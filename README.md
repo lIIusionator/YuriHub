@@ -2,7 +2,7 @@
 
 > A custom hub made for Roblox.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-2ea44f)](https://github.com/lIIusionator/YuriHub/releases/tag/v1.1.0)
+[![Version](https://img.shields.io/badge/version-1.1.1-2ea44f)](https://github.com/lIIusionator/YuriHub/releases/tag/v1.1.1)
 [![Stable branch](https://img.shields.io/badge/stable-main-24292f)](https://github.com/lIIusionator/YuriHub/tree/main)
 
 YuriHub brings everyday Roblox tools and performance tweaks together in one place.
@@ -20,9 +20,9 @@ YuriHub brings everyday Roblox tools and performance tweaks together in one plac
 
 ## Current Release
 
-**v1.1.0** is the current stable release and is published from the `main` branch.
+**v1.1.1** is the current stable release and is published from the `main` branch.
 
-### What's New in v1.1.0
-- ✨ **Auto Update** - Automatic updates for seamless version management
+### What's New in v1.1.1
+- 🔧 **Fixed** - Unmatching version after update
 
-[View the v1.1.0 release](https://github.com/lIIusionator/YuriHub/releases/tag/v1.1.0)
+[View the v1.1.1 release](https://github.com/lIIusionator/YuriHub/releases/tag/v1.1.1)
