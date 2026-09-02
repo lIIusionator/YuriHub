@@ -22,8 +22,10 @@
 ; this file in the repo, and it must stay within the first 8 KB of the file
 ; because that is all the check reads. SetVersion above is the exe's file
 ; version; the compiled updater installs a downloaded YURI.exe only if that is
-; higher than the running one. ZVER, lower down, is just the badge the hub draws.
+; higher than the running one. ZVER, lower down, is built from these two, so
+; the badge the hub draws can never disagree with the number the updater uses.
 global APP_VERSION := "1.0.0"
+global APP_STAGE   := "BETA"    ; follows the number on every badge; "" once it is not a beta
 ; -----------------------------------------------------------------------------
 
 ; ============================================================================
@@ -2691,7 +2693,8 @@ global hubCur := 0xFFFB7185
 global statStart := 0, togCount := 0, qCount := 0
 global AMBER := 0xFFFBBF24
 global ACCENTS := [0xFFFB7185, 0xFFF97316, 0xFFFBBF24, 0xFFA78BFA, 0xFF38BDF8, 0xFF2DD4BF]
-global ZVER := "v1.0 BETA"
+; the badge, derived - see APP_VERSION at the top of the file
+global ZVER := "v" APP_VERSION (APP_STAGE != "" ? " " APP_STAGE : "")
 global hubAccent := 0xFFFB7185
 try hubAccent := Integer(IniRead(iniPath, "hub", "accent", "0xFFFB7185"))
 global hubTheme := 0, hubOpacity := 1.0, hubMod := 0
@@ -30723,7 +30726,7 @@ YuriLog(line) {
 ; START followed by an error line and then no EXIT means the opposite. Those
 ; two cases need completely different fixes, and this is what tells them apart.
 YuriSessionStart() {
-    YuriLog("---- START  v" ZVER "  ahk " A_AhkVersion (A_IsCompiled ? " compiled" : "") )
+    YuriLog("---- START  " ZVER "  ahk " A_AhkVersion (A_IsCompiled ? " compiled" : "") )
 }
 YuriSessionEnd(reason := "", code := 0) {
     YuriLog("---- EXIT   " (reason != "" ? reason : "normal"))
@@ -32331,7 +32334,7 @@ HubGateDraw(now) {
     Txt("CONTROL SUITE", kx + 29, ky + 36, 120, 10, HL.fS, FA(Alpha(acc, 155), f), fmtL)
     ; the chip on the right: the live resolution for the two screen cards, the
     ; running version for the update card - each time, the thing the card is about
-    rs := (gKind = 3) ? "v" APP_VERSION : PZ_vw " x " PZ_vh
+    rs := (gKind = 3) ? ZVER : PZ_vw " x " PZ_vh
     rw := MeasureW(rs, HL.fXs) + 22
     b := SBrush(FA(Alpha(0xFFFFFF, 16), f))
     FillRR(kx + kw - 28 - rw, ky + 22, rw, 18, 9, b), DelB(b)
@@ -33281,6 +33284,12 @@ HubOpen() {
     HL.optx := HL.avcx + 27
     HL.opw := (HL.sbx + HL.sbw - 11) - 14 - HL.optx
     HL.opF := (MeasureW("OPERATOR", HL.fS) + 9 <= HL.opw) ? HL.fS : HL.fXs
+    ; The version badges size themselves to ZVER - it changes with every
+    ; release and "v1.0.0 BETA" already overran the 74 and 52 they were typed
+    ; at. Measured once here, read by the header, the credits card, the
+    ; dashboard chip and the hit test beside it.
+    HL.vbw := Max(74, Round(MeasureW(ZVER, fBadge)) + 18)      ; fBadge badges (header, credits)
+    HL.zvw := Max(52, Round(MeasureW(ZVER, HL.fS)) + 14)       ; the dashboard's small chip
     HL.scr := [BuildScr("DASHBOARD", HL.fT), BuildScr("INTEGRATIONS", HL.fT), BuildScr("SCRIPT HUB", HL.fT)
         , BuildScr("SETTINGS", HL.fT), BuildScr("CREDITS", HL.fT), BuildScr("UPDATE LOGS", HL.fT)]
     HL.intro := A_TickCount, HL.closeAt := 0, HL.scrAt := A_TickCount
@@ -33608,7 +33617,7 @@ HubZone(sx, sy) {
         return 205
     ; CHECK FOR UPDATES, in the header of the WHAT'S NEW card beside the
     ; version badge - the same rectangle the dashboard renderer draws it in
-    if (hubTab = 1 && ux >= x0 + (HL.ctw - 192) - 226 && ux <= x0 + (HL.ctw - 192) - 76
+    if (hubTab = 1 && ux >= x0 + (HL.ctw - 192) - 24 - HL.zvw - 150 && ux <= x0 + (HL.ctw - 192) - 24 - HL.zvw
         && uy >= HL.ly + 10 && uy <= HL.ly + 30)
         return 2001
     if hubTab = 2 {
@@ -36015,7 +36024,11 @@ HubRender() {
     b := SBrush(FA(Alpha(hubCur, 150 + 60*emb2G), s1))
     FillEll(rlx + rlw + 15, cy + 19 + hdy, 6, 6, b), DelB(b)
     tbn := fTab = 1 ? "DASHBOARD" : fTab = 2 ? "INTEGRATIONS" : fTab = 3 ? "SCRIPT HUB" : fTab = 4 ? "SETTINGS" : fTab = 5 ? "CREDITS" : "UPDATE LOGS"
-    bcx2 := cx + cw - 252
+    ; the version badge keeps its right edge; the tab chip sits 8 to its left,
+    ; wherever that lands, with the rail's spinner well clear on the far side
+    vbw := HL.vbw
+    vbx := cx + cw - 78 - vbw
+    bcx2 := vbx - 100
     b := SBrush(FA(Alpha(hubCur, 14 + 8*tt), s1))
     FillRR(bcx2, cy + 12 + hdy, 92, 18, 5, b), DelB(b)
     MicroBackdrop(bcx2, cy + 12 + hdy, 92, 18, 5, hubCur, s1, now, 0.8)
@@ -36029,8 +36042,6 @@ HubRender() {
     ; HL.opF makes for the OPERATOR caption.
     tbf := (MeasureW(tbn, HL.fS) <= 75) ? HL.fS : HL.fXs
     Txt(tbn, bcx2 + 17, cy + 11 + hdy + (1 - tt)*3, 75, 18, tbf, FA(Alpha(AccHi(hubCur, 0.45), 120 + 115*tt), s1), fmtL)
-    vbw := 74
-    vbx := cx + cw - 152
     b := SBrush(FA(Alpha(hubCur, 26 + 10*emb2G), s1))
     FillRR(vbx, cy + 12 + hdy, vbw, 18, 5, b), DelB(b)
     MicroBackdrop(vbx, cy + 12 + hdy, vbw, 18, 5, hubCur, s1, now, 0.8)
@@ -37245,16 +37256,17 @@ HubRender() {
             b := SBrush(FA(Alpha(hubCur, 170), f))
             FillRR(x0 + 12, ly + 10, 16, 2.4, 1.2, b), DelB(b)
             Txt("WHAT'S NEW", x0 + 12, ly + 15, 130, 12, fBadge, FA(0x76C7CBE0, f), fmtL)
+            zvx := x0 + colw - 12 - HL.zvw
             b := SBrush(FA(Alpha(hubCur, 26), f))
-            FillRR(x0 + colw - 64, ly + 12, 52, 16, 5, b), DelB(b)
-            Txt(ZVER, x0 + colw - 64, ly + 11, 52, 16, HL.fS, FA(Alpha(AccHi(hubCur, 0.4), 230), f), fmtC)
+            FillRR(zvx, ly + 12, HL.zvw, 16, 5, b), DelB(b)
+            Txt(ZVER, zvx, ly + 11, HL.zvw, 16, HL.fS, FA(Alpha(AccHi(hubCur, 0.4), 230), f), fmtC)
             ; ---- CHECK FOR UPDATES ----
             ; Beside the version badge, in the header, because the badge is the
             ; thing it asks about - and because the footer could not hold it:
             ; seven changelog rows run to 21 px above the card's floor, and a
             ; button there sat on the seventh. It answers on the gate card,
             ; see UpdCheckStart. HubZone tests this same rectangle.
-            FFMBtn(2001, x0 + colw - 226, ly + 10, 150, 20, "CHECK FOR UPDATES", hubCur, f, 0)
+            FFMBtn(2001, zvx - 12 - 150, ly + 10, 150, 20, "CHECK FOR UPDATES", hubCur, f, 0)
             FadeLine(x0 + 12, x0 + colw - 12, ly + 33, 0x16FFFFFF, f)
             nrows := Min(7, CHANGELOG.Length)
             loop nrows {
@@ -39417,16 +39429,17 @@ HubRender() {
             FillEll(occ - 2.5, ocy2 - 2.5, 5, 5, b), DelB(b)
             Txt("crafted frame by frame - thank you for running " APPNAME, x0, cbY + 36, HL.ctw - 60, 14, HL.fXs, FA(0x48C7CBE0, f), fmtL)
         } else {
-            vbw2 := 74
+            vbw2 := HL.vbw
             b := SBrush(FA(Alpha(hubCur, 26 + 10*emb2G), f))
             FillRR(x0, y0 + 36, vbw2, 20, 6, b), DelB(b)
             MicroBackdrop(x0, y0 + 36, vbw2, 20, 6, hubCur, f, now, 0.8)
             pn := Pen(FA(Alpha(hubCur, 130), f), 1)
             StrokeRR(x0, y0 + 36, vbw2, 20, 6, pn), DelP(pn)
             Txt(ZVER, x0, y0 + 35, vbw2, 20, fBadge, FA(Alpha(AccHi(hubCur, 0.35), 240), f), fmtC)
-            Txt("current build - channel: beta", x0 + vbw2 + 12, y0 + 38, 186, 15, fHint, FA(0x66C7CBE0, f), fmtL)
-            Txt("1.0", x0 + HL.ctw - 352, y0 + 60, 150, 64, HL.fG, FA(Alpha(hubCur, 14), f), fmtR)
-            Txt("BETA BUILD", x0 + HL.ctw - 352, y0 + 124, 150, 16, fBadge, FA(Alpha(hubCur, 32), f), fmtR)
+            Txt("current build - " (APP_STAGE != "" ? "channel: " StrLower(APP_STAGE) : "release channel")
+              , x0 + vbw2 + 12, y0 + 38, 186, 15, fHint, FA(0x66C7CBE0, f), fmtL)
+            Txt(APP_VERSION, x0 + HL.ctw - 352, y0 + 60, 150, 64, HL.fG, FA(Alpha(hubCur, 14), f), fmtR)
+            Txt((APP_STAGE != "" ? APP_STAGE : "RELEASE") " BUILD", x0 + HL.ctw - 352, y0 + 124, 150, 16, fBadge, FA(Alpha(hubCur, 32), f), fmtR)
             ents := CHANGELOG
             tlx := x0 + 8
             listTop := y0 + 70, listBot := HL.pd + HL.ch - 22
