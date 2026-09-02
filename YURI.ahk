@@ -10,7 +10,7 @@
 ;@Ahk2Exe-SetDescription   YURI - Control Suite
 ;@Ahk2Exe-SetProductName   YURI
 ;@Ahk2Exe-SetCompanyName   YURI
-;@Ahk2Exe-SetVersion       1.0.0.0
+;@Ahk2Exe-SetVersion       1.1.1.0
 ;@Ahk2Exe-SetCopyright     YURI
 ;@Ahk2Exe-SetOrigFilename  YURI.exe
 ;;@Ahk2Exe-SetMainIcon     YURI.ico
@@ -24,7 +24,7 @@
 ; version; the compiled updater installs a downloaded YURI.exe only if that is
 ; higher than the running one. ZVER, lower down, is built from these two, so
 ; the badge the hub draws can never disagree with the number the updater uses.
-global APP_VERSION := "1.0.0"
+global APP_VERSION := "1.1.1"
 global APP_STAGE   := "BETA"    ; follows the number on every badge; "" once it is not a beta
 ; -----------------------------------------------------------------------------
 
