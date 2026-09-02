@@ -1,4 +1,4 @@
-now#Requires AutoHotkey v2.0
+#Requires AutoHotkey v2.0
 #SingleInstance Off        ; must stay Off - the file-dialog / database helpers
                            ; relaunch this same binary as short-lived children
 
@@ -14,6 +14,16 @@ now#Requires AutoHotkey v2.0
 ;@Ahk2Exe-SetCopyright     YURI
 ;@Ahk2Exe-SetOrigFilename  YURI.exe
 ;;@Ahk2Exe-SetMainIcon     YURI.ico
+; -----------------------------------------------------------------------------
+
+; ---- version ----------------------------------------------------------------
+; Bump BOTH of these together for every release. APP_VERSION is what the
+; self-updater (see "self-update", further down) compares against the copy of
+; this file in the repo, and it must stay within the first 8 KB of the file
+; because that is all the check reads. SetVersion above is the exe's file
+; version; the compiled updater installs a downloaded YURI.exe only if that is
+; higher than the running one. ZVER, lower down, is just the badge the hub draws.
+global APP_VERSION := "1.0.0"
 ; -----------------------------------------------------------------------------
 
 ; ============================================================================
@@ -363,6 +373,108 @@ RbxJsonUnesc(v) {
 ; universe, the universe's details, its votes, and a large thumbnail which is
 ; downloaded to disk so the hub can load it as a bitmap. Fields are joined with
 ; Chr(1) because a game description can contain literally anything.
+; ---------------------------------------------------------------------------
+; ACCESS KEYS. Fetches the key list from the local server described in
+; KEYS_SERVER.md and drops the answer in a file for the gate to pick up.
+;
+; A FILE, not WM_COPYDATA, and that is not a preference. Every other child in
+; this suite posts its answer to `ui` - but PasswordGate runs at boot BEFORE
+; `ui` is created and before OnMessage(0x4A) is registered, so at the moment
+; this runs there is no window to post to and nothing listening if there were.
+; The gate polls for the file from its own render tick instead, which also
+; means a dead server never blocks a frame.
+;
+; Regex, not JSON.Parse. The example in KEYS_SERVER.md calls JSON.Parse and
+; describes it as built in "AHK v2.0+" - it is not; v2 ships no JSON class and
+; that line throws. Every other parser in this file reads JSON by pattern and
+; so does this one.
+;
+; cs-style prefixes for the same reason the commsync child has them: this runs
+; at global scope, where a plain name that matches any function in the file is
+; a load-time error.
+if A_Args.Length >= 2 && A_Args[1] = "keyfetch" {
+    Suspend true
+    kfOut := A_Args[2]
+    kfUrl := (A_Args.Length >= 3 && A_Args[3] != "") ? A_Args[3]
+           : "https://raw.githubusercontent.com/lIIusionator/YuriHub/main/keys.json"
+    kfTok := (A_Args.Length >= 4) ? A_Args[4] : ""
+    kfBody := "", kfErr := "", kfTxt := ""
+    ; ---- cache-busted, deliberately ----
+    ; raw.githubusercontent.com is served through a CDN that holds a copy for a
+    ; few minutes. Without this a key added to the repo would keep being
+    ; rejected long after it was committed, which is indistinguishable from the
+    ; key being wrong. The query string is part of the cache identity, so a
+    ; changing one always reaches the origin.
+    kfUrl .= (InStr(kfUrl, "?") ? "&" : "?") "t=" A_TickCount
+    try {
+        kfW := ComObject("WinHttp.WinHttpRequest.5.1")
+        ; This sits in front of the gate, so it fails in seconds rather than
+        ; the default half-minute - but it is the open internet now, not
+        ; loopback, so not the second-and-a-half a local server got.
+        kfW.SetTimeouts(4000, 4000, 8000, 12000)
+        kfW.Open("GET", kfUrl, false)
+        kfW.SetRequestHeader("User-Agent", "YURI")
+        kfW.SetRequestHeader("Cache-Control", "no-cache")
+        ; Only sent when there is one. A public repo needs no token, and sending
+        ; an expired or revoked one turns a working 200 into a 401.
+        if (kfTok != "")
+            kfW.SetRequestHeader("Authorization", "token " kfTok)
+        kfW.Send()
+        if (kfW.Status = 200)
+            kfBody := kfW.ResponseText
+        else if (kfW.Status = 401 || kfW.Status = 403)
+            kfErr := "token rejected - expired or revoked"
+        else if (kfW.Status = 404)
+            kfErr := kfTok = "" ? "keys.json is not in the repository"
+                                : "keys.json not found, or the token cannot see it"
+        else
+            kfErr := "key server answered " kfW.Status
+    } catch
+        kfErr := "could not reach the key list"
+    if (kfErr = "") {
+        if RegExMatch(kfBody, 's)"keys"\s*:\s*\[(.*?)\]', &kfM) {
+            kfPos := 1
+            while (kfPos := RegExMatch(kfM[1], '"([^"]*)"', &kfK, kfPos)) {
+                kfPos += kfK.Len
+                if (Trim(kfK[1]) != "")
+                    kfTxt .= Trim(kfK[1]) "`n"
+            }
+        }
+        if (kfTxt = "")
+            kfErr := "no keys in the reply"
+    }
+    try FileDelete(kfOut)
+    try FileAppend((kfErr = "") ? ("OK`n" kfTxt) : ("ERR`n" kfErr), kfOut, "UTF-8")
+    ExitApp
+}
+; ---- update probe child: asks the repo for its newest version, off the UI thread ----
+; The dashboard's CHECK FOR UPDATES. The parent must not block on the network
+; while its render loop is running, so - like the key list - the request is
+; made here and the answer is dropped in a file the card polls. The URL and
+; the token travel as arguments: this process has none of the parent's
+; globals, and APP_VERSION is the one thing it needs that is above this line.
+;   NEW <ver>   the repository is ahead of this build
+;   SAME <ver>  it is not
+;   ERR <why>   it could not be asked
+if A_Args.Length >= 4 && A_Args[1] = "updcheck" {
+    Suspend true
+    upR := UpdProbe(A_Args[3], A_Args[4])
+    try FileDelete(A_Args[2])
+    try FileAppend(upR.ok ? ((upR.newer ? "NEW " : "SAME ") upR.ver) : ("ERR " upR.msg), A_Args[2], "UTF-8")
+    ExitApp
+}
+; ---- update download child: fetches the new build to <file>, reports on <report> ----
+; The download is the slow part of an update - the file is 3 MB - and it is the
+; part the UPDATE button's spinner has to stay alive through. The parent does
+; the load check and the swap itself once the report says OK.
+if A_Args.Length >= 5 && A_Args[1] = "updfetch" {
+    Suspend true
+    upErr := UpdDownload(A_Args[2], A_Args[3], A_Args[4])
+    try FileDelete(A_Args[5])
+    try FileAppend(upErr = "" ? "OK" : ("ERR " upErr), A_Args[5], "UTF-8")
+    ExitApp
+}
+
 ; ---------------------------------------------------------------------------
 ; COMMUNITY SETS. Mirrors github.com/lIIusionator/Community-Fflags into the
 ; cache folder and writes an index the parent can render from without opening a
@@ -1849,6 +1961,524 @@ global YURI_DEVDIR := YURI_ROOT "\devopt"   ; device-optimization snapshots
 ; panel always renders from here and never touches the network itself, so a
 ; sync is only ever an update to what is already on disk.
 global YURI_COMM  := YURI_ROOT "\community"
+
+; ---- access keys ----
+; Straight off the repo now, not the localhost Node server from KEYS_SERVER.md.
+; That server only ever existed on the machine running it, so every other
+; machine got "key server unreachable" and could not get in at all. A raw URL
+; works from anywhere with no process to start.
+;
+; ONE constant. The child is handed this whole string, because it cannot read
+; this process's globals and two copies of a URL is one copy too many.
+global YURI_KEYS_URL := "https://raw.githubusercontent.com/lIIusionator/YuriHub/main/keys.json"
+
+; ---- BLANK THIS BEFORE YOU SHIP ----
+; A token compiled into the client is not a secret: the .ahk is plain text and
+; the .exe gives it up to `strings`. A classic ghp_ token also carries whole
+; SCOPES rather than one repository, so whoever reads it out gets whatever the
+; token's scopes allow across the whole account. This is here to unblock local
+; testing against a private repo and nothing else.
+;
+; YURI\config\gh.token overrides it when that file exists, so a distributed
+; build can leave the constant empty and a developer machine keeps working.
+; That file is the right home for it once testing is done.
+global YURI_KEYS_TOKEN := ""
+KeyToken() {
+    t := ""
+    try t := Trim(FileRead(YURI_CFG "\gh.token", "UTF-8"), " `t`r`n")
+    return (t != "") ? t : YURI_KEYS_TOKEN
+}
+; ---- self-update ----
+; The copy of this file in the repo is the source of truth. The check reads the
+; first 8 KB of it - a Range request, so the 3 MB script costs a few hundred
+; bytes to ask - and compares APP_VERSION. Only a strictly newer version is
+; ever fetched.
+;
+; Two ways in:
+;   at launch   SelfUpdate(), only while the AUTO UPDATE tile is on. It runs
+;               before any window exists, so it is allowed to block, and a
+;               newer build simply replaces this one and restarts.
+;   dashboard   CHECK FOR UPDATES raises the gate card (kind 3). The probe
+;               and the download run in child processes so the card's
+;               spinner keeps turning; only the load check blocks, for the
+;               second it takes, and the card says RESTARTING while it does.
+;
+;   .ahk : the new file is written beside this one, load-checked with
+;          "AutoHotkey.exe /validate" - a syntax error, or a #Requires this
+;          interpreter cannot meet, leaves the current file untouched - and then
+;          renamed over this file. AutoHotkey does not lock the running .ahk.
+;   .exe : YURI.exe from the same repo folder. It only installs if its file
+;          version (SetVersion, top of file) beats the running exe's, which is
+;          what stops a not-yet-recompiled exe from installing and restarting
+;          forever. A running exe cannot be overwritten, but it can be renamed.
+;
+; Either way the previous file is left beside the new one as .bak, which is the
+; rollback. The restart is an explicit Run + ExitApp rather than Reload():
+; Reload's /restart closes "the previous instance" by window title, and with
+; #SingleInstance Off that is not guaranteed to be this process. From the hub
+; the Run is deferred to HubFinish, so the hub folds away first and the new
+; build appears as it goes. Everything is written to YURI\errors.log as
+; "UPDATE" lines. Same token path as the key list, so a private repo works.
+global YURI_UPDATE_URL := "https://raw.githubusercontent.com/lIIusionator/YuriHub/main/YURI.ahk"
+global YURI_UPDATE_EXE := "https://raw.githubusercontent.com/lIIusionator/YuriHub/main/YURI.exe"
+global updRestartCmd := ""               ; set by the swap; HubFinish runs it on its way out
+
+; ---- at launch ----
+SelfUpdate() {
+    p := UpdProbe(YURI_UPDATE_URL, KeyToken())
+    if (!p.ok || !p.newer)
+        return
+    newFile := A_ScriptFullPath ".new"
+    try FileDelete(newFile)
+    err := UpdDownload(newFile, A_IsCompiled ? YURI_UPDATE_EXE : YURI_UPDATE_URL, KeyToken())
+    if (err = "")
+        err := UpdVerify(newFile)
+    if (err = "")
+        err := UpdSwapRestart(newFile, p.ver)      ; does not return on success
+    try FileDelete(newFile)
+    YuriLog("UPDATE  v" p.ver " not installed at launch: " err)
+}
+
+; ---- the pieces, shared by the launch path, the children and the card ----
+; One request, the way the key list does it: cache-busted, short timeouts, the
+; repo token only when there is one. lastByte > 0 asks for bytes 0..lastByte;
+; raw.githubusercontent.com answers 206 with just those.
+UpdFetch(url, tok := "", lastByte := 0) {
+    r := {ok: false, status: 0, req: 0}
+    try {
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.SetTimeouts(4000, 4000, 8000, lastByte ? 12000 : 60000)
+        url .= (InStr(url, "?") ? "&" : "?") "t=" A_TickCount   ; part of the cache identity, as with the key list
+        req.Open("GET", url, false)
+        req.SetRequestHeader("User-Agent", "YURI")
+        req.SetRequestHeader("Cache-Control", "no-cache")
+        if lastByte
+            req.SetRequestHeader("Range", "bytes=0-" lastByte)
+        if (tok != "")
+            req.SetRequestHeader("Authorization", "token " tok)
+        req.Send()
+        r.status := req.Status
+        r.ok := (req.Status = 200 || req.Status = 206)
+        r.req := req
+    }
+    return r
+}
+; The version at the top of the repo copy, and whether it beats this one.
+UpdProbe(url, tok) {
+    r := {ok: false, newer: false, ver: "", msg: ""}
+    p := UpdFetch(url, tok, 8191)
+    if !p.ok {
+        r.msg := p.status ? "the repository answered " p.status : "could not reach the repository"
+        return r
+    }
+    ; no version line = not this script (placeholder, wrong branch): never install it
+    if !RegExMatch(p.req.ResponseText, 'm)^\s*(?:global\s+)?APP_VERSION\s*:=\s*"([^"]+)"', &m) {
+        r.msg := "the repository copy carries no version"
+        return r
+    }
+    r.ok := true, r.ver := m[1], r.newer := (VerCompare(m[1], APP_VERSION) > 0)
+    return r
+}
+; The whole file, bytes as served, to newFile. "" on success, else why not.
+UpdDownload(newFile, url, tok) {
+    r := UpdFetch(url, tok)
+    if !r.ok
+        return r.status ? "the repository answered " r.status " for " (A_IsCompiled ? "YURI.exe" : "YURI.ahk")
+                        : "could not reach the repository"
+    try {
+        st := ComObject("ADODB.Stream")
+        st.Type := 1                            ; binary
+        st.Open()
+        st.Write(r.req.ResponseBody)
+        st.SaveToFile(newFile, 2)               ; 2 = overwrite
+        st.Close()
+    } catch as e
+        return "could not write the new file: " e.Message
+    return ""
+}
+; "" if the new file may be installed, else why not. A load check for the
+; script, a build-number check for the exe.
+UpdVerify(newFile) {
+    if A_IsCompiled {
+        try newB := FileGetVersion(newFile), curB := FileGetVersion(A_ScriptFullPath)
+        catch
+            return "the downloaded YURI.exe carries no version"
+        if (VerCompare(newB, curB) <= 0)
+            return "the repository's YURI.exe is build " newB ", not newer than " curB
+        return ""
+    }
+    if (RunWait('"' A_AhkPath '" /ErrorStdOut /validate "' newFile '"', , "Hide") != 0)
+        return "the new file failed to load - kept v" APP_VERSION
+    return ""
+}
+; Swap the files and start the new one. Returns only on failure, with the old
+; file back in place - except from the hub, where it returns "" and leaves the
+; restart to HubFinish so the hub's own close can play first.
+UpdSwapRestart(newFile, ver, viaHub := 0) {
+    global updRestartCmd
+    bakFile := A_ScriptFullPath ".bak"
+    try {
+        try FileDelete(bakFile)
+        FileMove(A_ScriptFullPath, bakFile, 1)  ; a running exe cannot be overwritten, but it can be renamed
+        FileMove(newFile, A_ScriptFullPath, 1)
+    } catch as e
+        return "could not replace the file: " e.Message
+    cmd := A_IsCompiled ? '"' A_ScriptFullPath '"'
+                        : '"' A_AhkPath '" "' A_ScriptFullPath '"'
+    YuriLog("---- UPDATE v" APP_VERSION " -> v" ver)
+    if viaHub {
+        updRestartCmd := cmd
+        HubClose()
+        return ""
+    }
+    try Run(cmd)
+    catch as e {                                ; could not start it: put the old file back and keep running
+        try FileMove(A_ScriptFullPath, newFile, 1)
+        try FileMove(bakFile, A_ScriptFullPath, 1)
+        return "could not start the new build: " e.Message
+    }
+    ExitApp
+}
+
+; ---- the dashboard's check, and the card it answers on ----
+; State lives in HL (see HubOpen) - HL.updPhase is the card's whole story:
+;   0 nothing up      1 checking     2 newer version found     3 downloading
+;   4 up to date      5 failed       6 load check + restart
+; The card is gateKind 3 - the opening gate's card with the update's words,
+; glyph and buttons; HubGateDraw, HubZone and HubClick all branch on the kind.
+UpdCheckStart() {
+    if (!hubLive || !IsObject(HL) || HL.closeAt || HubGateUp())
+        return
+    UpdReset()
+    HL.updFile := A_Temp "\yuri_upd_" A_TickCount ".txt"
+    try FileDelete(HL.updFile)
+    args := ' updcheck "' HL.updFile '" "' YURI_UPDATE_URL '" "' KeyToken() '"'
+    cmd := A_IsCompiled ? '"' A_ScriptFullPath '"' args
+                        : '"' A_AhkPath '" "' A_ScriptFullPath '"' args
+    pid := 0
+    try Run(cmd, , "Hide", &pid)
+    HL.updPid := pid
+    if pid
+        UpdSet(1)
+    else
+        UpdSet(5, "could not start the check", "COULD NOT CHECK")
+    HL.gateKind := 3
+    HL.gateAt := A_TickCount, HL.gateOut := 0
+    ; the card is modal over the whole hub, so anything already holding a
+    ; caret or a hover underneath it is dropped rather than left live
+    try HubGateClearBelow()
+    HubPoke()
+    HubTim(TICK_A)
+}
+; UPDATE pressed. The download goes to a child; the report file is what the
+; card waits on.
+UpdInstallBegin() {
+    if (HL.updPhase != 2)
+        return
+    HL.updNew := A_ScriptFullPath ".new"
+    try FileDelete(HL.updNew)
+    HL.updFile := HL.updNew ".rep"
+    try FileDelete(HL.updFile)
+    url := A_IsCompiled ? YURI_UPDATE_EXE : YURI_UPDATE_URL
+    args := ' updfetch "' HL.updNew '" "' url '" "' KeyToken() '" "' HL.updFile '"'
+    cmd := A_IsCompiled ? '"' A_ScriptFullPath '"' args
+                        : '"' A_AhkPath '" "' A_ScriptFullPath '"' args
+    pid := 0
+    try Run(cmd, , "Hide", &pid)
+    HL.updPid := pid
+    if pid
+        UpdSet(3)
+    else
+        UpdSet(5, "could not start the download")
+}
+; Called every frame the card is up (from HubGateDraw). Reads the child's
+; report once it lands, and gives up on a child that never answers.
+UpdPoll(now) {
+    ph := HL.updPhase
+    if (ph != 1 && ph != 3)
+        return
+    rep := ""
+    if (HL.updFile != "" && FileExist(HL.updFile))
+        try rep := Trim(FileRead(HL.updFile, "UTF-8"), " `t`r`n")
+    if (rep = "") {
+        ; an empty file is one the child is still writing; a probe with no
+        ; answer in half a minute is not going to get one, a download gets two
+        if (now - HL.updAt > (ph = 1 ? 30000 : 120000)) {
+            UpdKillChild()
+            UpdSet(5, "the repository did not answer", ph = 1 ? "COULD NOT CHECK" : "COULD NOT UPDATE")
+        }
+        return
+    }
+    try FileDelete(HL.updFile)
+    HL.updFile := "", HL.updPid := 0
+    sp := InStr(rep, " ")
+    word := sp ? SubStr(rep, 1, sp - 1) : rep
+    rest := sp ? Trim(SubStr(rep, sp + 1)) : ""
+    if (ph = 1) {
+        if (word = "NEW")
+            HL.updVer := rest, UpdSet(2)
+        else if (word = "SAME")
+            UpdSet(4)
+        else
+            UpdSet(5, rest != "" ? rest : "could not check", "COULD NOT CHECK")
+    } else if (word = "OK") {
+        UpdSet(6)
+        ; one frame of RESTARTING before the load check holds the loop
+        SetTimer(UpdFinish, -80)
+    } else
+        UpdSet(5, rest != "" ? rest : "the download failed")
+}
+; After the download: the load check, the swap, and the hub's close. Only a
+; failure lands back on the card.
+UpdFinish() {
+    if (!IsObject(HL) || HL.updPhase != 6)
+        return
+    err := UpdVerify(HL.updNew)
+    if (err = "")
+        err := UpdSwapRestart(HL.updNew, HL.updVer, 1)
+    if (err = "")
+        return
+    try FileDelete(HL.updNew)
+    HL.updNew := ""
+    YuriLog("UPDATE  v" HL.updVer " not installed: " err)
+    UpdSet(5, err)
+}
+UpdSet(ph, msg := "", ttl := "COULD NOT UPDATE") {
+    HL.updPhase := ph, HL.updMsg := msg, HL.updTtl := ttl, HL.updAt := A_TickCount
+    HubPoke()
+}
+UpdReset() {
+    UpdKillChild()
+    HL.updPhase := 0, HL.updVer := "", HL.updMsg := "", HL.updTtl := "", HL.updAt := 0
+}
+UpdKillChild() {
+    if HL.updPid
+        try ProcessClose(HL.updPid)
+    HL.updPid := 0
+    if (HL.updFile != "")
+        try FileDelete(HL.updFile)
+    HL.updFile := ""
+    if (HL.updNew != "")
+        try FileDelete(HL.updNew)
+    HL.updNew := ""
+}
+; CANCEL. Whatever is in flight is stopped, and the card leaves; the state is
+; cleared once it has gone (HubGateDraw), so nothing changes under it.
+UpdCancel() {
+    UpdKillChild()
+    HubGateDismiss()
+}
+; ---- the words ----
+UpdCardCopy(&ttl, &l1, &l2) {
+    ph := HL.updPhase
+    if (ph = 1)
+        ttl := "CHECKING FOR UPDATES", l1 := "Asking the repository for its newest version.", l2 := "You are on v" APP_VERSION "."
+    else if (ph = 2)
+        ttl := "NEWER VERSION FOUND", l1 := "v" HL.updVer " is available - you are on v" APP_VERSION ".", l2 := "UPDATE fetches it, checks it loads, then restarts YURI."
+    else if (ph = 3)
+        ttl := "DOWNLOADING v" HL.updVer, l1 := "Fetching the new build from the repository.", l2 := "This one keeps running until the new one has been checked."
+    else if (ph = 4)
+        ttl := "NO NEWER VERSION", l1 := "The repository has nothing newer than v" APP_VERSION ".", l2 := "You are up to date."
+    else if (ph = 5)
+        ttl := HL.updTtl != "" ? HL.updTtl : "COULD NOT UPDATE", l1 := HL.updMsg, l2 := "Nothing was changed."
+    else
+        ttl := "RESTARTING", l1 := "Checking that v" HL.updVer " loads, then swapping it in.", l2 := "YURI will close and reopen on its own."
+}
+; ---- the glyph, one per phase, in the gate card's own disc ----
+; The arrival ring re-fires on every change of phase, from HL.updAt, so the
+; verdict lands with the same punch the card arrived with.
+UpdGlyph(gx, gy, acc, f, now) {
+    ph := HL.updPhase
+    el := now - HL.updAt
+    col := ph = 4 ? C_ON : ph = 5 ? AMBER : acc
+    rr := 26 + 30*(1 - Ease3(Clamp(el/620.0, 0.0, 1.0)))
+    ra := HL.gateOut ? 0 : (1 - Clamp(el/620.0, 0.0, 1.0))
+    if (ra > 0.01) {
+        pn := Pen(FA(Alpha(AccHi(col, 0.4), Round(170*ra)), f), 1.4)
+        Ell(gx - rr, gy - rr, rr*2, rr*2, pn), DelP(pn)
+    }
+    b := SBrush(FA(Alpha(col, 26), f))
+    FillEll(gx - 27, gy - 27, 54, 54, b), DelB(b)
+    if (ph = 1 || ph = 3 || ph = 6) {
+        ; two arcs chasing at different speeds and in opposite directions - it
+        ; reads as working rather than as a loop. Motion goes with DecT, so
+        ; LOW PERFORMANCE MODE gets a still ring.
+        a1 := Mod(DecT(now)*0.34, 360), a2 := Mod(-DecT(now)*0.52, 360)
+        pn := Pen(FA(Alpha(AccHi(acc, 0.42), 240), f), 2.2)
+        Arc(gx - 17, gy - 17, 34, 34, a1, 100, pn), DelP(pn)
+        pn := Pen(FA(Alpha(acc, 150), f), 1.6)
+        Arc(gx - 11, gy - 11, 22, 22, a2, 150, pn), DelP(pn)
+        if (ph = 3) {
+            ; the download: an arrow dropping through the middle, on repeat
+            dy := Mod(DecT(now), 900)/900.0
+            da := Sin(3.14159*dy)
+            pn := Pen(FA(Alpha(AccHi(acc, 0.5), Round(230*da)), f), 1.6)
+            ay := gy - 5 + 6*dy
+            Line(gx, ay - 3, gx, ay + 3, pn)
+            Line(gx - 2.6, ay + 0.6, gx, ay + 3, pn)
+            Line(gx + 2.6, ay + 0.6, gx, ay + 3, pn), DelP(pn)
+        }
+    } else if (ph = 2) {
+        ; a down arrow into a tray, bobbing: the build waiting to be taken
+        bob := hubLowPerf ? 0 : 1.6*Sin(DecT(now)*0.005)
+        pn := Pen(FA(Alpha(AccHi(acc, 0.42), 240), f), 1.9)
+        Line(gx, gy - 14 + bob, gx, gy + 4 + bob, pn)
+        Line(gx - 6, gy - 2 + bob, gx, gy + 4 + bob, pn)
+        Line(gx + 6, gy - 2 + bob, gx, gy + 4 + bob, pn), DelP(pn)
+        pn := Pen(FA(Alpha(acc, Round(110*f)), f), 1.6)
+        Line(gx - 13, gy + 7, gx - 13, gy + 13, pn)
+        Line(gx - 13, gy + 13, gx + 13, gy + 13, pn)
+        Line(gx + 13, gy + 13, gx + 13, gy + 7, pn), DelP(pn)
+    } else if (ph = 4) {
+        ; a tick that draws itself in, inside a ring that settles on green
+        t := Ease3(Clamp((el - 120)/420.0, 0.0, 1.0))
+        pn := Pen(FA(Alpha(C_ON, Round(70 + 60*t)), f), 1.4)
+        Ell(gx - 19, gy - 19, 38, 38, pn), DelP(pn)
+        s1 := Min(t*2, 1.0), s2 := Clamp(t*2 - 1, 0.0, 1.0)
+        pn := Pen(FA(Alpha(AccHi(C_ON, 0.2), 245), f), 2.3)
+        Line(gx - 11, gy, gx - 11 + 8*s1, gy + 8*s1, pn)
+        if (s2 > 0)
+            Line(gx - 3, gy + 8, gx - 3 + 15*s2, gy + 8 - 16*s2, pn)
+        DelP(pn)
+    } else if (ph = 5) {
+        ; the mark, in the suite's warning colour
+        pn := Pen(FA(Alpha(AMBER, 110), f), 1.4)
+        Ell(gx - 19, gy - 19, 38, 38, pn), DelP(pn)
+        pn := Pen(FA(Alpha(AccHi(AMBER, 0.2), 245), f), 2.4)
+        Line(gx, gy - 12, gx, gy + 3, pn), DelP(pn)
+        b := SBrush(FA(Alpha(AMBER, 245), f))
+        FillEll(gx - 2.2, gy + 7.5, 4.4, 4.4, b), DelB(b)
+    }
+}
+; ---- the buttons ----
+; How many, where, and which zone each answers to. Same floor as the gate's
+; own button. Phase 2 is the one decision, so it gets the pair: UPDATE, then
+; CANCEL as the way back. A wait has CANCEL alone, a verdict CLOSE alone, and
+; the load check has nothing - there is nothing left to decide.
+HubUpdBtns(&by, &bw, &bh, &x1, &z1, &x2, &z2, &n) {
+    HubGateCard(&kx, &ky, &kw, &kh)
+    bw := 150, bh := 34
+    by := ky + kh - bh - 24
+    ph := HL.updPhase
+    x2 := 0, z2 := 0
+    if (ph = 2) {
+        n := 2
+        x1 := kx + (kw - bw*2 - 14)/2, z1 := 2002
+        x2 := x1 + bw + 14, z2 := 2003
+    } else if (ph = 6) {
+        n := 0, x1 := kx + (kw - bw)/2, z1 := 0
+    } else {
+        n := 1, x1 := kx + (kw - bw)/2
+        z1 := (ph = 4 || ph = 5) ? 2002 : 2003
+    }
+}
+
+; ---- the remote list is PARKED, not removed ----
+; 0 puts the gate back on the built-in password and stops the fetch entirely -
+; no child, no waiting, no server status on screen. Flip to 1 to bring the key
+; server back; everything below it is still wired and still works.
+global KEYS_REMOTE := 0
+global KEYS_LIST := []           ; the fetched keys
+global KEYS_ERR  := ""           ; why it failed, "" while still in flight
+global KEYS_IN   := 0            ; 1 once an answer of either kind has landed
+global KEYS_FILE := ""           ; where the child drops it
+global KEYS_AT := 0              ; when the current attempt was launched
+global KEYS_TRIES := 0           ; how many retries the gate has spent
+global keyFetchPid := 0
+
+KeyFetchStart() {
+    global KEYS_LIST, KEYS_ERR, KEYS_IN, KEYS_FILE, KEYS_AT, keyFetchPid
+    KEYS_LIST := [], KEYS_ERR := "", KEYS_IN := 0
+    if !KEYS_REMOTE {
+        ; IN, with an empty list and no error: nothing waits on it and nothing
+        ; reports a failure that was never attempted.
+        KEYS_IN := 1
+        return
+    }
+    KEYS_FILE := A_Temp "\yuri_keys_" A_TickCount ".txt"
+    try FileDelete(KEYS_FILE)
+    ; The URL travels as an argument so YURI_KEYS_URL is the only place it is
+    ; written; the child has no access to this process's globals.
+    args := ' keyfetch "' KEYS_FILE '" "' YURI_KEYS_URL '" "' KeyToken() '"'
+    cmd := A_IsCompiled ? '"' A_ScriptFullPath '"' args
+                        : '"' A_AhkPath '" "' A_ScriptFullPath '"' args
+    KEYS_AT := A_TickCount
+    try Run(cmd, , "Hide", &keyFetchPid)
+    catch
+        KEYS_ERR := "could not start the key check", KEYS_IN := 1
+}
+; ---- and try again, because the server may start AFTER the gate does ----
+; Without this, launching YURI before `npm start` meant restarting YURI. The
+; gate calls this every frame; it re-launches at most every four seconds and
+; gives up after a handful, so a genuinely absent server settles into a steady
+; message rather than spawning a process forever.
+KeyFetchRetry() {
+    global KEYS_ERR, KEYS_IN, KEYS_AT, KEYS_TRIES
+    if !KEYS_REMOTE
+        return
+    if (!KEYS_IN || KEYS_ERR = "" || KEYS_TRIES >= 6)
+        return
+    if (A_TickCount - KEYS_AT < 4000)
+        return
+    KEYS_TRIES += 1
+    KeyFetchStart()
+}
+; Returns 1 once there is an answer. Called from the gate's render tick, so it
+; must never block: it looks for the file and otherwise returns immediately.
+KeyFetchPoll() {
+    global KEYS_LIST, KEYS_ERR, KEYS_IN, KEYS_FILE, KEYS_AT, keyFetchPid
+    if (KEYS_IN || KEYS_FILE = "")
+        return KEYS_IN
+    if !FileExist(KEYS_FILE) {
+        ; FileExist first, THEN the process: a child that wrote its file and
+        ; exited in the same instant must be read, not written off.
+        if (keyFetchPid && !ProcessExist(keyFetchPid))
+            KEYS_ERR := "key check did not finish", KEYS_IN := 1
+        return KEYS_IN
+    }
+    txt := ""
+    try txt := FileRead(KEYS_FILE, "UTF-8")
+    try FileDelete(KEYS_FILE)
+    ln := StrSplit(txt, "`n", "`r")
+    if (ln.Length >= 1 && ln[1] = "OK") {
+        loop ln.Length - 1 {
+            if (Trim(ln[A_Index + 1]) != "")
+                KEYS_LIST.Push(Trim(ln[A_Index + 1]))
+        }
+        if !KEYS_LIST.Length
+            KEYS_ERR := "no keys returned"
+    } else
+        KEYS_ERR := (ln.Length >= 2 && Trim(ln[2]) != "") ? Trim(ln[2]) : "key check failed"
+    KEYS_IN := 1
+    KEYS_AT := A_TickCount
+    return 1
+}
+; ---- one comparison, deliberately case-folded ----
+; The old gate did `StrUpper(p) = PASS`, which was case-insensitive TWICE over:
+; StrUpper flattened the input, and AHK's `=` is itself case-insensitive for
+; strings - `==` is the case-sensitive one. Against the word MOON that did not
+; matter. Against a 32-character lowercase hex key it very nearly did: StrUpper
+; turns the input into 8F3A..., which only still matches 8f3a... because of the
+; operator. Anyone tightening that `=` to `==` for correctness would have broken
+; every key in the file.
+;
+; Hex is case-insensitive by nature, so folding is the RIGHT answer here - it
+; just has to be the deliberate one. Both sides are lowered explicitly and the
+; result no longer depends on which equality operator someone reaches for.
+KeyOk(p) {
+    p := Trim(p)
+    if (p = "")
+        return 0
+    ; The built-in, back for now. Checked FIRST and with no network behind it,
+    ; so it works whatever the key server is or is not doing.
+    if (StrLower(p) == "moon")
+        return 1
+    for k in KEYS_LIST {
+        if (StrLower(Trim(k)) == StrLower(p))
+            return 1
+    }
+    return 0
+}
 YuriInitDirs()
 
 global fam := 0
@@ -1996,6 +2626,16 @@ embImgs.Push({name: "selfie6.jpg", b64: ""
 ; the profile-font read a hundred lines up dodges it by spelling the path out
 ; literally; this one did not.
 global iniPath := YURI_CFG "\zeal.ini"
+
+; ---- AUTO UPDATE ----
+; Off unless the SETTINGS tile turned it on. Read here rather than with the
+; other hub settings, 28,000 lines down, because the launch check has to run
+; before a single window exists - and after iniPath, for the reason given in
+; the block above. HubAutoUpdSet is the only writer.
+global hubAutoUpd := 0
+try hubAutoUpd := Integer(IniRead(iniPath, "hub", "autoupdate", "0"))
+if hubAutoUpd
+    SelfUpdate()
 
 ; ---- saved keybinds ----
 ; These MUST come after iniPath. They used to sit up with the font metrics, 95
@@ -13193,7 +13833,7 @@ DOPSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
     if (Abs(DOP.scrT - DOP.scr) < 0.4)
         DOP.scr := DOP.scrT
     scr := DOP.scr
-    for i, g in DOPGroups() {
+    for i, grp in DOPGroups() {
         ry := ay + DOPRowY(i) - scr
         ; strictly after the frame, and in order down the column
         cg := Clamp((mt - DOP_ROW0 - (i - 1)*DOP_ROWD)/DOP_ROWS, 0.0, 1.0)
@@ -13203,11 +13843,11 @@ DOPSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
         hv := Max(HL.h.Get(1250 + i, 0.0), HL.h.Get(1260 + i, 0.0))
         sld := (1 - cg)*10
         axs := ax + sld
-        on := DOPIsOn(g.id)
+        on := DOPIsOn(grp.id)
         cur := DOP.t.Has(i) ? DOP.t[i] : (on ? 1.0 : 0.0)
         cur += ((on ? 1.0 : 0.0) - cur)*EK(0.22)
         DOP.t[i] := cur
-        run := (DOP.busy = g.id)
+        run := (DOP.busy = grp.id)
         fl := 0.0
         if DOP.flashAt.Has(i) {
             fe := (now - DOP.flashAt[i])/520.0
@@ -13229,26 +13869,26 @@ DOPSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
         DOPIcon(i, axs + 36, ry + DOP_RH/2, FA(Alpha(on ? acc : 0xFF9AA8C0, on ? 220 : 110), fb), on, now)
 
         tw := HL.abw - 132
-        Txt(g.n, axs + 54, ry + 5, tw, 16, fBadge
+        Txt(grp.n, axs + 54, ry + 5, tw, 16, fBadge
             , FA(Alpha(Mix(0xFFE8EAF6, acc, 0.18), 235), fb), fmtL)
         ; ---- applied is not the same claim as still applied ----
         ; The switch is driven by the snapshot file, which says we owe a revert.
         ; DOPDrift is driven by re-reading the machine, which is the only thing
         ; that can say the values are still there. They disagree the moment
         ; anything else on the machine writes over one of them.
-        dr := on ? DOPDrift(g.id) : 0
+        dr := on ? DOPDrift(grp.id) : 0
         ht := run ? "working - approve the elevation prompt"
             : (on && dr > 0) ? (dr " setting" (dr = 1 ? "" : "s") " no longer set - press RE-APPLY")
-            : (on && dr < 0 && g.rb) ? "applied - restart to take effect; boot values cannot be verified"
+            : (on && dr < 0 && grp.rb) ? "applied - restart to take effect; boot values cannot be verified"
             : (on && dr < 0) ? "applied - this group cannot be verified without elevation"
-            : (on && g.rb) ? "applied - takes effect after a restart"
+            : (on && grp.rb) ? "applied - takes effect after a restart"
             : on ? "applied - revert restores what was captured at hub open"
-            : g.h
+            : grp.h
         hc := run ? Alpha(AMBER, 220)
             : (on && dr > 0) ? Alpha(C_BAD, 215)
             : on ? Alpha(C_ON, 190) : 0x8AC7CBE0
         Txt(FFMElide(ht, HL.fS, tw), axs + 54, ry + 24, tw, 15, HL.fS, FA(hc, fb), fmtL)
-        if (g.rb && !on)
+        if (grp.rb && !on)
             Txt("RESTART", ax + HL.abw - 152, ry + 6, 62, 12, HL.fXs
                 , FA(Alpha(AMBER, 165), fb), fmtR)
 
@@ -13354,15 +13994,15 @@ DOPFooter(px, py, pw, ff, now, acc, mt) {
     Txt(n " / " segN, tx - 52, py + 10, 46, 14, HL.fS
         , FA(Alpha(n ? AccHi(acc, 0.4) : 0xFF8A90A6, n ? 235 : 150), fb), fmtR)
     Txt("APPLIED", tx, py + 10, tw, 14, HL.fXs, FA(0x62C7CBE0, fb), fmtR)
-    for i, g in DOPGroups() {
+    for i, grp in DOPGroups() {
         ; each segment lands just after the one before it
         sg := Clamp((cg - 0.30 - i*0.06)/0.40, 0.0, 1.0)
         if (sg <= 0.01)
             continue
         sx := tx + (i - 1)*(segW + segG)
         sy2 := py + 30
-        lit := DOP.t.Has(i) ? DOP.t[i] : (DOPIsOn(g.id) ? 1.0 : 0.0)
-        run := (DOP.busy = g.id)
+        lit := DOP.t.Has(i) ? DOP.t[i] : (DOPIsOn(grp.id) ? 1.0 : 0.0)
+        run := (DOP.busy = grp.id)
         b := SBrush(FA(Alpha(0xFFFFFF, Round(16*sg)), fb))
         FillRR(sx, sy2, segW, 5, 2.5, b), DelB(b)
         if (lit > 0.01) {
@@ -13376,7 +14016,7 @@ DOPFooter(px, py, pw, ff, now, acc, mt) {
             FillRR(sx, sy2, segW, 5, 2.5, b), DelB(b)
         }
         ; a restart still owed reads on the segment, not only in the sentence
-        if (lit > 0.5 && g.rb) {
+        if (lit > 0.5 && grp.rb) {
             b := SBrush(FA(Alpha(AMBER, Round(220*sg)), fb))
             FillEll(sx + segW/2 - 1.6, sy2 + 9, 3.2, 3.2, b), DelB(b)
         }
@@ -30016,7 +30656,8 @@ global CHANGELOG := [["+", "tabs, save / export + saved-script library"]
     , ["+", "discord activity: account, join link, focus state"]
     , ["*", "BETTER MATCHMAKING renamed AUTO-REGION FINDER"]
     , ["+", "new BETTER MATCHMAKING - picks measured servers"]
-    , ["*", "JOIN only rerolls with AUTO-REGION FINDER on"]]
+    , ["*", "JOIN only rerolls with AUTO-REGION FINDER on"]
+    , ["+", "CHECK FOR UPDATES + AUTO UPDATE setting"]]
 global famP := 0, fP := 0, fPs := 0
 try profName := IniRead(iniPath, "profile", "name", "USERNAME")
 try profBio := IniRead(iniPath, "profile", "bio", "EMPTY BIO")
@@ -30145,6 +30786,10 @@ CurBoot()
 RSetBoot()
 
 ; ================= password gate =================
+; Launched BEFORE the gate so the round trip overlaps the intro animation and
+; whatever time the user spends typing - by the time anyone presses Enter the
+; list is normally already in. The gate never waits on it; see GSubmit.
+KeyFetchStart()
 PasswordGate()
 
 ; ================= window (autoblock overlay: created dormant, shown by the hub) =================
@@ -30406,8 +31051,13 @@ PuzDisable() {
 ; keybinds survive a restart
 ; slider -> frame budget. Applied immediately so the next solve uses it.
 PuzSpeedApply() {
-    global PZ_FrameMs
+    global PZ_FrameMs, PZ_paceMul, PZ_paceOk
     PZ_FrameMs := PZ_FrameSlow + (PZ_FrameFast - PZ_FrameSlow)*Clamp(PZ_SpeedT, 0.0, 1.0)
+    ; A new slider position is a new assumption, so what was learned about the
+    ; old one no longer applies. Not reset per BOARD - within a hold the thing
+    ; it measures is the machine and the game, and neither changes between
+    ; boards - but PuzSolve does reset it per PRESS; see the note there.
+    PZ_paceMul := 1.0, PZ_paceOk := 0
 }
 PuzSlideSet(sx) {
     global PZ_SpeedT
@@ -30787,9 +31437,10 @@ HubPoke() {
     ; grid scan, the DFS and the next-deal polling, all of which sit outside the
     ; Critical window PuzDrawPath holds. Solving requires Roblox to be FOCUSED,
     ; so the hub is behind it and nobody is reading the status line at 60 fps
-    ; anyway; the renderer is not stopped, only left on its own tier, so the
-    ; text still lands within a frame or two. PuzSolve's finally pokes again
-    ; when the session ends and the hub catches up in one frame.
+    ; anyway; the renderer is STOPPED for the session (HubTim refuses every
+    ; non-zero period while PZ_solving - see the note there), and the finally
+    ; below pokes again when the session ends, so the hub catches up in one
+    ; frame.
     ;
     ; IsSet: this is reached from HubOpen and from background timers, and
     ; PZ_solving is not assigned until the puzzle module's globals run, which is
@@ -31611,19 +32262,28 @@ HubGateDismiss() {
 HubGateDraw(now) {
     if !HubGateUp()
         return
+    gKind := HubGateKind()             ; resolved once, read throughout
+    ; the update card is fed by child processes that report through files, and
+    ; it is the only thing that ever reads them - so it is the one that polls
+    if (gKind = 3 && !HL.gateOut)
+        UpdPoll(now)
     ; in on 420 ms, out on 300, both from one timestamp so a late frame cannot
     ; strand it half-drawn
     if HL.gateOut {
         e := Clamp((now - HL.gateOut)/300.0, 0.0, 1.0)
         f := 1 - Ease3(e)
         if (e >= 1.0) {
-            wasRes := (HubGateKind() = 2)
             HL.gateAt := 0, HL.gateOut := 0
+            ; ---- the update card forgets its verdict once it has left ----
+            ; So the next CHECK starts from CHECKING rather than a stale
+            ; answer, and nothing it was waiting on is left running.
+            if (gKind = 3)
+                UpdReset()
             ; ---- the resolution card closes the hub, and only once it is gone ----
             ; Sequenced after the exit rather than fired from the click, so the
             ; card is seen to leave before the hub starts its own close. Firing
             ; both at the press ran the two animations over each other.
-            if wasRes
+            if (gKind = 2)
                 HubClose()
             return
         }
@@ -31631,7 +32291,6 @@ HubGateDraw(now) {
         f := Ease3(Clamp((now - HL.gateAt)/420.0, 0.0, 1.0))
     if (f <= 0.004)
         return
-    gKind := HubGateKind()             ; resolved once, read three times below
     el  := now - (HL.gateOut ? HL.gateOut : HL.gateAt)
     pd  := HL.pd, cw := HL.cw, ch := HL.ch
     acc := hubAccent
@@ -31670,8 +32329,9 @@ HubGateDraw(now) {
     b := SBrush(FA(bp, f))
     FillEll(kx + 32 + bwz, ky + 27, 5, 5, b), DelB(b)
     Txt("CONTROL SUITE", kx + 29, ky + 36, 120, 10, HL.fS, FA(Alpha(acc, 155), f), fmtL)
-    ; the live resolution, as a chip on the right - the thing the card is about
-    rs := PZ_vw " x " PZ_vh
+    ; the chip on the right: the live resolution for the two screen cards, the
+    ; running version for the update card - each time, the thing the card is about
+    rs := (gKind = 3) ? "v" APP_VERSION : PZ_vw " x " PZ_vh
     rw := MeasureW(rs, HL.fXs) + 22
     b := SBrush(FA(Alpha(0xFFFFFF, 16), f))
     FillRR(kx + kw - 28 - rw, ky + 22, rw, 18, 9, b), DelB(b)
@@ -31682,34 +32342,42 @@ HubGateDraw(now) {
 
     ; ---- the glyph, with a ring that punches outward on arrival ----
     gx := kx + 60, gy := ky + 112
-    rr := 26 + 30*(1 - Ease3(Clamp(el/620.0, 0.0, 1.0)))
-    ra := HL.gateOut ? 0 : (1 - Clamp(el/620.0, 0.0, 1.0))
-    if (ra > 0.01) {
-        pn := Pen(FA(Alpha(AccHi(acc, 0.4), Round(170*ra)), f), 1.4)
-        Ell(gx - rr, gy - rr, rr*2, rr*2, pn), DelP(pn)
+    if (gKind = 3)
+        UpdGlyph(gx, gy, acc, f, now)
+    else {
+        rr := 26 + 30*(1 - Ease3(Clamp(el/620.0, 0.0, 1.0)))
+        ra := HL.gateOut ? 0 : (1 - Clamp(el/620.0, 0.0, 1.0))
+        if (ra > 0.01) {
+            pn := Pen(FA(Alpha(AccHi(acc, 0.4), Round(170*ra)), f), 1.4)
+            Ell(gx - rr, gy - rr, rr*2, rr*2, pn), DelP(pn)
+        }
+        b := SBrush(FA(Alpha(acc, 26), f))
+        FillEll(gx - 27, gy - 27, 54, 54, b), DelB(b)
+        pn := Pen(FA(Alpha(acc, Round(95*f)), f), 1.4)
+        StrokeRR(gx - 19, gy - 15, 30, 22, 4, pn), DelP(pn)
+        pn := Pen(FA(Alpha(AccHi(acc, 0.42), 240), f), 1.9)
+        StrokeRR(gx - 14, gy - 10, 30, 22, 4, pn)
+        Line(gx - 6, gy + 17, gx + 8, gy + 17, pn)
+        Line(gx + 1, gy + 12, gx + 1, gy + 17, pn), DelP(pn)
     }
-    b := SBrush(FA(Alpha(acc, 26), f))
-    FillEll(gx - 27, gy - 27, 54, 54, b), DelB(b)
-    pn := Pen(FA(Alpha(acc, Round(95*f)), f), 1.4)
-    StrokeRR(gx - 19, gy - 15, 30, 22, 4, pn), DelP(pn)
-    pn := Pen(FA(Alpha(AccHi(acc, 0.42), 240), f), 1.9)
-    StrokeRR(gx - 14, gy - 10, 30, 22, 4, pn)
-    Line(gx - 6, gy + 17, gx + 8, gy + 17, pn)
-    Line(gx + 1, gy + 12, gx + 1, gy + 17, pn), DelP(pn)
 
     ; ---- copy, entering line by line ----
     ; Each line waits on the one above it. The stagger is what the hub's own
     ; panels do on open, and it is the difference between a card that appears
-    ; and a card that arrives.
+    ; and a card that arrives. The update card re-runs it on every change of
+    ; phase, from its own clock, so a verdict arrives the way the card did.
     tx := kx + 108, tw := kw - 136
-    l1 := Ease3(Clamp((el - 60)/380.0, 0.0, 1.0)) * (HL.gateOut ? f : 1)
-    l2 := Ease3(Clamp((el - 140)/380.0, 0.0, 1.0)) * (HL.gateOut ? f : 1)
-    l3 := Ease3(Clamp((el - 210)/380.0, 0.0, 1.0)) * (HL.gateOut ? f : 1)
-    ; ---- one card, two things to say ----
+    elc := (gKind = 3 && !HL.gateOut) ? now - HL.updAt : el
+    l1 := Ease3(Clamp((elc - 60)/380.0, 0.0, 1.0)) * (HL.gateOut ? f : 1)
+    l2 := Ease3(Clamp((elc - 140)/380.0, 0.0, 1.0)) * (HL.gateOut ? f : 1)
+    l3 := Ease3(Clamp((elc - 210)/380.0, 0.0, 1.0)) * (HL.gateOut ? f : 1)
+    ; ---- one card, three things to say ----
     ; The opening gate warns that a resolution change will cost the hub; the
-    ; resolution card is that promise being kept. Same geometry, same stagger,
-    ; same glyph - only the words and what the button does differ.
-    if (gKind = 2) {
+    ; resolution card is that promise being kept; the update card is the
+    ; dashboard's question being answered. Same geometry, same stagger.
+    if (gKind = 3)
+        UpdCardCopy(&gTtl, &gL1, &gL2)
+    else if (gKind = 2) {
         gTtl := "RESOLUTION CHANGE DETECTED"
         gL1  := "The hub builds its layout for the screen it opened on,"
         gL2  := "so it cannot follow this one. It will close."
@@ -31720,21 +32388,45 @@ HubGateDraw(now) {
     }
     Txt(gTtl, tx + (1 - l1)*10, ky + 78, tw, 24, HL.fV
       , FA(Alpha(Mix(0xFFE8EAF6, acc, 0.22), 248), f*l1), fmtL)
-    Txt(gL1, tx + (1 - l2)*10, ky + 108, tw, 18, fHint, FA(0xBEC7CBE0, f*l2), fmtL)
-    Txt(gL2, tx + (1 - l3)*10, ky + 128, tw, 18, fHint, FA(0xBEC7CBE0, f*l3), fmtL)
+    Txt(FFMElide(gL1, fHint, tw), tx + (1 - l2)*10, ky + 108, tw, 18, fHint, FA(0xBEC7CBE0, f*l2), fmtL)
+    Txt(FFMElide(gL2, fHint, tw), tx + (1 - l3)*10, ky + 128, tw, 18, fHint, FA(0xBEC7CBE0, f*l3), fmtL)
 
+    ; ---- the buttons ----
+    if (gKind = 3) {
+        HubUpdBtns(&by, &bw, &bh, &x1, &z1, &x2, &z2, &n)
+        by += (1 - f)*20               ; they ride the card's slide
+        FadeLine(kx + 26, kx + kw - 26, by - 18, 0x1EFFFFFF, f)
+        ; and follow the copy in, a beat behind its third line - but leave
+        ; with the card, not on their own clock
+        bf := HL.gateOut ? f : f*Ease3(Clamp((elc - 300)/320.0, 0.0, 1.0))
+        if (n >= 1)
+            HubGateBtnDraw(z1, x1, by, bw, bh, z1 = 2002 ? (HL.updPhase = 2 ? "UPDATE" : "CLOSE") : "CANCEL"
+                         , acc, bf, now, z1 = 2002)
+        if (n = 2)
+            HubGateBtnDraw(z2, x2, by, bw, bh, "CANCEL", acc, bf, now, 0)
+        return
+    }
     HubGateBtn(&bx, &by, &bw, &bh)
     by += (1 - f)*20                   ; the button rides the card's slide
     FadeLine(kx + 26, kx + kw - 26, by - 18, 0x1EFFFFFF, f)
-    ; ---- the button ----
-    ; It was a rounded rectangle with a word in it, which on a card carrying
-    ; this much else read as the least considered thing on screen. Six layers
-    ; now, all of them doing something: a halo that puts it above the card, a
-    ; gradient body, a top-edge highlight so it reads as lit from above rather
-    ; than merely filled, a sheen that crosses on hover, a ring that expands out
-    ; of the press, and a tick that draws itself in beside the label.
-    hv := HL.h.Get(1210, 0.0)
-    pAt := FFM.clickAt.Has(1210) ? now - FFM.clickAt[1210] : 99999
+    HubGateBtnDraw(1210, bx, by, bw, bh, (gKind = 2) ? "CLOSE HUB" : "GOT IT", acc, f, now, 1)
+}
+; ---- the card's button ----
+; It was a rounded rectangle with a word in it, which on a card carrying this
+; much else read as the least considered thing on screen. Six layers now, all
+; of them doing something: a halo that puts it above the card, a gradient
+; body, a top-edge highlight so it reads as lit from above rather than merely
+; filled, a sheen that crosses on hover, a ring that expands out of the press,
+; and the label lifting a hair on hover and sinking on press - which is how
+; every button from FFMBtn down draws its label, centred across the whole
+; face with no glyph.
+;
+; primary = 0 is the way back - CANCEL beside UPDATE. The card's own surface
+; with the accent as an edge, and the hub's centre-out underline on hover, so
+; it is unmistakably a button and unmistakably not the offer.
+HubGateBtnDraw(z, bx, by, bw, bh, label, acc, f, now, primary := 1) {
+    hv := HL.h.Get(z, 0.0)
+    pAt := FFM.clickAt.Has(z) ? now - FFM.clickAt[z] : 99999
     pr  := (pAt < 150) ? 1 - pAt/150.0 : 0.0
     lift := -2.0*hv + 2.4*pr
     st := PushXform(bx + bw/2, by + bh/2 + lift, 1 - 0.025*pr, 0)
@@ -31746,46 +32438,52 @@ HubGateDraw(now) {
         pn := Pen(FA(Alpha(AccHi(acc, 0.45), Round(150*(1 - rp))), f), 1.6*(1 - rp) + 0.4)
         StrokeRR(x0 - gr, y0 - gr, bw + gr*2, bh + gr*2, 10 + gr, pn), DelP(pn)
     }
-    ; halo: lifts it off the card instead of just brightening in place
-    if (hv > 0.01) {
-        b := SBrush(FA(Alpha(AccHi(acc, 0.4), Round(34*hv)), f))
-        FillRR(x0 - 6, y0 - 5, bw + 12, bh + 10, 14, b), DelB(b)
+    if primary {
+        ; halo: lifts it off the card instead of just brightening in place
+        if (hv > 0.01) {
+            b := SBrush(FA(Alpha(AccHi(acc, 0.4), Round(34*hv)), f))
+            FillRR(x0 - 6, y0 - 5, bw + 12, bh + 10, 14, b), DelB(b)
+        }
+        ShadowDraw(x0, y0 + 2, bw, bh, 10, 4, 26, 14, f*(0.55 + 0.45*hv), 1.0)
+        b := VBrush(x0, y0, bw, bh, FA(Alpha(AccHi(acc, 0.5), Round(198 + 40*hv)), f)
+                                  , FA(Alpha(acc, Round(140 + 40*hv)), f))
+        FillRR(x0, y0, bw, bh, 10, b), DelB(b)
+        ; lit from above: a bright hairline along the top inside edge
+        b := VBrush(x0 + 6, y0 + 1, bw - 12, bh*0.42, FA(Alpha(0xFFFFFF, Round(52 + 26*hv)), f)
+                                                    , FA(Alpha(0xFFFFFF, 0), f))
+        FillRR(x0 + 6, y0 + 1, bw - 12, bh*0.42, 8, b), DelB(b)
+        ; a sheen that crosses once as the pointer arrives
+        if (hv > 0.02 && hv < 0.995) {
+            sx2 := x0 - 30 + (bw + 60)*hv
+            pth := RRPath(x0, y0, bw, bh, 10)
+            DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pth, "int", 0)
+            b := HBrush(sx2 - 16, y0, 32, bh, FA(Alpha(0xFFFFFF, 0), f)
+                                            , FA(Alpha(0xFFFFFF, Round(46*Sin(hv*3.14159))), f))
+            FillRR(sx2 - 16, y0, 32, bh, 0, b), DelB(b)
+            DllCall("gdiplus\GdipResetClip", "ptr", G)
+            DllCall("gdiplus\GdipDeletePath", "ptr", pth)
+        }
+        pn := Pen(FA(Alpha(AccHi(acc, 0.6), Round(215 + 40*hv)), f), 1.3)
+        StrokeRR(x0, y0, bw, bh, 10, pn), DelP(pn)
+        tc := FA(0xFFFFFFFF, f)
+    } else {
+        if (hv > 0.01) {
+            b := SBrush(FA(Alpha(0xFFFFFF, Round(10*hv)), f))
+            FillRR(x0 - 4, y0 - 3, bw + 8, bh + 6, 12, b), DelB(b)
+        }
+        b := VBrush(x0, y0, bw, bh, FA(Alpha(0xFFFFFF, Round(14 + 10*hv)), f)
+                                  , FA(Alpha(0xFFFFFF, Round(6 + 6*hv)), f))
+        FillRR(x0, y0, bw, bh, 10, b), DelB(b)
+        pn := Pen(FA(Alpha(acc, Round(90 + 110*hv)), f), 1.1)
+        StrokeRR(x0, y0, bw, bh, 10, pn), DelP(pn)
+        if (hv > 0.02 && !hubLowPerf) {
+            uw := (bw - 24)*Ease3(hv)
+            b := SBrush(FA(Alpha(acc, Round(160*hv)), f))
+            FillRR(x0 + bw/2 - uw/2, y0 + bh - 4, uw, 2, 1, b), DelB(b)
+        }
+        tc := FA(Alpha(Mix(0xFFC7CBE0, 0xFFFFFFFF, hv), Round(200 + 55*hv)), f)
     }
-    ShadowDraw(x0, y0 + 2, bw, bh, 10, 4, 26, 14, f*(0.55 + 0.45*hv), 1.0)
-    b := VBrush(x0, y0, bw, bh, FA(Alpha(AccHi(acc, 0.5), Round(198 + 40*hv)), f)
-                              , FA(Alpha(acc, Round(140 + 40*hv)), f))
-    FillRR(x0, y0, bw, bh, 10, b), DelB(b)
-    ; lit from above: a bright hairline along the top inside edge
-    b := VBrush(x0 + 6, y0 + 1, bw - 12, bh*0.42, FA(Alpha(0xFFFFFF, Round(52 + 26*hv)), f)
-                                                , FA(Alpha(0xFFFFFF, 0), f))
-    FillRR(x0 + 6, y0 + 1, bw - 12, bh*0.42, 8, b), DelB(b)
-    ; a sheen that crosses once as the pointer arrives
-    if (hv > 0.02 && hv < 0.995) {
-        sx2 := x0 - 30 + (bw + 60)*hv
-        pth := RRPath(x0, y0, bw, bh, 10)
-        DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pth, "int", 0)
-        b := HBrush(sx2 - 16, y0, 32, bh, FA(Alpha(0xFFFFFF, 0), f)
-                                        , FA(Alpha(0xFFFFFF, Round(46*Sin(hv*3.14159))), f))
-        FillRR(sx2 - 16, y0, 32, bh, 0, b), DelB(b)
-        DllCall("gdiplus\GdipResetClip", "ptr", G)
-        DllCall("gdiplus\GdipDeletePath", "ptr", pth)
-    }
-    pn := Pen(FA(Alpha(AccHi(acc, 0.6), Round(215 + 40*hv)), f), 1.3)
-    StrokeRR(x0, y0, bw, bh, 10, pn), DelP(pn)
-    ; label and tick, centred together rather than the label centred and the
-    ; tick pushed to an edge
-    ; ---- the label, drawn the way every other button in the hub draws it ----
-    ; This was a left-aligned label pushed 22 px right of centre with a hand-drawn
-    ; tick beside it, which is a shape nothing else in the suite uses: every
-    ; button from FFMBtn down is `TxtP(label, bx, by-1.., bw, bh, fBadge, tc,
-    ; fmtC)` - centred across the WHOLE button, no glyph, lifting a hair on hover
-    ; and sinking on press. Beside those, a ticked left-aligned label read as a
-    ; checklist row that had wandered onto a button. The tick was also just wrong
-    ; on the resolution card, where the button closes the hub rather than
-    ; confirming anything.
-    gLbl := (gKind = 2) ? "CLOSE HUB" : "GOT IT"
-    TxtP(gLbl, x0, y0 - 1 - (hubLowPerf ? 0 : 0.6*hv - 0.8*pr), bw, bh
-       , fBadge, FA(0xFFFFFFFF, f), fmtC)
+    TxtP(label, x0, y0 - 1 - (hubLowPerf ? 0 : 0.6*hv - 0.8*pr), bw, bh, fBadge, tc, fmtC)
     Pop(st)
 }
 RNw() => Round(RN_W*scaleF)
@@ -32550,16 +33248,25 @@ HubOpen() {
     ;   HL.rys   APPEARANCE heading
     ;   HL.setr  first appearance row      (4 rows at HL.rh/HL.rgap)
     ;   HL.setb  BEHAVIOUR heading
-    ;   HL.sett  behaviour tile row        (3 across, HL.setw x HL.seth)
+    ;   HL.sett  behaviour tile row        (4 across, HL.setw x HL.seth)
     ;   HL.setp  preview strip             (40 tall)
     ;            RESET card, pinned at HubFtrY() - 46
-    HL.rys := HL.cty + 40, HL.rh := 38, HL.rgap := 6
-    HL.setr := HL.rys + 20
-    HL.setb := HL.setr + 4*(HL.rh + HL.rgap) + 14
+    ; ---- four tiles, and where the height came from ----
+    ; AUTO UPDATE made a fourth switch, and a quarter of the column is too
+    ; narrow for a name beside a switch, so the tile stacks (see the SETTINGS
+    ; renderer) and needs 86 px, not 68, to carry a switch line, a name and
+    ; two captions with real air above and below them. The 18 px came out of
+    ; the page's gaps, none out of anything drawn: 4 between the tab's rule and
+    ; APPEARANCE, 2 under that heading, 6 between the last appearance row and
+    ; BEHAVIOUR, 4 between the tiles and the preview strip, 2 between the
+    ; strip and the RESET card. Every heading still clears its ink by 9-10.
+    HL.rys := HL.cty + 36, HL.rh := 38, HL.rgap := 6
+    HL.setr := HL.rys + 18
+    HL.setb := HL.setr + 4*(HL.rh + HL.rgap) + 8
     HL.sett := HL.setb + 20
-    HL.seth := 68
-    HL.setw := (HL.ctw - 20)/3
-    HL.setp := HL.sett + HL.seth + 10
+    HL.seth := 86
+    HL.setw := (HL.ctw - 30)/4
+    HL.setp := HL.sett + HL.seth + 6
     HL.lky := HL.cty + 300, HL.lkh := 76
     HL.sldx := HL.ctx + 118, HL.sldw := 260
     HL.tbw := 54, HL.tbh := 26, HL.tby := HL.cty + 38
@@ -32590,6 +33297,11 @@ HubOpen() {
     HL.grX := 0, HL.grY := 0, HL.grBX := 0, HL.grBY := 0
     HL.dragT := 0.0, HL.tilt := 0.0
     HL.abT := 0.0, HL.puzT := 0.0, HL.armT := 0.0, HL.actT := 0.0, HL.tintT := hubArmTint ? 1.0 : 0.0, HL.tintAt := 0, HL.lpT := hubLowPerf ? 1.0 : 0.0, HL.lpAt := 0, HL.topT := hubTop ? 1.0 : 0.0, HL.topAt := 0, HL.tmT := hubTrueMin ? 1.0 : 0.0, HL.tmAt := 0, HL.navY := HL.sby + 6.0, HL.modT := 0.0
+    ; AUTO UPDATE's eased switch, and the update card's whole state - see the
+    ; self-update block for what each phase means
+    HL.auT := hubAutoUpd ? 1.0 : 0.0, HL.auAt := 0
+    HL.updPhase := 0, HL.updVer := "", HL.updMsg := "", HL.updTtl := "", HL.updAt := 0
+    HL.updFile := "", HL.updNew := "", HL.updPid := 0
     HL.pokeAt := A_TickCount
     HL.minT := 0.0, HL.minFrom := 0.0, HL.minTo := 0.0, HL.minStart := 0
     ; bx/by above centre the hub on the PRIMARY work area, which is normally
@@ -32744,6 +33456,9 @@ HubOpen() {
     loop SPF_SUB6N
         HL.hz.Push(SPF_SUB6Z + A_Index)
     HL.hz.Push(1210)                         ; the opening gate's GOT IT
+    ; AUTO UPDATE tile; the dashboard's CHECK FOR UPDATES; the update card's
+    ; two buttons (primary UPDATE / CLOSE, secondary CANCEL)
+    HL.hz.Push(58, 2001, 2002, 2003)
     HL.hz.Push(1600, 1601, 1602, 1603, 1604, 1606, 1607, 1699)
     ; one per visible database slot - a fixed band, see RSET_FXZDB
     loop RSET_DBSLOTS
@@ -32774,6 +33489,18 @@ HubZone(sx, sy) {
     ; through is what makes the dim honest: the tabs, the nav rail, the window
     ; chrome and every module control underneath stay unclickable.
     if HubGateUp() {
+        ; the update card has one or two buttons, or none - HubUpdBtns is the
+        ; one source for where they are, the same way HubGateBtn is for GOT IT
+        if (HubGateKind() = 3) {
+            HubUpdBtns(&gby, &gbw, &gbh, &ux1, &uz1, &ux2, &uz2, &un)
+            if (!HL.gateOut && uy >= gby && uy <= gby + gbh) {
+                if (un >= 1 && ux >= ux1 && ux <= ux1 + gbw)
+                    return uz1
+                if (un = 2 && ux >= ux2 && ux <= ux2 + gbw)
+                    return uz2
+            }
+            return 0
+        }
         HubGateBtn(&gbx, &gby, &gbw, &gbh)
         if (!HL.gateOut && ux >= gbx && ux <= gbx + gbw && uy >= gby && uy <= gby + gbh)
             return 1210
@@ -32879,6 +33606,11 @@ HubZone(sx, sy) {
     if (hubTab = 1 && ux >= x0 + HL.ctw - 182 && ux <= x0 + HL.ctw - 40
         && uy >= HL.cty - 3 && uy <= HL.cty + 21)
         return 205
+    ; CHECK FOR UPDATES, in the header of the WHAT'S NEW card beside the
+    ; version badge - the same rectangle the dashboard renderer draws it in
+    if (hubTab = 1 && ux >= x0 + (HL.ctw - 192) - 226 && ux <= x0 + (HL.ctw - 192) - 76
+        && uy >= HL.ly + 10 && uy <= HL.ly + 30)
+        return 2001
     if hubTab = 2 {
         if FFM.view = "db" && FFM.viewT > 0.5
             return FFMDbZone(ux, uy)
@@ -33179,10 +33911,10 @@ HubZone(sx, sy) {
         ; it should be part of the target. Same three-column arithmetic the
         ; renderer uses, so a tile cannot be drawn anywhere its hitbox is not.
         if (uy >= HL.sett && uy <= HL.sett + HL.seth) {
-            loop 3 {
+            loop 4 {
                 tX := HL.ctx + (A_Index - 1)*(HL.setw + 10)
                 if (ux >= tX && ux <= tX + HL.setw)
-                    return A_Index = 1 ? 49 : A_Index = 2 ? 50 : 53
+                    return A_Index = 1 ? 49 : A_Index = 2 ? 50 : A_Index = 3 ? 53 : 58
             }
         }
         ; GALLERY - the MANAGE button in the strip band
@@ -33287,6 +34019,27 @@ HubClick(wParam, lParam, msg, hwnd) {
         ; dip plays, the same as every other button in the suite.
         FFM.clickAt[1210] := A_TickCount
         HubGateDismiss()
+        HubPoke()
+    }
+    ; ---- updates ----
+    ; The dashboard button raises the card; the card's primary answers with
+    ; UPDATE while there is a build to take and CLOSE once there is a verdict;
+    ; CANCEL stops whatever is in flight. All three recorded, for the press dip.
+    else if z = 2001 {
+        FFM.clickAt[2001] := A_TickCount
+        UpdCheckStart()
+    }
+    else if z = 2002 {
+        FFM.clickAt[2002] := A_TickCount
+        if (HL.updPhase = 2)
+            UpdInstallBegin()
+        else
+            HubGateDismiss()
+        HubPoke()
+    }
+    else if z = 2003 {
+        FFM.clickAt[2003] := A_TickCount
+        UpdCancel()
         HubPoke()
     }
     else if z = 1206 {
@@ -33469,6 +34222,8 @@ HubClick(wParam, lParam, msg, hwnd) {
         HubTopSet(!hubTop)
     else if z = 53
         HubTrueMinSet(!hubTrueMin)
+    else if z = 58
+        HubAutoUpdSet(!hubAutoUpd)
     else if z = 54
         ; Deferred by one tick because the card creates a window and re-enters
         ; the message loop, which is not something to do from inside a click
@@ -34155,8 +34910,8 @@ HubTabSet(t) {
 ; this is read from a renderer.
 ;   u = "" means the handle is copied instead of opened.
 CredLinks(who) {
-    ; LUNARIS' YouTube card shows the channel's DISPLAY NAME, not its @handle -
-    ; the url still carries the handle, so the link resolves either way. The
+    ; LUNARIS' YouTube card shows "@Lunaris" as a LABEL, not the channel's real
+    ; @handle - the url still carries the real handle, so the link resolves. The
     ; discord tag is lower-case because discord names are; the roblox one is not.
     ;
     ; `c` is what a copy card puts on the clipboard when it differs from what
@@ -34166,7 +34921,7 @@ CredLinks(who) {
     if (who = 2)
         return [{n: "ROBLOX",  h: "lIIusionator", a: "open profile"
                , u: "https://www.roblox.com/users/10679736474/profile"}
-              , {n: "YOUTUBE", h: "Lunaris",      a: "open channel"
+              , {n: "YOUTUBE", h: "@Lunaris",     a: "open channel"
                , u: "https://www.youtube.com/@Luna_.ris182"}
               , {n: "DISCORD", h: "@liiusionator", a: "copy tag", u: "", c: "liiusionator"}]
     return [{n: "ROBLOX",  h: "lmZeaI",   a: "open profile"
@@ -34348,7 +35103,7 @@ SetTileIcon(i, cx, cy, on, acc, f, now) {
         pn := Pen(FA(Alpha(on > 0.5 ? C_ON : acc, Round(150 + 80*on)), f), 1.4)
         StrokeRR(cx - 4, fy, 13, 11, 2.2, pn)
         Line(cx - 4, fy + 3.4, cx + 9, fy + 3.4, pn), DelP(pn)
-    } else {
+    } else if (i = 3) {
         ; minimize: an arrow dropping into a tray, which fills as it lands
         pn := Pen(FA(Alpha(on > 0.5 ? C_ON : acc, Round(150 + 80*on)), f), 1.5)
         ay := cy - 8 + 4*on
@@ -34361,6 +35116,22 @@ SetTileIcon(i, cx, cy, on, acc, f, now) {
         if (on > 0.02) {
             b := SBrush(FA(Alpha(C_ON, Round(150*on)), f))
             FillRR(cx - 7, cy + 7 - 3.4*on, 14, 3.4*on, 1.2, b), DelB(b)
+        }
+    } else {
+        ; auto update: a circular arrow that closes its loop as the switch
+        ; engages, and a dot that lands in the middle once it has
+        col4 := on > 0.5 ? C_ON : acc
+        pn := Pen(FA(Alpha(col4, Round(150 + 80*on)), f), 1.5)
+        sw4 := 215 + 100*on
+        Arc(cx - 8, cy - 8, 16, 16, -60, sw4, pn)
+        ae := (-60 + sw4)*0.0174533
+        ex := cx + 8*Cos(ae), ey := cy + 8*Sin(ae)
+        tx4 := -Sin(ae), ty4 := Cos(ae)                ; the arc's direction of travel at its tip
+        Line(ex, ey, ex - 4.2*tx4 + 2.6*Cos(ae), ey - 4.2*ty4 + 2.6*Sin(ae), pn)
+        Line(ex, ey, ex - 4.2*tx4 - 2.6*Cos(ae), ey - 4.2*ty4 - 2.6*Sin(ae), pn), DelP(pn)
+        if (on > 0.02) {
+            b := SBrush(FA(Alpha(C_ON, Round(170*on)), f))
+            FillEll(cx - 2.4*on, cy - 2.4*on, 4.8*on, 4.8*on, b), DelB(b)
         }
     }
 }
@@ -34643,6 +35414,16 @@ HubTrueMinSet(v) {
         HL.tmAt := A_TickCount
     HubPoke()
 }
+; AUTO UPDATE. Nothing to apply live: the setting is read at the next launch,
+; and the tile's caption says so. The ring pulse is the acknowledgement.
+HubAutoUpdSet(v) {
+    global hubAutoUpd
+    hubAutoUpd := v ? 1 : 0
+    try IniWrite(hubAutoUpd, iniPath, "hub", "autoupdate")
+    if IsObject(HL)
+        HL.auAt := A_TickCount
+    HubPoke()
+}
 HubResetDesign() {
     HubArmTintSet(1)
     global bgOpacity, hubOpacity
@@ -34683,6 +35464,10 @@ HubFinish() {
     hubLive := 0
     HubTim(0)
     G := G0
+    ; the update card has already swapped the files; the new build starts as
+    ; this one leaves, so the hub's close is the last thing this process shows
+    if (updRestartCmd != "")
+        try Run(updRestartCmd)
     ExitApp
 }
 HubRender() {
@@ -34977,6 +35762,7 @@ HubRender() {
     HL.lpT   += (((hubLowPerf ? 1.0 : 0.0) - HL.lpT))*EK(0.2)
     HL.topT  += ((hubTop ? 1.0 : 0.0) - HL.topT)*EK(0.2)
     HL.tmT   += ((hubTrueMin ? 1.0 : 0.0) - HL.tmT)*EK(0.2)
+    HL.auT   += ((hubAutoUpd ? 1.0 : 0.0) - HL.auT)*EK(0.2)
     HL.actT  += ((enabled ? 1.0 : 0.0) - HL.actT)*EK(0.18)
     tinted := armed && hubArmTint
     HL.armT := HL.armT + ((tinted ? 1.0 : 0.0) - HL.armT)*EK(0.16)
@@ -36147,6 +36933,9 @@ HubRender() {
         || (HL.topAt && now - HL.topAt < 700)
         || Abs(HL.tmT - (hubTrueMin ? 1.0 : 0.0)) > 0.004
         || (HL.tmAt && now - HL.tmAt < 700)
+        || Abs(HL.auT - (hubAutoUpd ? 1.0 : 0.0)) > 0.004
+        || (HL.auAt && now - HL.auAt < 700)
+        || (hubTab = 1 && FFM.clickAt.Has(2001))  ; CHECK FOR UPDATES, pressed
         ; LOW PERFORMANCE MODE was never listed here, so its switch only slid
         ; while something else happened to hold the loop busy - usually the
         ; cursor still being over the row. Added alongside the new one rather
@@ -36294,7 +37083,28 @@ HubRender() {
     ; still wins, so anything actually in flight - a drag, a transition, an edit
     ; - finishes at full rate whatever has focus. Applied only with FPS BOOST on,
     ; so it arrives with the feature it belongs to.
-    if (!busy && spfFps && WinActive("ahk_exe RobloxPlayerBeta.exe"))
+    ; ---- stand down while the SOLVER is running ----
+    ; PuzUiBreath yields every PZ_BreathMs so a four-second search does not look
+    ; like a hang - and an AHK Sleep runs every timer that is due, so each of
+    ; those yields costs a whole hub frame. How expensive that frame is depends
+    ; entirely on what happens to be on screen: an idle DASHBOARD is cheap, the
+    ; community panel with its eight-frame crossfading reel is not, and the
+    ; minimised pill crossfading its gallery sits in between. So the same board
+    ; solved twice took different amounts of time for reasons that had nothing
+    ; to do with the board.
+    ;
+    ; This used to pin the hub to TICK_Z for the duration, which reduced
+    ; nothing: a 50 ms timer and a 16 ms one both fire exactly once per 200 ms
+    ; yield, so the frame - and its variable cost - landed on every yield
+    ; regardless. Stopped instead, and HubTim refuses every non-zero period
+    ; while PZ_solving so no poke can re-arm it; PuzSolve's finally pokes once
+    ; the session is over and the hub catches up in one frame. The yields still
+    ; pump messages, so the window is never ghosted, and the layered surface
+    ; keeps showing its last frame. This branch is the belt to that guard's
+    ; braces: a frame that somehow ran during a solve stops the timer itself.
+    if PZ_solving
+        HubTim(0)
+    else if (!busy && spfFps && WinActive("ahk_exe RobloxPlayerBeta.exe"))
         HubTim(TICK_G)
     else
         HubTim(busy ? TICK_A : (deep ? TICK_Z : TICK_S))
@@ -36438,6 +37248,13 @@ HubRender() {
             b := SBrush(FA(Alpha(hubCur, 26), f))
             FillRR(x0 + colw - 64, ly + 12, 52, 16, 5, b), DelB(b)
             Txt(ZVER, x0 + colw - 64, ly + 11, 52, 16, HL.fS, FA(Alpha(AccHi(hubCur, 0.4), 230), f), fmtC)
+            ; ---- CHECK FOR UPDATES ----
+            ; Beside the version badge, in the header, because the badge is the
+            ; thing it asks about - and because the footer could not hold it:
+            ; seven changelog rows run to 21 px above the card's floor, and a
+            ; button there sat on the seventh. It answers on the gate card,
+            ; see UpdCheckStart. HubZone tests this same rectangle.
+            FFMBtn(2001, x0 + colw - 226, ly + 10, 150, 20, "CHECK FOR UPDATES", hubCur, f, 0)
             FadeLine(x0 + 12, x0 + colw - 12, ly + 33, 0x16FFFFFF, f)
             nrows := Min(7, CHANGELOG.Length)
             loop nrows {
@@ -38154,10 +38971,15 @@ HubRender() {
                 }
             }
             ; ================= BEHAVIOUR =================
-            ; Three tiles across. Each carries its own glyph, its name, the
+            ; Four tiles across. Each carries its own glyph, its name, the
             ; state in words and what that state means - so the switch is never
             ; the only thing telling you what it does, which is what made the
             ; old rows unreadable at a glance.
+            ; Four, not three, once AUTO UPDATE joined. A quarter of the column
+            ; is 135 px, and a name beside a switch does not fit in that, so
+            ; the tile stacks now: glyph and switch on the first line, the name
+            ; under them, the two captions under that. The captions are worded
+            ; to the width; FFMElide is the safety net, not the plan.
             SetHead(x0, HL.ctw, HL.setb + dy2, "BEHAVIOUR", hubCur, f, now)
             ; Every ternary here is kept on ONE line on purpose. A continuation
             ; line beginning with ":" is legal at statement level, but inside an
@@ -38165,14 +38987,17 @@ HubRender() {
             ; its value - not something to make the parser decide about.
             bT := [{z: 49, t: "PERFORMANCE", on: hubLowPerf, e: HL.lpT, at: HL.lpAt
                   , l1: hubLowPerf ? "effects off" : "full effects"
-                  , l2: hubLowPerf ? "flat, no motion, capped fps" : "every surface and animation"}
+                  , l2: hubLowPerf ? "flat, no motion" : "every surface animates"}
                  , {z: 50, t: "ON TOP", on: hubTop, e: HL.topT, at: HL.topAt
                   , l1: hubTop ? "always on top" : "normal window"
-                  , l2: hubTop ? "stays above other windows" : "other windows can cover it"}
+                  , l2: hubTop ? "stays above windows" : "windows can cover it"}
                  , {z: 53, t: "MINIMIZE", on: hubTrueMin, e: HL.tmT, at: HL.tmAt
                   , l1: hubTrueMin ? "true minimize" : "minimize to a pill"
-                  , l2: hubTrueMin ? "hidden - reopen from the tray" : "a pill stays on screen"}]
-            loop 3 {
+                  , l2: hubTrueMin ? "reopen from the tray" : "a pill stays on screen"}
+                 , {z: 58, t: "AUTO UPDATE", on: hubAutoUpd, e: HL.auT, at: HL.auAt
+                  , l1: hubAutoUpd ? "checks at launch" : "manual only"
+                  , l2: hubAutoUpd ? "installs newer builds" : "dashboard check only"}]
+            loop 4 {
                 k7 := A_Index
                 it7 := bT[k7]
                 tx0 := x0 + (k7 - 1)*(HL.setw + 10)
@@ -38192,16 +39017,22 @@ HubRender() {
                 pn := Pen(FA(Alpha(se7 > 0.5 ? hubCur : 0xFFFFFF
                                  , Round((se7 > 0.5 ? 70 : 28) + 60*hv7)), f), 1)
                 StrokeRR(tx0, ty0, HL.setw, HL.seth, 10, pn), DelP(pn)
-                SetTileIcon(k7, tx0 + 18, ty0 + 21, se7, hubCur, f, now)
-                Txt(it7.t, tx0 + 34, ty0 + 13, HL.setw - 92, 16, fBadge
+                ; glyph left, switch right, on one line. The glyph's ink starts
+                ; at +14, the same edge the text sits on, and the switch keeps
+                ; 10 to the right - the tile's margins are 10 top, 10 right,
+                ; 14 left, and the last caption's ink ends 11 above the floor.
+                SetTileIcon(k7, tx0 + 22, ty0 + 21, se7, hubCur, f, now)
+                FFMTogDraw(tx0 + HL.setw - 54, ty0 + 10, 44, 22, it7.e, hubCur, hv7, f)
+                ; the name under them, at the full width of the tile, then the
+                ; state and what it means - each line its own step down
+                Txt(it7.t, tx0 + 14, ty0 + 37, HL.setw - 28, 16, fBadge
                   , FA(Alpha(Mix(0xFFE8EAF6, hubCur, 0.18), 235), f), fmtL)
-                FFMTogDraw(tx0 + HL.setw - 52, ty0 + 10, 44, 22, it7.e, hubCur, hv7, f)
-                Txt(FFMElide(it7.l1, HL.fXs, HL.setw - 28), tx0 + 14, ty0 + 36
-                  , HL.setw - 28, 14, HL.fXs
+                Txt(FFMElide(it7.l1, HL.fXs, HL.setw - 28), tx0 + 14, ty0 + 55
+                  , HL.setw - 28, 13, HL.fXs
                   , FA(Alpha(it7.on ? Mix(0xFFE8EAF6, C_ON, 0.35) : 0xFFC7CBE0
                            , it7.on ? 225 : 150), f), fmtL)
-                Txt(FFMElide(it7.l2, HL.fXs, HL.setw - 28), tx0 + 14, ty0 + 50
-                  , HL.setw - 28, 13, HL.fXs, FA(0x66C7CBE0, f), fmtL)
+                Txt(FFMElide(it7.l2, HL.fXs, HL.setw - 28), tx0 + 14, ty0 + 67
+                  , HL.setw - 28, 12, HL.fXs, FA(0x66C7CBE0, f), fmtL)
                 if (it7.at && now - it7.at < 620) {
                     e7 := Ease3((now - it7.at)/620.0)
                     ex7 := e7*12
@@ -40338,7 +41169,10 @@ ScrRetok() {
 ; ================= password gate =================
 PasswordGate() {
     global G
-    static PASS := "MOON"
+    ; MOON is gone - keys come from the server now, see KeyOk. gPend holds a
+    ; submission made before the list arrived.
+    gPend := ""
+    gBuf := "", gPasteAt := 0
 
     CW2 := 560, CH2 := 312, PD := 26
     BW2 := CW2 + PD*2, BH2 := CH2 + PD*2
@@ -40412,7 +41246,21 @@ PasswordGate() {
     selQ := 0
     ringW := Map()
 
-    ih := InputHook("L64", "{Enter}{NumpadEnter}{Escape}")
+    ; ---- the buffer is gBuf, not ih.Input ----
+    ; InputHook only ever sees KEYSTROKES, so Ctrl+V produced nothing to read -
+    ; there was no way to paste a key, which for a 32-character hex string is
+    ; the way anyone would actually enter it.
+    ;
+    ; Characters are collected through OnChar into a buffer this code owns, and
+    ; backspace is taken off the hook (BackspaceIsUndo) and handled here, so
+    ; typed text and pasted text live in the same place and behave the same.
+    ; L64 is gone with it: that ENDED the input at 64 characters, and the cap
+    ; belongs in GChar now, where it can apply to a paste as well.
+    ih := InputHook("", "{Enter}{NumpadEnter}{Escape}")
+    ih.BackspaceIsUndo := false
+    ih.OnChar := GChar
+    ih.OnKeyDown := GKey
+    ih.KeyOpt("{Backspace}{vk56}{vk2D}", "N")     ; V and Insert, for the paste chords
     ih.OnEnd := GEnd
     ih.Start()
 
@@ -40428,7 +41276,7 @@ PasswordGate() {
         ux := (sx - gpx)/k, uy := (sy - gpy)/k
         if (ux - bcxU)**2 + (uy - btyU)**2 <= 81
             return 2
-        if ux >= fx + fw - 66 && ux <= fx + fw - 8 && uy >= fy + 8 && uy <= fy + 36 && gFoc && StrLen(ih.Input) > 0
+        if ux >= fx + fw - 66 && ux <= fx + fw - 8 && uy >= fy + 8 && uy <= fy + 36 && gFoc && StrLen(gBuf) > 0
             return 3
         if ux >= fx && ux <= fx + fw && uy >= fy && uy <= fy + fh
             return 7
@@ -40510,7 +41358,8 @@ PasswordGate() {
         if gFoc || gOkAt || gCloseAt || gDone
             return
         gFoc := 1, gFocusAt := A_TickCount, gPrevLen := 0
-        try ih.Start()                              ; fresh buffer on refocus
+        gBuf := ""                                  ; fresh buffer on refocus
+        try ih.Start()
     }
     GBlur() {
         if !gFoc || gOkAt || gCloseAt
@@ -40556,18 +41405,62 @@ PasswordGate() {
     GSubmit() {
         if gCloseAt || gOkAt || gDone || !gFoc
             return
-        p := ih.Input
+        p := gBuf
         if p = "" {
             try ih.Start()
             return
         }
-        if StrUpper(p) = PASS {
+        ; ---- do not reject what has not been checked ----
+        ; The list may still be in flight. Failing the key here would be a lie
+        ; and would burn a try, so the submission is HELD and GRender judges it
+        ; the moment an answer lands.
+        if (!KeyOk(p) && !KeyFetchPoll()) {
+            gPend := p
+            try ih.Stop()
+            return
+        }
+        GJudge(p)
+    }
+    GChar(hook, ch) {
+        ; Ctrl chords translate to control codes - Ctrl+V is 0x16 - and those
+        ; are not text. Enter and Backspace arrive here as 0x0D and 0x08 too.
+        if (Ord(ch) < 32)
+            return
+        if (StrLen(gBuf) < 64)
+            gBuf .= ch
+    }
+    GKey(hook, vk, sc) {
+        ctlG := GetKeyState("Control", "P")
+        shfG := GetKeyState("Shift", "P")
+        if (vk = 8) {
+            gBuf := ctlG ? "" : SubStr(gBuf, 1, -1)   ; ctrl+backspace clears it
+            return
+        }
+        ; Both chords, because half of Windows uses the other one.
+        if ((vk = 86 && ctlG) || (vk = 45 && shfG))
+            GPaste()
+    }
+    GPaste() {
+        c := ""
+        try c := A_Clipboard
+        ; A key copied out of a chat message, a file or a browser arrives with
+        ; its line break and usually some surrounding space. None of that is
+        ; part of the key, and leaving it in makes a correct paste fail.
+        c := RegExReplace(c, "[\r\n\t ]", "")
+        if (c = "")
+            return
+        gBuf := SubStr(gBuf . c, 1, 64)
+        gPasteAt := A_TickCount
+    }
+    GJudge(p) {
+        if KeyOk(p) {
             gOkAt := A_TickCount
             try ih.Stop()
             return
         }
         gTries += 1
         gShakeAt := A_TickCount, gDenyAt := gShakeAt, gPrevLen := 0
+        gBuf := ""
         try ih.Stop()
         ih.Start()
     }
@@ -40675,7 +41568,7 @@ PasswordGate() {
         ghE += (((hz = 3) ? 1.0 : 0.0) - ghE)*EK(0.2)
         if ghE < 0.004 && hz != 3
             ghE := 0.0
-        len := gFoc ? StrLen(ih.Input) : 0
+        len := gFoc ? StrLen(gBuf) : 0
         if len != gPrevLen {
             if len > gPrevLen
                 gKeyAt := now
@@ -40701,6 +41594,13 @@ PasswordGate() {
         if gHovAv < 0.004 && hz != 6
             gHovAv := 0.0
 
+        ; A submission made before the key list arrived is judged here, on the
+        ; frame the answer lands - see GSubmit.
+        KeyFetchRetry()
+        if (gPend != "" && KeyFetchPoll()) {
+            gp := gPend, gPend := ""
+            GJudge(gp)
+        }
         ims := now - gIntro
         stg := ims < 700
         s1 := stg ? Ease3((ims - 60)/340.0) : 1.0
@@ -40987,6 +41887,22 @@ PasswordGate() {
             }
         } else
             Txt(gOkAt ? "GRANTED" : "LOCKED", rx, sy, 240, 30, fGateT, FA(Alpha(curG, 245), s2), fmtL)
+        ; ---- and say WHY, when the answer is not simply yes or no ----
+        ; With the key list coming off a server there are two states that are
+        ; neither granted nor denied: still asking, and could not ask. Without
+        ; this the gate silently refuses every key when the server is down, and
+        ; looks identical to a wrong key typed forty times.
+        if !gOkAt {
+            gMsg := (gPasteAt && now - gPasteAt < 1300) ? "pasted"
+                  : !KEYS_REMOTE     ? ""
+                  : (gPend != "")    ? "checking key..."
+                  : (KEYS_ERR != "") ? StrLower(KEYS_ERR)
+                  : !KEYS_IN         ? "contacting key server..."
+                  : ""
+            if (gMsg != "")
+                Txt(gMsg, rx, sy + 32, 260, 14, fGateC
+                    , FA(Alpha((KEYS_ERR != "") ? 0xFFFBBF24 : 0xC7CBE0, 205), s2), fmtL)
+        }
         stw := scr.w
         loop 3 {
             k := A_Index - 1
@@ -41024,7 +41940,12 @@ PasswordGate() {
             Line(vex0, vey, vex1, vey, pn)
         DelP(pn)
         Txt(gOkAt ? "WELCOME" : (gFoc ? "LISTENING" : "STANDBY"), vx + 30, vy + 2, vw - 38, 11, fGateC, FA(Alpha(Mix(curG, 0xFFC7CBE0, 0.5), 150), s2), fmtL)
-        htxt := dnT > 0 ? "access denied" : (gOkAt ? "welcome back, zeal" : (gFoc ? "enter password" : "click card to type"))
+        ; The hint names the paste chord: a 32-character hex key is not something
+        ; anyone types, and an input that looks type-only reads as type-only.
+        htxt := dnT > 0 ? "access denied"
+              : gOkAt   ? "welcome back, zeal"
+              : gFoc    ? "enter password  ·  ctrl+v to paste"
+              :           "click card to type or paste"
         hcol := dnT > 0 ? Alpha(C_BAD, Min(255, 150 + 105*dnT)) : (gOkAt ? Alpha(curG, 205) : 0x62C7CBE0)
         Txt(htxt, rx, cy + 94 + mdy, 250, 16, fHint, FA(hcol, s2), fmtL)
 
@@ -41060,15 +41981,22 @@ PasswordGate() {
         b := SBrush(FA(Alpha(curG, Round(120 + 90*Abs(Sin(DecT(now)*0.0026)))), s2))
         FillEll(rx + cpw - 3.5, cpy + 6.5, 5, 5, b), DelB(b)
         if gCapsE > 0.01 {
-            cbx := rx + fw - 42
+            ; ---- below the standby card, not on top of it ----
+            ; The badge sat at cy+80 while the standby card runs cy+46 to cy+84,
+            ; and its x range is entirely inside the card's - so it overlapped
+            ; the card's bottom-right corner by four pixels. cy+88 clears the
+            ; card by 4 and the divider at cy+108 by 5. The transform pivot has
+            ; to move with it or the pop-in scales about a point that is no
+            ; longer the badge's centre.
+            cbx := rx + fw - 42, cby := cy + 88 + mdy
             cpe := 1 + 0.30*(1 - Ease3(Min((now - gCapsAt)/240.0, 1.0)))
-            stCp := PushXform(cbx + 20, cy + 87 + mdy, cpe, 0)
+            stCp := PushXform(cbx + 20, cby + 7.5, cpe, 0)
             ca_ := gCapsE*(0.75 + 0.25*Sin(DecT(now)*0.006))
             b := SBrush(FA(Alpha(hubAccent, 14 + 40*ca_), s3))
-            FillRR(cbx, cy + 80 + mdy, 40, 15, 5, b), DelB(b)
+            FillRR(cbx, cby, 40, 15, 5, b), DelB(b)
             pn := Pen(FA(Alpha(hubAccent, 170*ca_), s3), 1)
-            StrokeRR(cbx, cy + 80 + mdy, 40, 15, 5, pn), DelP(pn)
-            Txt("CAPS", cbx, cy + 79 + mdy, 40, 15, fBadge
+            StrokeRR(cbx, cby, 40, 15, 5, pn), DelP(pn)
+            Txt("CAPS", cbx, cby - 1, 40, 15, fBadge
               , FA(Alpha(AccHi(hubAccent, 0.45), 240*gCapsE), s3), fmtC)
             Pop(stCp)
         }
@@ -44132,6 +45060,24 @@ HubTim(p) {
     ; this feature exists to remove. Stopping (p = 0) is always allowed.
     if (hubHidden && p)
         return
+    ; ---- and a solve in progress is a window nobody is looking at ----
+    ; The solver yields every PZ_BreathMs, and every timer that is due fires
+    ; ONCE per yield - so the hub's rate during a solve never mattered: at 50 ms,
+    ; 33 ms or 16 ms it landed exactly one frame per yield. What varied was the
+    ; COST of that frame - the pill crossfading its gallery, a full hub on the
+    ; community panel, an idle dashboard - and that cost was paid on every yield
+    ; of every board, which is how the same board took a different time
+    ; depending on what the hub happened to be showing. Solving requires Roblox
+    ; to be FOCUSED, so the hub is behind it; its frames buy nothing there.
+    ; Stopped, not slowed: a slower period still lands its one frame per yield
+    ; until it is longer than the yield interval, and at that point it is a
+    ; static picture with extra steps. HubPoke restarts it when the session
+    ; ends. Here rather than only at the call site in PuzSolve because thirty
+    ; other places ask for TICK_A directly and any one of them would re-arm it.
+    ; IsSet for the same reason HubPoke gives: PZ_solving is assigned after
+    ; HubOpen in the auto-execute order.
+    if (p && IsSet(PZ_solving) && PZ_solving)
+        return
     ; LOW PERFORMANCE MODE caps the frame rate on top of the tiers above it.
     ; 40 ms is still smooth enough to drag a window by; 220 ms is four frames a
     ; second, which is all a static picture needs; 300 ms is the deep tier,
@@ -46173,7 +47119,21 @@ global PZ_iterCap := 0           ; PZ_IterMax() for the solve in flight
 ; Checked every 1024 nodes rather than every node: A_TickCount is a call, the
 ; test is on the hottest line in the module, and 1024 nodes is far below the
 ; resolution that matters here.
-global PZ_SolveMs := 4000        ; wall-clock ceiling for the SEARCH
+global PZ_SolveMs := 4000        ; wall-clock ceiling for the SEARCH, at 10x10 and under
+; ---- and it has to grow with the board ----
+; Four seconds was set when the grid was 6x6 and 7x7, and stayed a constant
+; while the grid became a setting. A 25x25 has thirty-five times the cells and
+; the search scales with the CELLS, not with the clock: measured on 25x25 boards
+; at the density the panel actually deals - around 120 to 140 pairs - the search
+; costs 550,000 to 900,000 nodes where a 10x10 costs 60,000. At roughly 150,000
+; nodes a second interpreted, four seconds was never going to be enough, and the
+; board would come back "out of time" having been perfectly solvable.
+;
+; PZ_iterCap already scales on n squared. This is the same curve, clamped: a
+; 10x10 keeps its four seconds exactly, a 25x25 gets sixteen. The clamp is
+; because n squared alone would hand 25x25 sixty-nine seconds, and nobody is
+; waiting that long for a board that a cancel would end anyway.
+PZ_SolveMax() => Round(PZ_SolveMs * Clamp(PZ_GridN()**2 / 100.0, 1.0, 4.0))
 ; ---- and a ceiling on the whole board, not just the search ----
 ; Every bound in this module so far has been on one stage: the search gets four
 ; seconds, the next-deal poll gets 2.5, a line gets its cell budgets. None of
@@ -46209,7 +47169,10 @@ global PZ_BoardMs  := 12000      ; opening ceiling, before the board is known
 PuzDrawBudget(np) {
     perLine := PZ_FrameMs * (PZ_StartFrames + PZ_PressFrames + PZ_LagFrames
                            + PZ_EndFrames + PZ_SlackFrames + PZ_CellFrames*PZ_GridN())
-    return Max(3000, Round(3 * np * perLine))
+    ; Times the learned pace as well as the 3x for redraws: a board drawn at a
+    ; slowed pace legitimately takes longer, and a budget that did not know that
+    ; would cut it off partway through for doing the right thing.
+    return Max(3000, Round(3 * np * perLine * PZ_paceMul))
 }
 global PZ_boardEnd := 0          ; A_TickCount that press must finish by
 global PZ_boardOut := ""         ; the stage it was in when it ran out
@@ -48681,7 +49644,7 @@ PuzCalCard(warn := "") {
     PuzCalDraw()
 }
 PuzCalCardKill() {
-    global PZ_calGui, PZ_calDc, PZ_calBm, PZ_calG, PZ_calStep
+    global PZ_calGui, PZ_calDc, PZ_calBm, PZ_calG, PZ_calStep, PZ_calWarn
     if (PZ_calGui = "")
         return
     SetTimer(PuzCalDraw, 0)
@@ -49218,6 +50181,7 @@ PuzSolve() {
     ; local no matter that a super-global of that name exists - the count would
     ; rise inside this call and be thrown away when it returned.
     global PZ_solving, PZ_runs, PZ_total, PZ_sess
+    global PZ_paceMul, PZ_paceOk
     global PZ_auPairs, PZ_auShort, PZ_auCells
     global PZ_cancel, PZ_cancelUp
     if (PZ_solving || !puzOn)
@@ -49243,6 +50207,21 @@ PuzSolve() {
     ; false and a hold can never cancel itself.
     PZ_cancel := 0, PZ_cancelUp := 0
     PZ_solving := 1, PZ_runs := 0
+    ; The learned pace starts over on every PRESS. It carries board to board
+    ; WITHIN a hold, where the game state is continuous and what it learned is
+    ; still true - but a new press is a new attempt at the speed the slider
+    ; asked for, and the slowdown it inherited from a stutter three sessions
+    ; ago is noise, not a measurement of the machine. Held over presses, a
+    ; single missed line cost 30% of the pace until fifteen clean lines had
+    ; paid it back, and the only way to get the slider's own speed again was
+    ; to press until enough of them accumulated. If the game genuinely needs
+    ; the slower pace, line one of the next press rediscovers it in one miss.
+    PZ_paceMul := 1.0, PZ_paceOk := 0
+    ; The hub renderer goes quiet for the session - see the guard in HubTim for
+    ; why stopped rather than slowed. AFTER PZ_solving is raised, so the guard
+    ; is already holding the door when this asks for 0; the finally's HubPoke
+    ; brings it back once PZ_solving is down again.
+    HubTim(0)
     ; per SESSION, like PZ_runs - the point is comparing one tuning setting
     ; against another, and a lifetime total cannot do that
     PZ_auPairs := 0, PZ_auShort := 0, PZ_auCells := 0
@@ -49474,64 +50453,45 @@ PuzHeld() {
 ; checks each line the moment it is drawn, before the next one covers anything.
 ; The board-level repair had no sound version of itself left, so it now reports
 ; instead of grinding.
-; ---- ADJACENCY, not colour counts ----
-; This counted colours and rejected the board once TWO of them appeared three or
-; more times. That is a claim about the game's PALETTE, not about the board, and
-; it only survived because small boards never tested it: 6x6 carries about eight
-; pairs and 7x7 about eleven, few enough that every pair gets its own colour and
-; nothing ever reaches three. A 10x10 carries twenty-odd and a 25x25 well over a
-; hundred - far more pairs than there are distinguishable colours - so reuse is
-; guaranteed, two colours reach four dots each, and every large board was thrown
-; out as "already drawn on" before the scan was ever used. Six retries later the
-; session ended with "board unreadable". PuzMatchBucket exists precisely to pair
-; a colour used by two different pairs; this test was rejecting the boards that
-; feature was written for.
+; ---- REVERTED to the frequency test, because the adjacency one was wrong ----
+; I replaced this with a test that counted how many dots have an orthogonal
+; neighbour of the same colour, on the reasoning that a drawn line is a
+; connected run of one colour while a deal's endpoints are isolated. That
+; reasoning assumes a SPARSE board - Flow-style, a handful of endpoints in a
+; field of empty cells. This board is dense: PuzScanGrid pushes a dot for every
+; cell that clears PZ_BrightThresh, so on a full grid every dot has four
+; neighbours and two endpoints of one pair landing side by side is ordinary,
+; not evidence of anything. The allowance was three. Real boards blew past it
+; immediately and every grid stopped solving.
 ;
-; What actually separates a deal from a drawn board is not how often a colour
-; appears but WHERE: a drawn line is a connected run of cells all reading as its
-; endpoint colour, so almost every dot on it has an orthogonal neighbour of the
-; same colour. On a deal the endpoints are isolated - two pairs sharing a colour
-; are at opposite ends of the board, not touching. That holds at any board size
-; and at any palette size, which is the property the old test did not have.
+; This is the version that was working at 6x6 and 7x7, restored unchanged.
 ;
-; A pair whose two endpoints happen to be orthogonally adjacent is legal and
-; contributes two, so the allowance is a small fraction rather than zero.
+; KNOWN LIMITATION, and it is the one that sent me down this road: `over >= 2`
+; is a claim about the game's PALETTE, not the board. It holds while a board has
+; fewer pairs than there are distinguishable colours - true at 6x6 and 7x7 - and
+; fails on 10x10 and 25x25, where reuse is guaranteed and the board is thrown
+; out as "already drawn on". Fixing that properly needs the colour histogram of
+; a real 10x10 deal, not another guess at a threshold.
 PuzLooksLikeDeal(dots) {
     if (dots.Length < 4)
         return 0
-    ; ---- the background-bleed case, as a FRACTION of the board ----
-    ; A cell background bright enough to clear PZ_BrightThresh reads as a dot in
-    ; every cell it shows through, so the whole board arrives as one colour seen
-    ; fifty times. Still worth catching, but a flat 4 said "no colour may serve
-    ; more than two pairs", which is false on anything large. A third of every
-    ; dot on the board is far above any legitimate reuse.
-    seen := Map()
-    for d in dots
-        seen[d.col] := seen.Has(d.col) ? seen[d.col] + 1 : 1
-    lim := Max(4, dots.Length // 3)
-    for , v in seen {
-        if (v > lim)
+    seen := Map(), over := 0
+    for d in dots {
+        c := d.col
+        seen[c] := seen.Has(c) ? seen[c] + 1 : 1
+        if (seen[c] = 3)                       ; counted once, on the third sighting
+            over++
+        ; Two over-full colours is a drawn board. ONE over-full colour that is
+        ; very over-full is a different failure with the same cost: a cell
+        ; background bright enough to clear PZ_BrightThresh reads as a dot in
+        ; every cell it shows through, so the whole board arrives as one colour
+        ; seen fifty times. That passed a test that only counted how MANY
+        ; colours were over-full, and the fifty "pairs" it produced were the
+        ; unsolvable board the search then spent its whole budget on.
+        if (over >= 2 || seen[c] > 4)
             return 0
     }
-    ; ---- and the drawn board ----
-    ; kb = n+1 for the same reason PuzReachable and PuzTryRoute use it: packing
-    ; (r,c) into one integer needs a base above the largest column, and c runs to
-    ; 25 here. c is 1..n, so k-1 at c=1 and k+1 at c=n land on a column 0 that no
-    ; dot can occupy - the lookup simply misses rather than aliasing a neighbour.
-    kb := PZ_GridN() + 1
-    at := Map()
-    for d in dots
-        at[d.r * kb + d.c] := d.col
-    chain := 0
-    for d in dots {
-        k := d.r * kb + d.c
-        if ((at.Has(k - kb) && at[k - kb] = d.col)
-         || (at.Has(k + kb) && at[k + kb] = d.col)
-         || (at.Has(k - 1)  && at[k - 1]  = d.col)
-         || (at.Has(k + 1)  && at[k + 1]  = d.col))
-            chain++
-    }
-    return (chain > Max(2, dots.Length // 10)) ? 0 : 1
+    return 1
 }
 
 PuzBoardSig(dots) {
@@ -49596,7 +50556,10 @@ PuzSolveOne(dots := "") {
     ; never reaches the solver, and a stale code from the previous board would
     ; make PuzSolve treat a bad read as a stopped search.
     PZ_solveOut := 0
-    PZ_boardEnd := A_TickCount + PZ_BoardMs, PZ_boardOut := ""
+    ; The board's ceiling has to leave room for the search's, or the Min() in
+    ; PuzSolveBoard would hand the extra time straight back.
+    PZ_boardEnd := A_TickCount + PZ_BoardMs + Max(0, PZ_SolveMax() - PZ_SolveMs)
+    PZ_boardOut := ""
     PZ.tScan := 0, PZ.tPair := 0, PZ.tSolve := 0, PZ.tOpt := 0, PZ.tDraw := 0
     t0 := A_TickCount
     if !IsObject(dots) {
@@ -49813,12 +50776,56 @@ global PZ_Verify := 1            ; 0 goes back to drawing blind
 ; and cleared afterwards, so the next line starts at full speed again.
 global PZ_retryMul := 1.0        ; transient - non-1.0 ONLY inside a verify redraw
 global PZ_SlowStep := 1.8        ; how much slower a failed line is redrawn
+; ---- and the pace LEARNS, instead of assuming ----
+; PZ_FrameMs is an ASSUMED game frame period - the file says so at the top - and
+; the slider sets it between 42 ms and 5 ms. Five is an assumption of 200 FPS.
+; When the game is actually running slower than the assumption the walk outruns
+; it, cells get skipped, the line comes up short, PuzVerifyLine catches it and
+; redraws that one line 1.8x slower.
+;
+; Which is where the inconsistency comes from, and it is not the solver at all:
+; how MANY lines fail depends on the game's instantaneous frame rate, so the
+; same board drawn twice costs a different number of slow redraws. Nothing about
+; the code changed between the fast run and the slow one - Roblox did.
+;
+; The retry was per-line and forgotten immediately, so every line paid the same
+; discovery cost over and over. This carries it: a failure slows the REST of the
+; board, and a run of clean lines gives a little back. The pace converges on the
+; fastest one this machine and this game actually sustain, usually within a line
+; or two, and holds for the rest of the hold. It does NOT hold across presses -
+; PuzSolve starts each one at the slider's speed - because carrying it that far
+; turned out to carry the stutters too, and "reset it a few times until it goes
+; fast" was the user doing by hand what the reset now does.
+global PZ_paceMul  := 1.0        ; learned pace, 1.0 = the slider's own speed
+global PZ_paceOk   := 0          ; lines in a row that landed first time
+global PZ_PACE_UP   := 1.30      ; a failure slows what is left by this
+; The give-back was 0.94 per THREE clean lines: fifteen clean lines to undo one
+; miss, forty-eight to come down from the cap, and every miss on the way reset
+; the count. On a seven-by-seven that is boards, not lines, and it is what made
+; one stutter linger for the rest of a hold. 0.90 per two lines undoes a miss
+; in six and the cap in eighteen - still slower than the slowdown, so a pace
+; that is genuinely needed is not thrown away on a single clean line and then
+; missed again, but no longer a tax that outlives the board that levied it.
+global PZ_PACE_DOWN := 0.90      ; a clean run hands some back, more gently
+global PZ_PACE_MAX  := 2.60      ; ceiling, so one bad board cannot crawl
+global PZ_PACE_RUN  := 2         ; clean lines needed before easing back
 PuzVerifyLine(pairs, k, path) {
-    global PZ_retryMul
+    global PZ_retryMul, PZ_paceMul, PZ_paceOk
     if (!PZ_Verify || path.Length < 3)
         return
-    if !PuzAuditPath(pairs, k, path)
+    if !PuzAuditPath(pairs, k, path) {
+        ; It landed. A run of clean lines says the pace is not what is hurting,
+        ; so give a little of it back and keep probing for faster.
+        if (++PZ_paceOk >= PZ_PACE_RUN) {
+            PZ_paceOk := 0
+            PZ_paceMul := Max(1.0, PZ_paceMul * PZ_PACE_DOWN)
+        }
         return                       ; the line is on the board - nothing to do
+    }
+    ; It did not. The next line is about to be drawn into the same conditions,
+    ; so slow those too rather than rediscovering this one line at a time.
+    PZ_paceOk := 0
+    PZ_paceMul := Min(PZ_paceMul * PZ_PACE_UP, PZ_PACE_MAX)
     ; It did not take. Redraw THIS line, and only this line, at the slower pace.
     ; Redrawing a line that partly landed is safe: the game treats a fresh drag
     ; from the same dot as a replacement.
@@ -50284,7 +51291,7 @@ PuzSolveBoard(pairs) {
     PZ_stop := 0                 ; the latch is per SOLVE - see PuzSolveStop
     ; Whichever runs out first. The search used to own four seconds regardless
     ; of how much of the press was already gone.
-    PZ_solveEnd := Min(A_TickCount + PZ_SolveMs, PZ_boardEnd)
+    PZ_solveEnd := Min(A_TickCount + PZ_SolveMax(), PZ_boardEnd)
     PZ_solveOut := 0
     board := []
     loop PZ_GridN() {
@@ -50312,6 +51319,94 @@ PuzRoutePair(k, pairs, board, paths, depth := 0) {
     return PuzDFS(k, pairs, board, paths, p.a.r, p.a.c, p.b.r, p.b.c, path, 0, 0, depth)
 }
 
+; How many free cells this one can still move to.
+PuzFreeDeg(board, n, r, c) {
+    d := 0
+    if (r > 1 && board[r - 1][c] = 0)
+        d++
+    if (r < n && board[r + 1][c] = 0)
+        d++
+    if (c > 1 && board[r][c - 1] = 0)
+        d++
+    if (c < n && board[r][c + 1] = 0)
+        d++
+    return d
+}
+; An endpoint of a pair that has NOT been routed yet still needs a way out.
+; j <= k means the cell belongs to a pair already routed or to the path being
+; drawn right now; above that, only endpoints carry an index, because nothing
+; else has been placed for those pairs.
+PuzEndAlive(k, pairs, board, n, r, c) {
+    j := board[r][c]
+    if (j <= k)
+        return true
+    p := pairs[j]
+    o := (p.a.r = r && p.a.c = c) ? p.b : p.a
+    if (Abs(r - o.r) + Abs(c - o.c) = 1)
+        return true            ; already touching its partner, needs nothing
+    return PuzFreeDeg(board, n, r, c) > 0
+}
+; ---- a path that runs alongside itself is never necessary ----
+; If a route reaches a cell that touches an earlier, non-consecutive cell of the
+; SAME route, it has looped: you could have stepped straight across at the
+; earlier cell and thrown the loop away. The shortened route joins the same two
+; endpoints and occupies a strict SUBSET of the cells, so it cannot block
+; anything the longer one did not. Every solution therefore has a
+; non-self-touching equivalent, and refusing these cannot lose one.
+;
+; It is also by far the strongest prune available here. Measured on the 10x10
+; that was reported: 58,000 work units down to 5,100. On 25x25 boards at the
+; density the panel deals: 640,000 down to 83,000, and 970,000 down to 110,000.
+; Across 54 generated boards it changed no answer and turned two timeouts into
+; solves.
+;
+; Two neighbours are excluded. The cell we came FROM is the consecutive
+; predecessor - that is the path, not a touch. The TARGET is where this route is
+; trying to arrive, so running up beside it is the goal rather than a loop.
+; Note the start endpoint is deliberately NOT excluded: coming back around to
+; touch your own start is exactly the case the shortcut argument covers.
+PuzTouchesSelf(k, board, n, nr, nc, pr, pc, tr, tc) {
+    if (nr > 1 && board[nr - 1][nc] = k
+        && !(nr - 1 = pr && nc = pc) && !(nr - 1 = tr && nc = tc))
+        return true
+    if (nr < n && board[nr + 1][nc] = k
+        && !(nr + 1 = pr && nc = pc) && !(nr + 1 = tr && nc = tc))
+        return true
+    if (nc > 1 && board[nr][nc - 1] = k
+        && !(nr = pr && nc - 1 = pc) && !(nr = tr && nc - 1 = tc))
+        return true
+    if (nc < n && board[nr][nc + 1] = k
+        && !(nr = pr && nc + 1 = pc) && !(nr = tr && nc + 1 = tc))
+        return true
+    return false
+}
+; ---- is this step survivable ----
+; Two tests, both of which only cut states that provably have no continuation,
+; so neither can lose a solution.
+;
+;  1. the head has nowhere to go and is not beside the target, or the target
+;     has nothing left to be entered from. Either way this path is finished.
+;  2. filling this cell just took the last free neighbour of an endpoint that
+;     still has to be routed.
+;
+; The second only looks at the FOUR neighbours of the cell just filled, not at
+; every remaining pair: nothing else lost a degree, and an endpoint reaching
+; zero is always caught on the move that takes its last neighbour. Measured
+; against the full scan it prunes identically and costs about a thirtieth.
+PuzStepOk(k, pairs, board, n, nr, nc, tr, tc) {
+    if (Abs(nr - tr) + Abs(nc - tc) != 1
+        && (!PuzFreeDeg(board, n, nr, nc) || !PuzFreeDeg(board, n, tr, tc)))
+        return false
+    if (nr > 1 && !PuzEndAlive(k, pairs, board, n, nr - 1, nc))
+        return false
+    if (nr < n && !PuzEndAlive(k, pairs, board, n, nr + 1, nc))
+        return false
+    if (nc > 1 && !PuzEndAlive(k, pairs, board, n, nr, nc - 1))
+        return false
+    if (nc < n && !PuzEndAlive(k, pairs, board, n, nr, nc + 1))
+        return false
+    return true
+}
 PuzDFS(k, pairs, board, paths, r, c, tr, tc, path, dr, dc, depth := 0) {
     global PZ_iter, PZ_iterCap, PZ_solveEnd, PZ_solveOut
     ; Hoisted, and this is the one that matters most: PuzDFS recurses once per
@@ -50335,11 +51430,22 @@ PuzDFS(k, pairs, board, paths, r, c, tr, tc, path, dr, dc, depth := 0) {
         return false
     }
     dirs := [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]]
+    ; ---- four keys, computed ONCE ----
+    ; The sort called PuzDKey inside its comparison, twice per comparison, so a
+    ; four-element insertion sort spent between six and twelve calls per node
+    ; re-deriving four values that never change while the node is being sorted.
+    ; PuzDKey is two Abs() and a direction test behind an interpreted call, and
+    ; this is the innermost line of the whole search - it runs once per cell of
+    ; every path the DFS tries. Computing the keys up front and carrying them
+    ; alongside is the same sort with a third of the calls.
+    ky := [PuzDKey(dirs[1], r, c, tr, tc, dr, dc), PuzDKey(dirs[2], r, c, tr, tc, dr, dc)
+         , PuzDKey(dirs[3], r, c, tr, tc, dr, dc), PuzDKey(dirs[4], r, c, tr, tc, dr, dc)]
     i := 2
     while (i <= 4) {  ; closest to target first; straight beats turning on ties
         j := i
-        while (j > 1 && PuzDKey(dirs[j - 1], r, c, tr, tc, dr, dc) > PuzDKey(dirs[j], r, c, tr, tc, dr, dc)) {
+        while (j > 1 && ky[j - 1] > ky[j]) {
             t := dirs[j - 1], dirs[j - 1] := dirs[j], dirs[j] := t
+            t := ky[j - 1],   ky[j - 1]   := ky[j],   ky[j]   := t
             j--
         }
         i++
@@ -50359,9 +51465,19 @@ PuzDFS(k, pairs, board, paths, r, c, tr, tc, path, dr, dc, depth := 0) {
         }
         if (board[nr][nc] != 0)
             continue
+        if PuzTouchesSelf(k, board, n, nr, nc, r, c, tr, tc)
+            continue
         board[nr][nc] := k
         path.Push([nr, nc])
-        if PuzDFS(k, pairs, board, paths, nr, nc, tr, tc, path, nr - r, nc - c, depth + 1)
+        ; ---- two dead ends, caught on the move that creates them ----
+        ; Reachability was only tested when a pair COMPLETED, so the search
+        ; would walk a path into a corner, or seal off an endpoint it still had
+        ; to reach, and only discover it by exhausting everything underneath.
+        ; On the 10x10 that was reported this is the difference between 349,000
+        ; work units and 58,000 - the board was solvable all along, it was just
+        ; landing either side of the four-second deadline depending on the day.
+        if (PuzStepOk(k, pairs, board, n, nr, nc, tr, tc)
+            && PuzDFS(k, pairs, board, paths, nr, nc, tr, tc, path, nr - r, nc - c, depth + 1))
             return true
         path.Pop()
         board[nr][nc] := 0
@@ -50458,15 +51574,30 @@ PuzReachable(sr, sc, tr, tc, board) {
     ; interpreted calls per neighbour test is two too many. A local copy of a
     ; constant is still a constant.
     n := PZ_GridN()
-    seen := Map()
     ; Key base derived from the grid, not the literal 8 this used to carry. A
     ; base of 8 packs r,c into one integer without collisions only while c stays
     ; under 8 - true at 6, still true at 7, and silently wrong at 8, where
     ; (1,8) and (2,0) collide and the BFS starts skipping cells it never
     ; visited. n+1 is the same trick with the boundary tied to the grid.
     kb := n + 1
-    seen[sr * kb + sc] := true
-    q := [[sr, sc]]
+    ; ---- a STAMPED array, not a fresh Map ----
+    ; This walk runs once per remaining pair after every tentative completion,
+    ; so it is called thousands of times in a solve - and it was building a new
+    ; Map each time and paying a hash lookup per neighbour. A flat array indexed
+    ; by the packed key is a direct index, and stamping it with a per-call
+    ; counter means it is never cleared: an entry from a previous call carries
+    ; an older stamp and reads as unvisited. Rebuilt only when the grid changes.
+    static seenA := [], seenN := 0, seenS := 0
+    if (seenN != n) {
+        seenA := [], seenN := n, seenS := 0
+        loop n*kb + n
+            seenA.Push(0)
+    }
+    seenS += 1
+    seenA[sr*kb + sc] := seenS
+    ; The queue holds the PACKED KEY, not a two-element array. One allocation
+    ; per enqueue was one too many when the key is already being computed.
+    q := [sr*kb + sc]
     qi := 1
     while (qi <= q.Length) {
         ; Charged to the same counter the DFS uses, one unit per cell taken off
@@ -50480,18 +51611,39 @@ PuzReachable(sr, sc, tr, tc, board) {
         if (++PZ_iter, PuzSolveStop())
             return false
         cur := q[qi], qi++
-        r := cur[1], c := cur[2]
-        for d in [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]] {
-            nr := d[1], nc := d[2]
-            if (nr < 1 || nr > n || nc < 1 || nc > n)
-                continue
-            if (nr = tr && nc = tc)
+        r := cur // kb, c := cur - r*kb
+        ; ---- unrolled, because the literal was five allocations a cell ----
+        ; `for d in [[r-1,c],[r+1,c],[r,c-1],[r,c+1]]` built an outer array and
+        ; four inner ones for every cell taken off the queue. On a 10x10 that is
+        ; five thousand allocations per walk, and the walk is most of the cost of
+        ; the search. Written out, it allocates nothing.
+        if (r > 1) {
+            if (r - 1 = tr && c = tc)
                 return true
-            key := nr * kb + nc
-            if (board[nr][nc] != 0 || seen.Has(key))
-                continue
-            seen[key] := true
-            q.Push([nr, nc])
+            key := cur - kb
+            if (board[r - 1][c] = 0 && seenA[key] != seenS)
+                seenA[key] := seenS, q.Push(key)
+        }
+        if (r < n) {
+            if (r + 1 = tr && c = tc)
+                return true
+            key := cur + kb
+            if (board[r + 1][c] = 0 && seenA[key] != seenS)
+                seenA[key] := seenS, q.Push(key)
+        }
+        if (c > 1) {
+            if (r = tr && c - 1 = tc)
+                return true
+            key := cur - 1
+            if (board[r][c - 1] = 0 && seenA[key] != seenS)
+                seenA[key] := seenS, q.Push(key)
+        }
+        if (c < n) {
+            if (r = tr && c + 1 = tc)
+                return true
+            key := cur + 1
+            if (board[r][c + 1] = 0 && seenA[key] != seenS)
+                seenA[key] := seenS, q.Push(key)
         }
     }
     return false
@@ -51013,7 +52165,7 @@ PuzCellGlide(x0, y0, x1, y1, bud) {
 ; The pitch keeps the pixel speed at what 1080p was tuned for. PZ_retryMul is
 ; 1.0 everywhere except inside a verify redraw, so on the ordinary path this is
 ; the pitch term alone.
-PuzPitchScale() => Max(1.0, PZ_SX()/86.2) * PZ_retryMul
+PuzPitchScale() => Max(1.0, PZ_SX()/86.2) * PZ_retryMul * PZ_paceMul
 PuzCellBudget(path, i, n) => ((i < n && PuzIsCorner(path, i)) ? PZ_CornerFrames : PZ_CellFrames)
                            * PZ_FrameMs * PuzPitchScale()
 
