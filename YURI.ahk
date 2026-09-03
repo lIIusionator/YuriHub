@@ -13107,7 +13107,7 @@ global DOP_SYSN  := 5
 ; Sized against HubFtrY(), not against the card bottom. The hub reserves the
 ; last HUB_FTRH pixels for its own version band, and two cards at the old
 ; 46/58 ran 16px into it - which is what put the buttons on top of the
-; YURI - V1.0 BETA stamp.
+; YURI - V1.0 release stamp.
 global DOP_RH    := 42, DOP_RG := 52
 global DOP_JOBMS := 600000           ; backstop only - see DOPPoll, which
                                      ; watches the launcher process instead
@@ -36266,7 +36266,7 @@ HubOpen() {
     HL.opw := (HL.sbx + HL.sbw - 11) - 14 - HL.optx
     HL.opF := (MeasureW("OPERATOR", HL.fS) + 9 <= HL.opw) ? HL.fS : HL.fXs
     ; The version badges size themselves to ZVER - it changes with every
-    ; release and "v1.0.0 BETA" already overran the 74 and 52 they were typed
+    ; release and "v1.0.0" already overran the 74 and 52 they were typed
     ; at. Measured once here, read by the header, the credits card, the
     ; dashboard chip and the hit test beside it.
     HL.vbw := Max(74, Round(MeasureW(ZVER, fBadge)) + 18)      ; fBadge badges (header, credits)
