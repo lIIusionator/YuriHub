@@ -10,7 +10,7 @@
 ;@Ahk2Exe-SetDescription   YURI - Control Suite
 ;@Ahk2Exe-SetProductName   YURI
 ;@Ahk2Exe-SetCompanyName   YURI
-;@Ahk2Exe-SetVersion       1.1.1.0
+;@Ahk2Exe-SetVersion       1.0.0.0
 ;@Ahk2Exe-SetCopyright     YURI
 ;@Ahk2Exe-SetOrigFilename  YURI.exe
 ;;@Ahk2Exe-SetMainIcon     YURI.ico
@@ -24,8 +24,8 @@
 ; version; the compiled updater installs a downloaded YURI.exe only if that is
 ; higher than the running one. ZVER, lower down, is built from these two, so
 ; the badge the hub draws can never disagree with the number the updater uses.
-global APP_VERSION := "1.1.1"
-global APP_STAGE   := "BETA"    ; follows the number on every badge; "" once it is not a beta
+global APP_VERSION := "1.0.0"
+global APP_STAGE   := ""        ; follows the number on every badge; "" once it is not a beta
 ; -----------------------------------------------------------------------------
 
 ; ============================================================================
@@ -79,10 +79,28 @@ if A_Args.Length >= 2 && A_Args[1] = "ahkfile" {
 ; ---- database fetch child: download + parse off the UI thread ----
 if A_Args.Length >= 2 && A_Args[1] = "ffdb" {
     Suspend true
+    ; ---- every source, UNIONED - not the first one that answers ----
+    ; This was a fallback chain: the first source that answered was written
+    ; and the rest were never read, so the database was PCDesktopClient.json
+    ; alone - the flags the settings server currently OVERRIDES for the desktop
+    ; client. A flag the server leaves at its built-in default never appears
+    ; in that file however real it is; DFFlagDebugDrawBroadPhaseAABBs is one of
+    ; some six thousand. FVariables.txt is the other half: every flag defined
+    ; in the client binary, with its prefix, whether the server touches it or
+    ; not. The retired-flag check (the ffupd child) has read it all along; the
+    ; database now does too. One name per line, sorted, prefixed - the same
+    ; file the panel always read, only complete.
+    ; Studio is deliberately NOT here. The old list named StudioClient.json
+    ; (404 from the tracker for some time); its successor, PCStudioApp.json,
+    ; would offer two thousand Studio-only names that the retired-flag check
+    ; (the ffupd child, which reads the same three sources as this) would then
+    ; report as "not in the live flag list" and drop. A database and a clean
+    ; pass that disagree about what exists is worse than a shorter database.
     srcs := ["https://raw.githubusercontent.com/MaximumADHD/Roblox-FFlag-Tracker/main/PCDesktopClient.json"
            , "https://raw.githubusercontent.com/MaximumADHD/Roblox-FFlag-Tracker/main/PCClientBootstrapper.json"
-           , "https://raw.githubusercontent.com/MaximumADHD/Roblox-FFlag-Tracker/main/StudioClient.json"]
+           , "https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/roblox/FVariables.txt"]
     outPath := "`f"
+    names := "", seen := Map(), got := 0
     for src in srcs {
         body := ""
         try {
@@ -98,24 +116,35 @@ if A_Args.Length >= 2 && A_Args[1] = "ffdb" {
             continue
         if (body = "")
             continue
-        names := "", seen := Map(), pos := 1
-        while (pos := RegExMatch(body, '[{,]\s*"([A-Za-z0-9_]+)"\s*:', &m, pos)) {
-            nm := m[1]
-            if !seen.Has(nm) {
-                seen[nm] := true
-                names .= nm "`n"
+        pos := 1
+        if InStr(src, "FVariables") {
+            ; "[C++] DFFlagDebugDrawBroadPhaseAABBs" - a tag, then the name
+            while (pos := RegExMatch(body, 'm)^\[[^\]]+\]\s+([A-Za-z0-9_]+)', &m, pos)) {
+                nm := m[1]
+                if !seen.Has(nm) {
+                    seen[nm] := true
+                    names .= nm "`n"
+                }
+                pos += m.Len
             }
-            pos += m.Len - 1
+        } else {
+            while (pos := RegExMatch(body, '[{,]\s*"([A-Za-z0-9_]+)"\s*:', &m, pos)) {
+                nm := m[1]
+                if !seen.Has(nm) {
+                    seen[nm] := true
+                    names .= nm "`n"
+                }
+                pos += m.Len - 1
+            }
         }
-        if (names = "")
-            continue
+        got++
+    }
+    if (names != "") {
         tmp := A_Temp "\yuri_ffdb.txt"
         try {
             FileOpen(tmp, "w", "UTF-8").Write(Sort(RTrim(names, "`n")) "`n")
             outPath := tmp
-        } catch
-            continue
-        break
+        }
     }
     sBuf := Buffer(StrPut(outPath, "UTF-16"))
     StrPut(outPath, sBuf, "UTF-16")
@@ -158,11 +187,13 @@ if A_Args.Length >= 2 && A_Args[1] = "ffupdate" {
         return ""
     }
 
+    srcOk := 0
     for src in ["https://raw.githubusercontent.com/MaximumADHD/Roblox-FFlag-Tracker/main/PCDesktopClient.json"
               , "https://raw.githubusercontent.com/MaximumADHD/Roblox-FFlag-Tracker/main/PCClientBootstrapper.json"] {
         body := FFUFetch(src)
         if (body = "")
             continue
+        srcOk++
         pos := 1
         while (pos := RegExMatch(body, '[{,]\s*"([A-Za-z0-9_]+)"\s*:', &m, pos)) {
             if !seen.Has(m[1])
@@ -172,6 +203,7 @@ if A_Args.Length >= 2 && A_Args[1] = "ffupdate" {
     }
     body := FFUFetch("https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/roblox/FVariables.txt")
     if (body != "") {
+        srcOk++
         pos := 1
         while (pos := RegExMatch(body, "m)^\[.*?\]\s*(\w+)", &m, pos)) {
             if !seen.Has(m[1])
@@ -186,6 +218,14 @@ if A_Args.Length >= 2 && A_Args[1] = "ffupdate" {
         tmp := A_Temp "\yuri_ffupd.txt"
         try {
             fh := FileOpen(tmp, "w", "UTF-8")
+            ; ---- the first line says how much of the list this is ----
+            ; Three sources, and a fetch that fails is skipped rather than
+            ; fatal - so a list can come back with one or two of them, and it
+            ; used to come back looking whole. The parent read it as the live
+            ; list, UPDATE renamed healthy flags to their nearest lookalikes
+            ; and CLEAN dropped the rest as retired. No tab in this line, so an
+            ; older parser skips it.
+            fh.Write("#sources " srcOk " 3`n")
             ; flushed every 400 lines: `.=` on a string heading for 2.5MB is the
             ; kind of loop that turns linear work quadratic
             chunk := "", c := 0
@@ -231,6 +271,25 @@ if A_Args.Length >= 2 && A_Args[1] = "ffexport" {
     StrPut(payload, sBuf, "UTF-16")
     cds := Buffer(A_PtrSize*3)
     NumPut("uptr", 0x5A15, cds, 0)
+    NumPut("uint", sBuf.Size, cds, A_PtrSize)
+    NumPut("ptr", sBuf.Ptr, cds, A_PtrSize*2)
+    DllCall("SendMessage", "ptr", Integer(A_Args[2]), "uint", 0x4A, "ptr", 0, "ptr", cds)
+    ExitApp
+}
+; ---- LOGIN ITEMS: pick a program to add ----
+; The same shape as ffexport: the dialog lives in a child so the hub's frame
+; never blocks behind it. The path comes back on 0x5A31; cancel is `f.
+if A_Args.Length >= 2 && A_Args[1] = "lgipick" {
+    Suspend true
+    ; Any file: an .exe, a shortcut, a script, a document, a URL file - Run
+    ; opens each the way a double-click would, and a document's own program
+    ; is what comes and goes with Roblox.
+    sel := FileSelect("3", A_ProgramFiles, "Add anything to LOGIN ITEMS - it opens the way a double-click would", "All files (*.*)")
+    payload := (sel != "") ? sel : "`f"
+    sBuf := Buffer(StrPut(payload, "UTF-16"))
+    StrPut(payload, sBuf, "UTF-16")
+    cds := Buffer(A_PtrSize*3)
+    NumPut("uptr", 0x5A31, cds, 0)
     NumPut("uint", sBuf.Size, cds, A_PtrSize)
     NumPut("ptr", sBuf.Ptr, cds, A_PtrSize*2)
     DllCall("SendMessage", "ptr", Integer(A_Args[2]), "uint", 0x4A, "ptr", 0, "ptr", cds)
@@ -465,15 +524,15 @@ if A_Args.Length >= 4 && A_Args[1] = "updcheck" {
     try FileAppend(upR.ok ? ((upR.newer ? "NEW " : "SAME ") upR.ver) : ("ERR " upR.msg), A_Args[2], "UTF-8")
     ExitApp
 }
-; ---- update download child: fetches the new build to <file>, reports on <report> ----
+; ---- update download child: downloads the new build to <file>, reports on <report> ----
 ; The download is the slow part of an update - the file is 3 MB - and it is the
-; part the UPDATE button's spinner has to stay alive through. The parent does
-; the load check and the swap itself once the report says OK.
-if A_Args.Length >= 5 && A_Args[1] = "updfetch" {
+; part the UPDATE button's spinner has to stay alive through. The parent checks
+; the file and puts it in place itself once the report says OK.
+if A_Args.Length >= 4 && A_Args[1] = "updfetch" {
     Suspend true
-    upErr := UpdDownload(A_Args[2], A_Args[3], A_Args[4])
-    try FileDelete(A_Args[5])
-    try FileAppend(upErr = "" ? "OK" : ("ERR " upErr), A_Args[5], "UTF-8")
+    upErr := UpdDownload(A_Args[2], A_Args[3])
+    try FileDelete(A_Args[4])
+    try FileAppend(upErr = "" ? "OK" : ("ERR " upErr), A_Args[4], "UTF-8")
     ExitApp
 }
 
@@ -1798,7 +1857,20 @@ global TOG_MS := 650, TICK_A := 16, TICK_S := 33, TICK_D := 33, TICK_Z := 50
 ; and the poke path put it straight back on the fast tier. Applied only while
 ; FPS BOOST is on, so it arrives with the feature it belongs to rather than
 ; changing the hub's behaviour behind your back.
-global TICK_G := 500
+;
+; ---- 100, not 500, and only from deep idle ----
+; It was 500 ms - two frames a second - and it was taken the moment nothing was
+; animating, which with the pointer parked on a blank part of the card is most
+; of the time. The hub is ALWAYS-ON-TOP over the game; somebody playing with it
+; open in the corner was looking at ambient motion drawn at 2 fps, which reads
+; as the hub having broken, and a tab change or a minimise put it right for the
+; length of their animations and then it "broke" again. The deep-idle tier
+; already knows when the hub is genuinely being left alone (four seconds with
+; no pointer contact, HUB_DEEP_MS), and its own note says slow sine motion
+; needs 20 fps to carry. So the stand-down starts where deep idle starts, not
+; before, and it halves the deep rate rather than dividing it by ten: ten
+; frames a second is the floor for something that is on screen.
+global TICK_G := 100
 global HUB_DEEP_MS := 4000
 global C_ON := 0xFF34D399, C_OFF := 0xFFFB7185
 ; Sentinel meaning "paint this in the current accent". Stored message colours
@@ -1853,6 +1925,22 @@ global RN_px := 0, RN_py := 0            ; where the notice window was placed
 
 global shadowCache := Map()
 global brCache := Map(), brOwn := Map()   ; solid-brush cache; see SBrushP
+; ---- brushes a caller must free ----
+; DelB used to free any handle it did not find in brOwn - the cached set - and
+; that is the wrong side to key on. A cache flush (BrushCacheTick) deletes every
+; cached brush and empties brOwn, and it can run from ANOTHER window's render
+; timer in the middle of a frame; a caller holding a cached handle across that
+; moment then finds it "not owned" and deletes it a second time. A double
+; delete of a dead handle is how a brush that has since been created at the
+; same address - cached under some other colour - dies while still in the
+; cache, and that colour never draws again. So the register is of the brushes
+; that ARE the caller's - every gradient brush the constructors below hand
+; out - and DelB frees exactly those. A cached brush is never in it.
+global brTemp := Map()
+; ... and the handles the LAST flush deleted, kept until the next one, so a
+; DelB that reaches a flushed handle from the frame it interrupted skips it
+; instead of deleting it twice. One flush's worth is the whole race window.
+global brDead := Map()
 global penCache := Map(), penOwn := Map() ; pen cache; see PenP
 ; ---- colour memos ----
 ; TH and AccHi are the two highest-frequency functions in the renderer. TH runs
@@ -1996,52 +2084,49 @@ KeyToken() {
 ; bytes to ask - and compares APP_VERSION. Only a strictly newer version is
 ; ever fetched.
 ;
-; Two ways in:
-;   at launch   SelfUpdate(), only while the AUTO UPDATE tile is on. It runs
-;               before any window exists, so it is allowed to block, and a
-;               newer build simply replaces this one and restarts.
-;   dashboard   CHECK FOR UPDATES raises the gate card (kind 3). The probe
-;               and the download run in child processes so the card's
-;               spinner keeps turning; only the load check blocks, for the
-;               second it takes, and the card says RESTARTING while it does.
+; Two ways in, one card:
+;   dashboard   CHECK FOR UPDATES raises the gate card (kind 3) at once and
+;               runs the probe behind it.
+;   AUTO UPDATE runs the same probe when the hub opens, silently. If the
+;               repository is ahead, the card comes up on its own - after
+;               the opening gate has left, never over it - with UPDATE and
+;               CANCEL. If it is not, or cannot be asked, nothing is shown
+;               and the log says why. Nothing installs until UPDATE is
+;               pressed, either way: an update is never a surprise.
+; The probe and the download run in child processes so the card's spinner
+; keeps turning; only the load check blocks, for the second it takes, and the
+; card says RESTARTING while it does.
 ;
-;   .ahk : the new file is written beside this one, load-checked with
-;          "AutoHotkey.exe /validate" - a syntax error, or a #Requires this
-;          interpreter cannot meet, leaves the current file untouched - and then
-;          renamed over this file. AutoHotkey does not lock the running .ahk.
-;   .exe : YURI.exe from the same repo folder. It only installs if its file
-;          version (SetVersion, top of file) beats the running exe's, which is
-;          what stops a not-yet-recompiled exe from installing and restarting
-;          forever. A running exe cannot be overwritten, but it can be renamed.
+;   .ahk : Download() straight from the repo to a temp file, which then has
+;          to be this script at the version the probe saw (an error page is
+;          not) and has to load ("AutoHotkey.exe /validate": a syntax error,
+;          or a #Requires this interpreter cannot meet, keeps the current
+;          file). Then it is copied over this file in place - AutoHotkey does
+;          not lock the running .ahk - and the temp file is deleted.
+;   .exe : YURI.exe from the same repo folder, the same way, installed only
+;          if its file version (SetVersion, top of file) beats the running
+;          exe's - what stops a not-yet-recompiled exe from installing and
+;          restarting forever. A running exe cannot be overwritten, so it is
+;          renamed .old and the copy goes in under its name; the next launch
+;          deletes the .old.
 ;
-; Either way the previous file is left beside the new one as .bak, which is the
-; rollback. The restart is an explicit Run + ExitApp rather than Reload():
+; Nothing else is left behind: the repository's history is the way back. The
+; restart is an explicit Run + ExitApp rather than Reload():
 ; Reload's /restart closes "the previous instance" by window title, and with
-; #SingleInstance Off that is not guaranteed to be this process. From the hub
-; the Run is deferred to HubFinish, so the hub folds away first and the new
-; build appears as it goes. Everything is written to YURI\errors.log as
-; "UPDATE" lines. Same token path as the key list, so a private repo works.
+; #SingleInstance Off that is not guaranteed to be this process. The Run is
+; HubFinish's, so the hub folds away first and the new build appears as it
+; goes. Everything is written to YURI\errors.log as "UPDATE" lines. The probe
+; carries the key list's token, so a private repo can be checked; Download()
+; cannot carry it, so the file itself has to be reachable without one.
 global YURI_UPDATE_URL := "https://raw.githubusercontent.com/lIIusionator/YuriHub/main/YURI.ahk"
 global YURI_UPDATE_EXE := "https://raw.githubusercontent.com/lIIusionator/YuriHub/main/YURI.exe"
-global updRestartCmd := ""               ; set by the swap; HubFinish runs it on its way out
+global updRestartCmd := ""               ; set by the replace; HubFinish runs it on its way out
+; a compiled build renames itself .old when it updates (see UpdReplace); the
+; copy that did so has exited by now, so this is where the .old goes
+if A_IsCompiled
+    try FileDelete(A_ScriptFullPath ".old")
 
-; ---- at launch ----
-SelfUpdate() {
-    p := UpdProbe(YURI_UPDATE_URL, KeyToken())
-    if (!p.ok || !p.newer)
-        return
-    newFile := A_ScriptFullPath ".new"
-    try FileDelete(newFile)
-    err := UpdDownload(newFile, A_IsCompiled ? YURI_UPDATE_EXE : YURI_UPDATE_URL, KeyToken())
-    if (err = "")
-        err := UpdVerify(newFile)
-    if (err = "")
-        err := UpdSwapRestart(newFile, p.ver)      ; does not return on success
-    try FileDelete(newFile)
-    YuriLog("UPDATE  v" p.ver " not installed at launch: " err)
-}
-
-; ---- the pieces, shared by the launch path, the children and the card ----
+; ---- the pieces, shared by the children and the card ----
 ; One request, the way the key list does it: cache-busted, short timeouts, the
 ; repo token only when there is one. lastByte > 0 asks for bytes 0..lastByte;
 ; raw.githubusercontent.com answers 206 with just those.
@@ -2081,76 +2166,78 @@ UpdProbe(url, tok) {
     r.ok := true, r.ver := m[1], r.newer := (VerCompare(m[1], APP_VERSION) > 0)
     return r
 }
-; The whole file, bytes as served, to newFile. "" on success, else why not.
-UpdDownload(newFile, url, tok) {
-    r := UpdFetch(url, tok)
-    if !r.ok
-        return r.status ? "the repository answered " r.status " for " (A_IsCompiled ? "YURI.exe" : "YURI.ahk")
-                        : "could not reach the repository"
-    try {
-        st := ComObject("ADODB.Stream")
-        st.Type := 1                            ; binary
-        st.Open()
-        st.Write(r.req.ResponseBody)
-        st.SaveToFile(newFile, 2)               ; 2 = overwrite
-        st.Close()
-    } catch as e
-        return "could not write the new file: " e.Message
+; The whole file, straight from the repo, to `file`. "" on success, else why
+; not. Download() writes it fresh - no cache - and throws when it cannot.
+UpdDownload(file, url) {
+    try FileDelete(file)
+    url .= (InStr(url, "?") ? "&" : "?") "t=" A_TickCount   ; part of the cache identity, as with the key list
+    try Download(url, file)
+    catch as e
+        return "could not download " (A_IsCompiled ? "YURI.exe" : "YURI.ahk") ": " e.Message
+    if !FileExist(file)
+        return "the download produced no file"
     return ""
 }
-; "" if the new file may be installed, else why not. A load check for the
-; script, a build-number check for the exe.
-UpdVerify(newFile) {
+; "" if the download may go in, else why not. It has to be the thing it was
+; meant to be - a page saying "404" downloads just as well as a script - and it
+; has to be newer: the version line for the script, the build number for the
+; exe. The script also has to load.
+UpdVerify(file, ver) {
     if A_IsCompiled {
-        try newB := FileGetVersion(newFile), curB := FileGetVersion(A_ScriptFullPath)
+        try newB := FileGetVersion(file), curB := FileGetVersion(A_ScriptFullPath)
         catch
-            return "the downloaded YURI.exe carries no version"
+            return "the download is not a YURI.exe build"
         if (VerCompare(newB, curB) <= 0)
             return "the repository's YURI.exe is build " newB ", not newer than " curB
         return ""
     }
-    if (RunWait('"' A_AhkPath '" /ErrorStdOut /validate "' newFile '"', , "Hide") != 0)
+    head := ""
+    try {
+        fh := FileOpen(file, "r", "UTF-8")
+        head := fh.Read(8192), fh.Close()
+    }
+    if (!RegExMatch(head, 'm)^\s*(?:global\s+)?APP_VERSION\s*:=\s*"([^"]+)"', &m) || m[1] != ver)
+        return "the download is not YURI.ahk v" ver
+    if (RunWait('"' A_AhkPath '" /ErrorStdOut /validate "' file '"', , "Hide") != 0)
         return "the new file failed to load - kept v" APP_VERSION
     return ""
 }
-; Swap the files and start the new one. Returns only on failure, with the old
-; file back in place - except from the hub, where it returns "" and leaves the
-; restart to HubFinish so the hub's own close can play first.
-UpdSwapRestart(newFile, ver, viaHub := 0) {
+; Put the download in this file's place and start it. "" once that is done
+; and the hub's close is under way - HubFinish runs the new build so the hub's
+; own close can play first - or, on failure, why not, with this file as it was.
+UpdReplace(file, ver) {
     global updRestartCmd
-    bakFile := A_ScriptFullPath ".bak"
+    oldExe := A_ScriptFullPath ".old"
     try {
-        try FileDelete(bakFile)
-        FileMove(A_ScriptFullPath, bakFile, 1)  ; a running exe cannot be overwritten, but it can be renamed
-        FileMove(newFile, A_ScriptFullPath, 1)
+        if A_IsCompiled {
+            try FileDelete(oldExe)
+            FileMove(A_ScriptFullPath, oldExe, 1)
+        }
+        try FileCopy(file, A_ScriptFullPath, 1)
+        catch as e {
+            if A_IsCompiled
+                try FileMove(oldExe, A_ScriptFullPath, 1)
+            throw e
+        }
     } catch as e
         return "could not replace the file: " e.Message
-    cmd := A_IsCompiled ? '"' A_ScriptFullPath '"'
-                        : '"' A_AhkPath '" "' A_ScriptFullPath '"'
+    try FileDelete(file)
+    updRestartCmd := A_IsCompiled ? '"' A_ScriptFullPath '"'
+                                  : '"' A_AhkPath '" "' A_ScriptFullPath '"'
     YuriLog("---- UPDATE v" APP_VERSION " -> v" ver)
-    if viaHub {
-        updRestartCmd := cmd
-        HubClose()
-        return ""
-    }
-    try Run(cmd)
-    catch as e {                                ; could not start it: put the old file back and keep running
-        try FileMove(A_ScriptFullPath, newFile, 1)
-        try FileMove(bakFile, A_ScriptFullPath, 1)
-        return "could not start the new build: " e.Message
-    }
-    ExitApp
+    HubClose()
+    return ""
 }
 
-; ---- the dashboard's check, and the card it answers on ----
+; ---- the check, and the card it answers on ----
 ; State lives in HL (see HubOpen) - HL.updPhase is the card's whole story:
 ;   0 nothing up      1 checking     2 newer version found     3 downloading
 ;   4 up to date      5 failed       6 load check + restart
 ; The card is gateKind 3 - the opening gate's card with the update's words,
 ; glyph and buttons; HubGateDraw, HubZone and HubClick all branch on the kind.
-UpdCheckStart() {
-    if (!hubLive || !IsObject(HL) || HL.closeAt || HubGateUp())
-        return
+; HL.updAuto says the probe was the launch check, which changes what happens
+; to a "nothing newer": the dashboard shows it, the launch check keeps quiet.
+UpdProbeStart() {
     UpdReset()
     HL.updFile := A_Temp "\yuri_upd_" A_TickCount ".txt"
     try FileDelete(HL.updFile)
@@ -2164,25 +2251,58 @@ UpdCheckStart() {
         UpdSet(1)
     else
         UpdSet(5, "could not start the check", "COULD NOT CHECK")
+    return pid != 0
+}
+; The card. Modal over the whole hub, so anything already holding a caret or
+; a hover underneath it is dropped rather than left live.
+UpdRaise() {
+    HL.updPend := 0
     HL.gateKind := 3
     HL.gateAt := A_TickCount, HL.gateOut := 0
-    ; the card is modal over the whole hub, so anything already holding a
-    ; caret or a hover underneath it is dropped rather than left live
     try HubGateClearBelow()
     HubPoke()
     HubTim(TICK_A)
+}
+; ...unless another card is up - the opening gate, at launch - in which case
+; this one waits its turn and HubGateDraw raises it once that has left.
+UpdRaiseWhenClear() {
+    if HubGateUp()
+        HL.updPend := 1
+    else
+        UpdRaise()
+}
+; CHECK FOR UPDATES on the dashboard: the card first, the answer into it.
+UpdCheckStart() {
+    if (!hubLive || !IsObject(HL) || HL.closeAt || HubGateUp())
+        return
+    UpdProbeStart()
+    HL.updAuto := 0
+    UpdRaise()
+}
+; AUTO UPDATE, from HubOpen: the probe alone. See UpdPoll for the rest.
+UpdAutoStart() {
+    if (!IsObject(HL) || HL.updPhase)
+        return
+    if !UpdProbeStart() {
+        YuriLog("UPDATE  launch check could not start")
+        UpdReset()
+        return
+    }
+    HL.updAuto := 1
 }
 ; UPDATE pressed. The download goes to a child; the report file is what the
 ; card waits on.
 UpdInstallBegin() {
     if (HL.updPhase != 2)
         return
-    HL.updNew := A_ScriptFullPath ".new"
-    try FileDelete(HL.updNew)
-    HL.updFile := HL.updNew ".rep"
+    ; to %TEMP%, not beside this file: nothing appears next to it but the
+    ; finished replacement
+    HL.updTmp := A_Temp "\yuri_upd_" A_TickCount (A_IsCompiled ? ".exe" : ".ahk")
+    try FileDelete(HL.updTmp)
+    HL.updFile := HL.updTmp ".rep"
     try FileDelete(HL.updFile)
     url := A_IsCompiled ? YURI_UPDATE_EXE : YURI_UPDATE_URL
-    args := ' updfetch "' HL.updNew '" "' url '" "' KeyToken() '" "' HL.updFile '"'
+    args := ' updfetch "' HL.updTmp '" "' url '" "' HL.updFile '"'
     cmd := A_IsCompiled ? '"' A_ScriptFullPath '"' args
                         : '"' A_AhkPath '" "' A_ScriptFullPath '"' args
     pid := 0
@@ -2199,6 +2319,8 @@ UpdPoll(now) {
     ph := HL.updPhase
     if (ph != 1 && ph != 3)
         return
+    if (HubGateKind() = 3 && HL.gateOut)
+        return                          ; a card on its way out is not rewritten under the user
     rep := ""
     if (HL.updFile != "" && FileExist(HL.updFile))
         try rep := Trim(FileRead(HL.updFile, "UTF-8"), " `t`r`n")
@@ -2207,7 +2329,11 @@ UpdPoll(now) {
         ; answer in half a minute is not going to get one, a download gets two
         if (now - HL.updAt > (ph = 1 ? 30000 : 120000)) {
             UpdKillChild()
-            UpdSet(5, "the repository did not answer", ph = 1 ? "COULD NOT CHECK" : "COULD NOT UPDATE")
+            if (ph = 1 && HL.updAuto) {
+                YuriLog("UPDATE  launch check: the repository did not answer")
+                UpdReset()
+            } else
+                UpdSet(5, "the repository did not answer", ph = 1 ? "COULD NOT CHECK" : "COULD NOT UPDATE")
         }
         return
     }
@@ -2217,9 +2343,17 @@ UpdPoll(now) {
     word := sp ? SubStr(rep, 1, sp - 1) : rep
     rest := sp ? Trim(SubStr(rep, sp + 1)) : ""
     if (ph = 1) {
-        if (word = "NEW")
+        if (word = "NEW") {
             HL.updVer := rest, UpdSet(2)
-        else if (word = "SAME")
+            if HL.updAuto
+                UpdRaiseWhenClear()     ; the launch check has something to say after all
+        } else if HL.updAuto {
+            ; nothing newer, or nothing reachable: the launch check has nobody
+            ; to tell, and a card saying so on every launch would be noise
+            if (word != "SAME")
+                YuriLog("UPDATE  launch check: " (rest != "" ? rest : "could not check"))
+            UpdReset()
+        } else if (word = "SAME")
             UpdSet(4)
         else
             UpdSet(5, rest != "" ? rest : "could not check", "COULD NOT CHECK")
@@ -2230,18 +2364,18 @@ UpdPoll(now) {
     } else
         UpdSet(5, rest != "" ? rest : "the download failed")
 }
-; After the download: the load check, the swap, and the hub's close. Only a
+; After the download: the checks, the replace, and the hub's close. Only a
 ; failure lands back on the card.
 UpdFinish() {
     if (!IsObject(HL) || HL.updPhase != 6)
         return
-    err := UpdVerify(HL.updNew)
+    err := UpdVerify(HL.updTmp, HL.updVer)
     if (err = "")
-        err := UpdSwapRestart(HL.updNew, HL.updVer, 1)
+        err := UpdReplace(HL.updTmp, HL.updVer)
     if (err = "")
         return
-    try FileDelete(HL.updNew)
-    HL.updNew := ""
+    try FileDelete(HL.updTmp)
+    HL.updTmp := ""
     YuriLog("UPDATE  v" HL.updVer " not installed: " err)
     UpdSet(5, err)
 }
@@ -2252,6 +2386,7 @@ UpdSet(ph, msg := "", ttl := "COULD NOT UPDATE") {
 UpdReset() {
     UpdKillChild()
     HL.updPhase := 0, HL.updVer := "", HL.updMsg := "", HL.updTtl := "", HL.updAt := 0
+    HL.updAuto := 0, HL.updPend := 0
 }
 UpdKillChild() {
     if HL.updPid
@@ -2260,9 +2395,9 @@ UpdKillChild() {
     if (HL.updFile != "")
         try FileDelete(HL.updFile)
     HL.updFile := ""
-    if (HL.updNew != "")
-        try FileDelete(HL.updNew)
-    HL.updNew := ""
+    if (HL.updTmp != "")
+        try FileDelete(HL.updTmp)
+    HL.updTmp := ""
 }
 ; CANCEL. Whatever is in flight is stopped, and the card leaves; the state is
 ; cleared once it has gone (HubGateDraw), so nothing changes under it.
@@ -2276,7 +2411,8 @@ UpdCardCopy(&ttl, &l1, &l2) {
     if (ph = 1)
         ttl := "CHECKING FOR UPDATES", l1 := "Asking the repository for its newest version.", l2 := "You are on v" APP_VERSION "."
     else if (ph = 2)
-        ttl := "NEWER VERSION FOUND", l1 := "v" HL.updVer " is available - you are on v" APP_VERSION ".", l2 := "UPDATE fetches it, checks it loads, then restarts YURI."
+        ttl := "NEWER VERSION FOUND", l1 := "v" HL.updVer " is available - you are on v" APP_VERSION "."
+        , l2 := HL.updAuto ? "Found at launch. UPDATE installs it, then restarts YURI." : "UPDATE fetches it, checks it loads, then restarts YURI."
     else if (ph = 3)
         ttl := "DOWNLOADING v" HL.updVer, l1 := "Fetching the new build from the repository.", l2 := "This one keeps running until the new one has been checked."
     else if (ph = 4)
@@ -2284,7 +2420,7 @@ UpdCardCopy(&ttl, &l1, &l2) {
     else if (ph = 5)
         ttl := HL.updTtl != "" ? HL.updTtl : "COULD NOT UPDATE", l1 := HL.updMsg, l2 := "Nothing was changed."
     else
-        ttl := "RESTARTING", l1 := "Checking that v" HL.updVer " loads, then swapping it in.", l2 := "YURI will close and reopen on its own."
+        ttl := "RESTARTING", l1 := "Checking that v" HL.updVer " loads, then putting it in place.", l2 := "YURI will close and reopen on its own."
 }
 ; ---- the glyph, one per phase, in the gate card's own disc ----
 ; The arrival ring re-fires on every change of phase, from HL.updAt, so the
@@ -2629,16 +2765,6 @@ embImgs.Push({name: "selfie6.jpg", b64: ""
 ; literally; this one did not.
 global iniPath := YURI_CFG "\zeal.ini"
 
-; ---- AUTO UPDATE ----
-; Off unless the SETTINGS tile turned it on. Read here rather than with the
-; other hub settings, 28,000 lines down, because the launch check has to run
-; before a single window exists - and after iniPath, for the reason given in
-; the block above. HubAutoUpdSet is the only writer.
-global hubAutoUpd := 0
-try hubAutoUpd := Integer(IniRead(iniPath, "hub", "autoupdate", "0"))
-if hubAutoUpd
-    SelfUpdate()
-
 ; ---- saved keybinds ----
 ; These MUST come after iniPath. They used to sit up with the font metrics, 95
 ; lines before iniPath existed, so every IniRead ran against an empty path, the
@@ -2737,6 +2863,7 @@ global hubTop := 1
 ; and the tray icon is the only way back. That is a real difference in cost as
 ; well as in looks, because a hidden hub draws nothing at all.
 global hubTrueMin := 0
+global hubAutoUpd := 0          ; AUTO UPDATE tile: check at hub open, ask before installing
 ; 1 while the window is hidden. Deliberately NOT the same as clearing hubLive:
 ; the app is still running, still holding its hotkeys and its background
 ; timers, it simply has no window on screen.
@@ -2745,7 +2872,7 @@ global hubHidden := 0
 ; identity: CURSOR was slotted in under FAST FLAG MANAGER, and renumbering
 ; FORSAKEN would have touched its panel, its hit zones and its hotkey path
 ; for no gain, so it keeps id 2 while sitting third.
-global HUBMODS := [1, 3, 4, 5, 2, 6]     ; card position -> module id
+global HUBMODS := [1, 3, 4, 5, 2, 6, 7]  ; card position -> module id
 ; ---- the module rail scrolls ----
 ; Six cards and two labelled breaks fill the column to within a few pixels of
 ; the panel, and a seventh would not fit at all. Rather than shave the cards
@@ -2756,7 +2883,7 @@ global mdScr := 0.0
 MdRailTop() => HL.mdy - 8
 MdRailBot() => HL.pd + HL.ch - 34         ; clear of the "click a module" line
 MdRailVis() => MdRailBot() - MdRailTop()
-MdRailTot() => (HL.m6y + HL.m6h + 10) - MdRailTop()
+MdRailTot() => (HL.m7y + HL.m7h + 10) - MdRailTop()
 MdRailMax() => Max(0.0, MdRailTot() - MdRailVis())
 global hubAccPrev := 0xFFFB7185
 
@@ -2771,8 +2898,15 @@ global hubAccPrev := 0xFFFB7185
 ;      (search: FFMDrawModules / FFMDrawPanel / FFMDrawView)
 global FFM := {}
 FFM.flags  := [],  FFM.db := [],  FFM.map := Map()
+FFM.badN   := 0                            ; values refused on the way in - see FFMAdd
+FFM.hist   := []                           ; snapshots of the staged list, newest first
+FFM.hsScr  := 0.0, FFM.hsScrT := 0.0       ; the HISTORY tab's scroll
 FFM.view   := "",  FFM.viewAt := 0, FFM.viewT := 0.0
 FFM.commAt := 0                            ; community view opened-at, for its banner
+; the hero reel runs off the wall clock (FFMCommBanner); a click-to-skip adds
+; to this offset so the next crossfade starts now, and marks when, for the
+; press flash. Timing stays a function of the clock, so nothing else changes.
+FFM.cmReelOff := 0, FFM.cmReelSkipAt := 0
 FFM.cmScr  := 0.0, FFM.cmScrT := 0.0       ; community BODY scroll, in px
 FFM.cm     := Map()                        ; place -> per-game description scroll
 FFM.viewPrev := ""
@@ -2782,7 +2916,7 @@ FFM.dbScr  := 0.0, FFM.dbScrT := 0.0
 FFM.dbIns  := Map()                        ; flag name -> tick it was taken
 FFM.logScr := 0.0, FFM.logScrT := 0.0
 FFM.upd     := []                          ; UPDATE decisions, newest first
-FFM.logTab  := 1                           ; 1 = INJECTION, 2 = UPDATES
+FFM.logTab  := 1                           ; 1 = INJECTION, 2 = UPDATES, 3 = HISTORY
 FFM.logTabPrev := 1, FFM.logTabAt := 0     ; the switch transition, see FFMLogView
 FFM.updScr  := 0.0, FFM.updScrT := 0.0
 FFM.q      := "",  FFM.q2 := "",  FFM.ih := 0
@@ -2821,6 +2955,7 @@ FFM.failed := Map()
 FFM.live      := Map()   ; live full names, from the last UPDATE
 FFM.bare      := Map()   ; lower(bare name) -> live full name
 FFM.liveAt    := 0       ; when it was fetched; 0 = never, so the signal stands down
+FFM.livePartial := 0     ; 1 while the last list came back short of its sources - see FFMUpdateGot
 FFM.cleanScan := 0       ; the scan CLEAN promised, reused at write time
 FFM.bareAll   := Map()   ; lower(bare) -> EVERY live name that strips to it
 FFM.updUndo   := 0       ; staged names as they were before the last UPDATE
@@ -2838,6 +2973,14 @@ FFM.instAt := 0                            ; tick of the last tab switch, for th
 ; name -> the value a flag held BEFORE we first wrote it, for this Roblox
 ; process only. Cleared whenever we attach to or lose a process.
 FFM.orig := Map()
+; name -> the value ADDRESS that write went to. The table stores bare names,
+; and 300-odd of them are shared by two flags (an FFlag and a DFFlag, an FLog
+; and an FString): INJECT resolves through the hash chain, the index walks the
+; list, and for a shared name the two can hand back different nodes - so
+; UNINJECT "restored" one flag while the other stayed injected. Every path
+; that touches an owned flag now goes to the address INJECT recorded here.
+; Lives and dies with FFM.orig, per process, per instance.
+FFM.origAt := Map()
 ; true while ApplyLive/Uninject/ReApplyTick are doing real work. All three are
 ; timer-driven and AHK lets a timer interrupt another thread's Sleep, so
 ; without this a manual UNINJECT could be silently overwritten by an
@@ -2896,6 +3039,8 @@ FFM.aijT := 0.0   ; auto-inject
 
 global ffdbPid  := 0
 global ffFile   := YURI_FLAGS "\zeal_flags.json"
+global ffHist   := YURI_FLAGS "\zeal_hist.json"   ; snapshots of the staged list - see FFMSnap
+global FFM_HSMAX := 30                            ; snapshots kept
 global FFPFX    := "^(DynamicFastFlag|DynamicFastInt|DynamicFastString|DynamicFastLog"
                   . "|DFString|SFString|FString|DFFlag|SFFlag|DFInt|DFLog|SFLog|SFInt|FFlag|FInt|FLog)"
 ; systems panel: 7 rows, 4 visible at a time (the panel scrolls)
@@ -4839,7 +4984,7 @@ global FFM_COMM_HOLD := 5200, FFM_COMM_FADE := 900
 ; point.
 global FFM_COMM_DSCLH  := 15                  ; description line height
 global FFM_COMM_DSCVIS := 3                   ; lines visible at once
-FFMCommDscY()  => 110                         ; description top, relative to the card
+FFMCommDscY()  => 112                         ; description top, relative to the card: the header is the 148x84 picture's height plus its margins
 FFMCommDscH()  => FFM_COMM_DSCVIS*FFM_COMM_DSCLH
 ; The description sits on a plate inset 4 px around it, so the gaps either side
 ; are measured from the PLATE, not the text: 3 px clear of the rating bar above
@@ -4880,7 +5025,7 @@ FFMCommCardH(ent)  => FFMCommSetY(ent) + FFMCommSetVis(ent)*FFM_COMM_SETRH + 10
 ; header lives in a viewport. Sized to what ONE game card needs, which is the
 ; shape the panel had before any of this - a single game still fills it exactly
 ; and does not scroll. Anything more is scroll.
-global FFM_COMM_BANNERH := 132                ; the hero banner
+global FFM_COMM_BANNERH := 236                ; the hero banner - was 132, a 4:1 letterbox on a 16:9 source; this shows the picture
 global FFM_COMM_GAP     := 14                 ; banner to card, and card to card
 ; PINNED, not derived. It used to be built up from the card, which worked while
 ; a card was one set tall; a card carrying a set LIST is taller than the panel
@@ -4994,7 +5139,7 @@ FFMCommDragDsc(gi, sy) {
 ; FFMCommGameCard.
 FFMCommState(key) {
     if !FFM.cm.Has(key)
-        FFM.cm[key] := {d: 0, dMax: 0, s: 0, wrap: [], wrapKey: ""}
+        FFM.cm[key] := {d: 0, dMax: 0, s: 0, wrap: [], wrapKey: "", off: 0, skipAt: 0}
     return FFM.cm[key]
 }
 ; Which card's description is under the cursor, or 0. Positions are taken
@@ -5066,6 +5211,8 @@ global FFM_UPRH   := 32
 global FFM_UPROWS := 10
 global FFM_UPMAX  := 500
 global FFM_TABW   := 92        ; log-overlay tab chip width
+global FFM_HSRH   := 32        ; a HISTORY row
+global FFM_HSROWS := 10        ; rows visible on it (FFM_LGROWS*FFM_LGRH / FFM_HSRH)
 global FFM_TABMS  := 260.0     ; log-overlay tab switch duration, ms
 global FFM_INSMS  := 620.0     ; database-insert pulse duration, ms
                                ; 620 is FFM.flash's own life, so a flag taken
@@ -5154,6 +5301,8 @@ global FFM_COMM_AT   := 0        ; when the index on disk was last read
 global FFM_COMM_SYNC := 0        ; 1 while a sync child is running
 global FFM_COMM_SYNCAT := 0      ; when it was launched - see FFMCommSyncing
 global FFM_COMM_MSG  := ""       ; what to say when there is nothing to show
+global FFM_COMM_OKAT := 0        ; when a sync last landed OK - see FFMCommSync
+global FFM_COMM_FRESH_MS := 600000   ; ten minutes: a sync younger than this is not repeated
 global commSyncPid   := 0
 
 ; Whatever is on disk, in the order the child wrote it (GENERAL first). Reading
@@ -5199,14 +5348,22 @@ FFMCommIndexLoad() {
     return out.Length
 }
 
-; ---- sync on open, and only on open ----
-; Not on a timer and not at boot: the panel is the only thing that uses this, so
-; the only moment it is worth a round trip is the moment it is opened. The
-; existing cache stays on screen throughout - a sync never blanks the panel, it
-; only replaces what is there once it has something better.
-FFMCommSync() {
+; ---- sync at launch, and on open ----
+; The loading screen runs it (LoadingScreen), so the cache is current before
+; the hub is on screen and the panel's first open shows the published sets
+; rather than the last session's. The panel still syncs when it opens, so a
+; session that outlives a push picks it up - but not if the last sync landed
+; within FFM_COMM_FRESH_MS: the tree call behind it is metered at 60 an hour,
+; and a launch followed by a few panel opens would spend a fair share of that
+; on answers already in hand. `force` is the SYNC button and the re-sync a
+; missing file triggers, which are both asking for exactly that round trip.
+; The existing cache stays on screen throughout - a sync never blanks the
+; panel, it only replaces what is there once it has something better.
+FFMCommSync(force := 0) {
     global commSyncPid, FFM_COMM_SYNC, FFM_COMM_SYNCAT, FFM_COMM_MSG
     if (FFM_COMM_SYNC && commSyncPid && ProcessExist(commSyncPid))
+        return
+    if (!force && FFM_COMM_OKAT && A_TickCount - FFM_COMM_OKAT < FFM_COMM_FRESH_MS)
         return
     if !DirExist(YURI_COMM)
         try DirCreate(YURI_COMM)
@@ -5251,12 +5408,14 @@ FFMCommSyncing() {
     return 1
 }
 FFMCommSynced(payload) {
-    global FFM_COMM_SYNC, FFM_COMM_MSG
+    global FFM_COMM_SYNC, FFM_COMM_MSG, FFM_COMM_OKAT
     FFM_COMM_SYNC := 0
     f := StrSplit(payload, Chr(1))
     if (f.Length >= 1 && f[1] = "OK") {
         FFMCommIndexLoad()
+        FFMCommQueueGames()
         FFM_COMM_MSG := ""
+        FFM_COMM_OKAT := A_TickCount
         FFMCommClampAll()
     } else {
         ; The cache is still whatever the last good sync left, so a failure is
@@ -5264,6 +5423,47 @@ FFMCommSynced(payload) {
         FFM_COMM_MSG := (f.Length >= 2 && f[2] != "") ? f[2] : "sync failed"
     }
     HubPoke()
+}
+; ---- and their games, into the boot queues ----
+; The index only names the games. Their names, icons, banners, stats and
+; thumbnails come from the lookups the saved places get (SPF.preQ), and the
+; artwork warm (LD_warm) decodes what those lookups fetch. Both queues are
+; built at boot from the index on disk, so a sync that lands later - during
+; the load, or from the panel - has to add what it brought, or a game
+; published since last session opens as "loading game details...". Resolved
+; and already-queued ids are skipped; the warm getters are cache hits for
+; anything already decoded, so a repeat costs nothing. The pumps are re-armed
+; so the additions drain even when the loading screen has long since gone.
+FFMCommQueueGames() {
+    global LD_warm
+    added := 0
+    for ent in FFM_COMM {
+        pl := ent.place
+        if (pl = "")
+            continue
+        if !(SPF.stats.Has(pl) && SPF.stats[pl].at) {
+            inQ := 0
+            for q in SPF.preQ
+                if (q = pl) {
+                    inQ := 1
+                    break
+                }
+            if !inQ
+                SPF.preQ.Push(pl), added++
+        }
+        inW := 0
+        for j in LD_warm
+            if (j.v = pl && (j.k = "bmp" || j.k = "ico" || j.k = "thm")) {
+                inW := 1
+                break
+            }
+        if !inW
+            LD_warm.Push({k: "bmp", v: pl}), added++
+    }
+    if added {
+        SPFPrefetchArm()
+        BootWarmArm()
+    }
 }
 ; A new index can be shorter than the old one, so every scroll it feeds has to
 ; be brought back inside its new range or the panel opens on empty space.
@@ -5310,6 +5510,7 @@ FFMBoot()
 ; ================= FAST FLAG MANAGER: module implementation =================
 FFMBoot() {
     FFMLoadFlags()
+    FFMHistLoad()
     FFMReindex()
     SetTimer(FFMFetchDb, -600)
     SetTimer(FFMPoll, 1200)
@@ -5510,6 +5711,8 @@ FFMReApplyRun() {
             if (!FFMSameProc(hp0, pid0))
                 break                           ; process swapped under us
             nm   := fl["name"]
+            if !FFMOn(fl)
+                continue                        ; switched off: not re-asserted
             ; Backing off. Costs one Map lookup instead of a read, a write and
             ; a read-back, and the countdown means a flag that becomes writable
             ; again is retried within a second or two rather than never.
@@ -5521,14 +5724,16 @@ FFMReApplyRun() {
             dv   := FFlags.Coerce(fl["value"])
             if (dv = "")
                 continue                        ; string flag - nothing writable
-            vpr := idx.Has(bare) ? idx[bare] : 0
-            if (!vpr)
-                continue
+            ; an owned flag is re-asserted where INJECT wrote it (FFM.origAt);
+            ; only one not yet owned is resolved here, through the index, and
             ; cached while the table identity holds - see FFM.raVP
-            if FFM.raVP.Has(nm)
+            if FFM.origAt.Has(nm)
+                vp := FFM.origAt[nm]
+            else if FFM.raVP.Has(nm)
                 vp := FFM.raVP[nm]
             else {
-                vp := MemIO.ReadU64(vpr + 0xC0)
+                vpr := idx.Has(bare) ? idx[bare] : 0
+                vp := vpr ? MemIO.ReadU64(vpr + 0xC0) : 0
                 if vp
                     FFM.raVP[nm] := vp
             }
@@ -5571,7 +5776,7 @@ FFMReApplyRun() {
             ; a write that is then refused leaves UNINJECT willing to write an
             ; "original" over a flag this module never managed to change.
             hadR := FFM.orig.Has(nm)
-            if (FFlags.SetVia(vpr, fl["value"])) {
+            if (FFlags.SetAt(vp, fl["value"])) {
                 ; SetVia returning true means the WRITE call succeeded, not that
                 ; the value stuck. Reading it straight back is what tells the
                 ; difference between holding a flag and only appearing to: a
@@ -5603,7 +5808,7 @@ FFMReApplyRun() {
                 } else {
                     restored++
                     if !hadR
-                        FFM.orig[nm] := cur      ; the write took: now it is ours to undo
+                        FFM.orig[nm] := cur, FFM.origAt[nm] := vp   ; the write took: now it is ours to undo
                     if FFM.raStuck.Has(nm)
                         FFM.raStuck.Delete(nm)
                     ; it took - clear the backoff so the next failure starts over
@@ -5667,6 +5872,56 @@ FFMPfxOf(n) {
 }
 FFMBareOf(n) => RegExReplace(n, FFPFX)
 
+; What a staged flag's value IS: "bool", "int" or "string". The prefix is
+; Roblox's own declaration and wins; only a bare name falls back to what the
+; value looked like when it was typed (FFMType). There is no float kind - no
+; flag in the client's namespace is one, and a decimal typed into an int flag
+; is rounded on the way in, which is the right answer for an int.
+FFMKindOf(fl) {
+    p := FFMPfxOf(fl["name"])
+    if (p != "")
+        return InStr(p, "String") ? "string" : InStr(p, "Flag") ? "bool" : "int"
+    return (fl["type"] = "string") ? "string" : (fl["type"] = "bool") ? "bool" : "int"
+}
+; ---- staged, and switched on ----
+; A flag can sit in the list switched OFF: kept, searchable, exported nowhere
+; and injected nowhere, so "is it this one?" no longer means deleting it and
+; typing it back. Records saved by older builds carry no "on" and count as on.
+FFMOn(fl) => !fl.Has("on") || fl["on"]
+FFMOnCount() {
+    n := 0
+    for fl in FFM.flags
+        n += FFMOn(fl) ? 1 : 0
+    return n
+}
+FFMToggleOn(i) {
+    if (i < 1 || i > FFM.flags.Length)
+        return
+    fl := FFM.flags[i]
+    fl["on"] := FFMOn(fl) ? 0 : 1
+    FFM.flash[i] := A_TickCount
+    FFMSaveFlags()
+    FFMSay(fl["on"] ? (fl["name"] " ON") : (fl["name"] " OFF - KEPT, NOT APPLIED"), fl["on"] ? 0xFF34D399 : 0)
+    HubPoke()
+}
+; The value a flag is staged with when nothing was typed: what its prefix can
+; hold. "true" on a DFInt was the old answer for every name, and with values
+; checked on the way in (FFMAdd) that would refuse every database pick.
+FFMDefaultFor(name) {
+    p := FFMPfxOf(name)
+    if (p = "" || InStr(p, "Flag"))
+        return "true"
+    return InStr(p, "String") ? "" : "0"
+}
+; What to say after a stage: a non-bool comes in on a placeholder that wants
+; setting, and the row's value cell is where that happens.
+FFMStagedMsg(r, nm) {
+    if (r = 2)
+        return "UPDATED " nm
+    return (FFMKindOf(Map("name", nm, "type", "int")) = "bool") ? ("STAGED " nm)
+         : ("STAGED " nm "  -  CLICK ITS VALUE TO SET IT")
+}
+
 FFMType(v) {
     v := StrLower(Trim(String(v)))
     if (v = "true" || v = "false")
@@ -5696,6 +5951,8 @@ FFMJson(skipFailed := false) {
         k := fl["name"]
         if seen.Has(k)
             continue
+        if !FFMOn(fl)
+            continue                           ; switched off: kept, not written
         if (skipFailed && FFM.failed.Has(k))
             continue
         seen[k] := true
@@ -5843,13 +6100,65 @@ class MemIO {
         return b ? StrGet(b.ptr, sz, "UTF-8") : ""
     }
 
+    ; Why the last Write failed, in words the log can carry. "" after success.
+    static why := ""
+
     static Write(addr, buf, sz) {
         if (!this.hProcess || !addr)
             return false
-        return DllCall("WriteProcessMemory",
+        this.why := ""
+        if DllCall("WriteProcessMemory",
             "Ptr", this.hProcess, "Ptr", addr,
             "Ptr", buf.Ptr, "UInt", sz, "Ptr", 0)
+            return true
+        ; ---- the page would not take it: once more with the protection
+        ;      lifted, then a verdict rather than a bare false ----
+        ; A plain write fails on a page that is read-only, and some of the
+        ; client's flag storage is: the image's .rdata, and the file-backed
+        ; section the anti-cheat keeps its locked flags in. Lifting the
+        ; protection is tried once, and put back whatever happens. Serialised,
+        ; because a timer firing between the lift and the restore would find
+        ; the page open and could push a second write through it.
+        prevC := A_IsCritical
+        Critical "On"
+        try {
+            for np in [0x04, 0x40] {              ; PAGE_READWRITE, then PAGE_EXECUTE_READWRITE
+                old := 0
+                if !DllCall("VirtualProtectEx", "Ptr", this.hProcess, "Ptr", addr
+                          , "UPtr", sz, "UInt", np, "UInt*", &old)
+                    continue
+                ok := DllCall("WriteProcessMemory", "Ptr", this.hProcess, "Ptr", addr
+                            , "Ptr", buf.Ptr, "UInt", sz, "Ptr", 0)
+                DllCall("VirtualProtectEx", "Ptr", this.hProcess, "Ptr", addr
+                      , "UPtr", sz, "UInt", old, "UInt*", &back := 0)
+                if ok
+                    return true
+            }
+        } finally
+            Critical prevC
+        this.why := this.Classify(addr)
+        return false
     }
+
+    ; What kind of page a refused write hit. A flag that lives in a read-only
+    ; image page, or in the anti-cheat's locked section, cannot be written by
+    ; anyone from outside - the client settings file is the only route to it,
+    ; and the log should say that instead of "failed".
+    static Classify(addr) {
+        mbi := Buffer(48, 0)                      ; MEMORY_BASIC_INFORMATION, x64
+        if !DllCall("VirtualQueryEx", "Ptr", this.hProcess, "Ptr", addr, "Ptr", mbi, "UPtr", 48)
+            return "address unknown to the process"
+        state := NumGet(mbi, 32, "UInt"), prot := NumGet(mbi, 36, "UInt"), type := NumGet(mbi, 40, "UInt")
+        if (state != 0x1000 || prot = 0x01)       ; not MEM_COMMIT, or PAGE_NOACCESS
+            return "stale address - the page is gone"
+        if !(prot & 0xCC)                         ; no PAGE_*WRITE* bit at all
+            return (type = 0x1000000) ? "read-only image page - only the client file can set it"
+                 : (type = 0x40000)   ? "locked by the anti-cheat - only the client file can set it"
+                                      : "read-only page"
+        return "write refused"
+    }
+    ; the verdict, ready to append to a log line
+    static WhyStr() => (this.why != "") ? ("  -  " this.why) : ""
 
     ; Returns true only if the attached process is still running.
     ; Cheaper than a full poll - one DllCall vs ProcessExist + snapshot.
@@ -6131,6 +6440,15 @@ class FlagSingleton {
         ; retry loop alone would run fifteen of them. Successful scans are
         ; cached, so this only ever throttles failure.
         if (this._failAt && A_TickCount - this._failAt < this.SCAN_RETRY)
+            return 0
+        ; ---- not under a drag ----
+        ; A fruitless scan walks the whole client image on the UI thread and
+        ; is retried every SCAN_RETRY while the table is not there yet - the
+        ; client starting, or a build the pattern does not fit. Each walk is a
+        ; freeze, and a freeze during a drag is the window stopping under the
+        ; pointer and then leaping to wherever the pointer went. The pointer
+        ; owns the window while a button is down; the scan can wait.
+        if ((IsObject(HL) && HL.drag) || gateDrag)
             return 0
         this._BuildPattern()
         pLen := this._patLen
@@ -6566,6 +6884,19 @@ class FFlags {
         NumPut("Int", rv, buf)
         return MemIO.Write(vp, buf, 4)
     }
+    ; The four bytes straight to a value address already in hand - the one
+    ; INJECT recorded (FFM.origAt), so UNINJECT and re-apply land on the SAME
+    ; storage INJECT wrote and not on whatever a fresh lookup of the name
+    ; happens to find. A value address is a flag's static storage; it does not
+    ; move for the life of the process, whatever the descriptor list does.
+    static SetAt(vp, value) {
+        rv := this.Coerce(value)
+        if (rv = "" || !this._Ptr(vp))
+            return false
+        buf := Buffer(4)
+        NumPut("Int", rv, buf)
+        return MemIO.Write(vp, buf, 4)
+    }
 
     static ReadInt(name, hdr) {
         vp := this._FindValuePtr(name, hdr)
@@ -6601,6 +6932,64 @@ class FFlags {
     ; so refuse it here and let the caller report it as failed rather than
     ; injecting a value nobody asked for and no one can see is wrong.
     static _Fit(n) => (n >= -2147483648 && n <= 2147483647) ? n : ""
+
+    ; ---- string flags: the MSVC std::string the value pointer leads to ----
+    ; 32 bytes: 16 of inline text (the Small String Optimisation), then the
+    ; length, then the capacity. A capacity of 15 means the text is inline;
+    ; more means the first 8 bytes are a heap pointer instead. Reading honours
+    ; both. Writing only ever produces the inline form, and refuses anything
+    ; longer than 15 bytes: a heap-backed string means handing the engine a
+    ; buffer it will later free with its own allocator, and a 32-byte object
+    ; that cannot be written atomically against the engine's reads. Both crash
+    ; the client. The inline form has no pointer to free and nothing to tear,
+    ; and it goes out in ONE write. Longer values go through the client file at
+    ; the next launch, and the log says so.
+    ;
+    ; The object is snapshotted whole (as hex) before it is written and put
+    ; back whole by UNINJECT: the old heap buffer, if there was one, was never
+    ; freed by our write, so restoring the pointer to it is safe.
+    static StrObj(vp) {
+        b := (this._Ptr(vp)) ? MemIO.Read(vp, 32) : 0
+        if !b
+            return ""
+        sz := NumGet(b, 16, "Int64"), cap := NumGet(b, 24, "Int64")
+        if (sz < 0 || sz > 8192 || cap < 15 || cap > 0x7FFFFFFF)
+            return ""                             ; not a string object we recognise
+        txt := (cap <= 15) ? ((sz <= 15) ? StrGet(b.Ptr, sz, "UTF-8") : "")
+                           : MemIO.ReadStr(NumGet(b, 0, "Int64"), sz)
+        return {hex: this.Hex(b, 32), text: txt}
+    }
+    ; 1 written, 0 refused by the process, -1 too long to write live
+    static SetStr(vp, value) {
+        if (!this._Ptr(vp))
+            return 0
+        sb := Buffer(StrPut(value, "UTF-8"))
+        StrPut(value, sb, "UTF-8")
+        n := sb.Size - 1                          ; bytes, without the terminator
+        if (n > 15)
+            return -1
+        o := Buffer(32, 0)
+        if n
+            DllCall("RtlMoveMemory", "Ptr", o, "Ptr", sb, "UPtr", n)
+        NumPut("Int64", n, o, 16)
+        NumPut("Int64", 15, o, 24)
+        return MemIO.Write(vp, o, 32) ? 1 : 0
+    }
+    ; the whole object back, from the snapshot
+    static PutRaw(vp, hex) {
+        if (!this._Ptr(vp) || StrLen(hex) != 64)
+            return false
+        o := Buffer(32, 0)
+        loop 32
+            NumPut("UChar", Integer("0x" SubStr(hex, 2*A_Index - 1, 2)), o, A_Index - 1)
+        return MemIO.Write(vp, o, 32)
+    }
+    static Hex(buf, n) {
+        h := ""
+        loop n
+            h .= Format("{:02X}", NumGet(buf, A_Index - 1, "UChar"))
+        return h
+    }
 
     ; Write through a value-pointer holder we already resolved.
     static SetVia(vpr, value) {
@@ -6726,6 +7115,53 @@ HubLaunchBtn(x, y, w, h, f, now, acc, live) {
     StrokeRR(x, y, w, h, h/2, pn), DelP(pn)
 }
 
+; ---- the TUTORIAL pill ----
+; Built the way HubLaunchBtn is - the recessed track, the inner shadow, the
+; glyph in the rail, the small-face label, the rim - so the two read as a
+; pair. Its glyph is a route: three waypoints joined by a path, the last one
+; lit, and on hover a pulse runs along the path from the first to the last.
+HubTourBtn(x, y, w, h, f, now, acc) {
+    hv  := HL.h.Get(2207, 0.0)
+    prs := FFM.clickAt.Has(2207) ? Clamp((now - FFM.clickAt[2207])/400.0, 0.0, 1.0) : 1.0
+    b := VBrush(x, y, w, h, FA(Mix(0xFF0E1120, 0xFF161B34, hv), f), FA(0xFF080A12, f))
+    FillRR(x, y, w, h, h/2, b), DelB(b)
+    if !hubLowPerf {
+        b := VBrush(x, y, w, 5, FA(Alpha(0x000000, 90), f), Alpha(0x000000, 0))
+        FillRR(x + 2, y + 1, w - 4, 5, 2.5, b), DelB(b)
+    }
+    ; the route: waypoints at three heights, the path through them
+    gx := x + 11, cy2 := y + h/2
+    p1x := gx, p1y := cy2 + 4, p2x := gx + 7, p2y := cy2 - 4, p3x := gx + 14, p3y := cy2 + 3
+    pn := Pen(FA(Alpha(AccHi(acc, 0.35), 120 + 60*hv), f), 1.3)
+    Line(p1x, p1y, p2x, p2y, pn), Line(p2x, p2y, p3x, p3y, pn), DelP(pn)
+    b := SBrush(FA(Alpha(0xFFC7CBE0, 150 + 60*hv), f))
+    FillEll(p1x - 2, p1y - 2, 4, 4, b), FillEll(p2x - 2, p2y - 2, 4, 4, b), DelB(b)
+    b := SBrush(FA(Alpha(AccHi(acc, 0.5), 235), f))
+    FillEll(p3x - 2.6, p3y - 2.6, 5.2, 5.2, b), DelB(b)
+    if (hv > 0.02 && !hubLowPerf) {
+        ; a pulse travelling the route while the pointer is on it
+        pp := Mod(DecT(now)*0.0016, 1.0)
+        if (pp < 0.5) {
+            tt := pp/0.5
+            qx := p1x + (p2x - p1x)*tt, qy := p1y + (p2y - p1y)*tt
+        } else {
+            tt := (pp - 0.5)/0.5
+            qx := p2x + (p3x - p2x)*tt, qy := p2y + (p3y - p2y)*tt
+        }
+        b := SBrush(FA(Alpha(AccHi(acc, 0.6), Round(220*hv)), f))
+        FillEll(qx - 2, qy - 2, 4, 4, b), DelB(b)
+    }
+    if (prs < 1 && !hubLowPerf) {
+        ; the press: a ring out of the last waypoint
+        pn := Pen(FA(Alpha(acc, Round(180*(1 - prs))), f), 1.6)
+        Ell(p3x - 4 - 10*prs, p3y - 4 - 10*prs, 8 + 20*prs, 8 + 20*prs, pn), DelP(pn)
+    }
+    Txt("TUTORIAL", x + 31, y + 1, w - 38, h, HL.fXs
+        , FA(Alpha(Mix(0xFFE8EAF6, acc, 0.25), 210 + 45*hv), f), fmtL)
+    pn := Pen(FA(Alpha(acc, 55 + 90*hv + (prs < 1 ? Round(80*(1 - prs)) : 0)), f), 1.2)
+    StrokeRR(x, y, w, h, h/2, pn), DelP(pn)
+}
+
 HubOpenRoblox() {
     ok := false
     try {
@@ -6833,7 +7269,7 @@ FFMPS(pid) {
         FlagSingleton.Forget(pid)            ; its addresses died with it too
     }
     if !FFM.ps.Has(pid)
-        FFM.ps[pid] := {orig: Map(), failed: Map(), succ: 0, fail: 0, hdrKey: "", label: ""
+        FFM.ps[pid] := {orig: Map(), origAt: Map(), failed: Map(), succ: 0, fail: 0, hdrKey: "", label: ""
                       , flags: 0, map: 0, stamp: st}   ; 0 = not cloned from the base yet
     else if (st && !FFM.ps[pid].stamp)
         FFM.ps[pid].stamp := st              ; first time we could read one
@@ -6894,7 +7330,7 @@ FFMUseInstance(pid, quiet := false) {
         ; client's originals into it would arm UNINJECT to write them at a
         ; process that never saw them.
         if (!cur.stamp || !FFM.stamp || cur.stamp = FFM.stamp) {
-            cur.orig := FFM.orig, cur.failed := FFM.failed
+            cur.orig := FFM.orig, cur.origAt := FFM.origAt, cur.failed := FFM.failed
             cur.succ := FFM.injectSucc, cur.fail := FFM.injectFail
             cur.hdrKey := FFM.lastHdrKey
             cur.flags := FFM.flags, cur.map := FFM.map
@@ -6923,6 +7359,7 @@ FFMUseInstance(pid, quiet := false) {
         ps.map   := FFMIndexOf(ps.flags)
     }
     FFM.orig := ps.orig, FFM.failed := ps.failed
+    FFM.origAt := ps.HasOwnProp("origAt") ? ps.origAt : Map()
     FFM.injectSucc := ps.succ, FFM.injectFail := ps.fail
     FFM.lastHdrKey := ps.hdrKey
     FFM.flags := ps.flags, FFM.map := ps.map
@@ -7037,6 +7474,7 @@ FFMPoll() {
         FFM.rbx := live ? 1 : 0, FFM.rbxAt := A_TickCount
         HubPoke()
     }
+    LGIObserve(live)                             ; LOGIN ITEMS rides this enumeration - see LGIScan
     ; ---- selection ----
     ; NOT gated on the list being non-empty. That gate was the bug: with no
     ; clients left, a dead FFM.pid was never cleared, `pid` came back non-zero,
@@ -7054,7 +7492,7 @@ FFMPoll() {
             FFM.pid := 0
             MemIO.Detach()
             FlagSingleton.Invalidate()
-            FFM.orig := Map(), FFM.failed := Map()
+            FFM.orig := Map(), FFM.origAt := Map(), FFM.failed := Map()
             FFM.lastHdrKey := ""
             FFM.attFailAt := 0
             FFMSay("ROBLOX CLOSED", C_ACC)
@@ -7304,7 +7742,15 @@ FFMApplyLive(isAuto := false, silent := false) {
                 swapped := true
                 break
             }
+            if !FFMOn(fl)
+                continue                         ; switched off: staged, not applied
             bareName := FFMBareOf(fl["name"])
+            ; a string flag is a 32-byte object, not four bytes - the index pass
+            ; below handles it, with its own snapshot
+            if (FFMKindOf(fl) = "string") {
+                miss.Push(fl)
+                continue
+            }
             ; Snapshot the live value the first time we touch this flag, so
             ; UNINJECT can put it back. Guarded by Has() - a second inject must
             ; not record our own value as the "original".
@@ -7315,9 +7761,17 @@ FFMApplyLive(isAuto := false, silent := false) {
             ; flag this module never touched. String flags and out-of-range
             ; numbers reach exactly that path: readable, snapshotted, refused.
             had := FFM.orig.Has(fl["name"])
+            ; an owned flag is written where it was first written; a new one is
+            ; resolved once, through the hash chain, and that address is kept
+            vp1 := (had && FFM.origAt.Has(fl["name"])) ? FFM.origAt[fl["name"]]
+                 : FFlags._FindValuePtr(bareName, hdr)
+            if !FFlags._Ptr(vp1) {
+                miss.Push(fl)                    ; retried against the index below
+                continue
+            }
             cur := ""
             if !had {
-                cur := FFlags.ReadIntChk(bareName, hdr)
+                cur := MemIO.ReadI32Chk(vp1)
                 if (cur = "" || !IsInteger(cur)) {
                     ; Unreadable here does not mean unwritable, and that is the
                     ; trap: the write can land while the read failed, leaving a
@@ -7328,9 +7782,9 @@ FFMApplyLive(isAuto := false, silent := false) {
                     continue
                 }
             }
-            if (FFlags.Set(bareName, fl["value"], hdr)) {
+            if (FFlags.SetAt(vp1, fl["value"])) {
                 if !had
-                    FFM.orig[fl["name"]] := cur
+                    FFM.orig[fl["name"]] := cur, FFM.origAt[fl["name"]] := vp1
                 succ++
                 FFMLog("Inject", fl["name"], "OK → " fl["value"])
             } else {
@@ -7359,6 +7813,38 @@ FFMApplyLive(isAuto := false, silent := false) {
                 }
                 nm   := fl["name"]
                 bare := FFMBareOf(nm)
+                ; ---- string flags ----
+                if (FFMKindOf(fl) = "string") {
+                    if (!idx.Has(bare)) {
+                        fail++, FFM.failed[nm] := true
+                        FFMLog("Inject", nm, idx.Count ? "NOT IN THIS ROBLOX BUILD" : "table unreadable - could not verify")
+                        continue
+                    }
+                    vps := FFM.origAt.Has(nm) ? FFM.origAt[nm] : MemIO.ReadU64(idx[bare] + 0xC0)
+                    so  := vps ? FFlags.StrObj(vps) : ""
+                    if (so = "") {
+                        fail++, FFM.failed[nm] := true
+                        FFMLog("Inject", nm, "original unreadable - NOT written (could not be undone)")
+                        continue
+                    }
+                    rs := FFlags.SetStr(vps, fl["value"])
+                    if (rs = -1) {
+                        fail++, FFM.failed[nm] := true
+                        FFMLog("Inject", nm, "SKIPPED - " (StrPut(fl["value"], "UTF-8") - 1)
+                             . " bytes; a string over 15 cannot be written live - the client file sets it at launch")
+                        continue
+                    }
+                    if (rs) {
+                        if !FFM.orig.Has(nm)
+                            FFM.orig[nm] := "str:" so.hex, FFM.origAt[nm] := vps
+                        succ++
+                        FFMLog("Inject", nm, "OK (string) → " fl["value"] " (was " so.text ")")
+                    } else {
+                        fail++, FFM.failed[nm] := true
+                        FFMLog("Inject", nm, "found but write refused" MemIO.WhyStr())
+                    }
+                    continue
+                }
                 if (FFlags.Coerce(fl["value"]) = "") {
                     fail++, FFM.failed[nm] := true
                     ; Coerce also refuses a number too wide for the 32-bit
@@ -7380,9 +7866,9 @@ FFMApplyLive(isAuto := false, silent := false) {
                 }
                 vpr := idx[bare]
                 had0 := FFM.orig.Has(nm)
+                vp0  := (had0 && FFM.origAt.Has(nm)) ? FFM.origAt[nm] : MemIO.ReadU64(vpr + 0xC0)
                 cur0 := ""
                 if !had0 {
-                    vp0  := MemIO.ReadU64(vpr + 0xC0)
                     cur0 := vp0 ? MemIO.ReadI32Chk(vp0) : ""
                     if (cur0 = "") {
                         ; Refused, not written. A flag whose pre-injection value
@@ -7396,14 +7882,14 @@ FFMApplyLive(isAuto := false, silent := false) {
                         continue
                     }
                 }
-                if (FFlags.SetVia(vpr, fl["value"])) {
+                if (FFlags.SetAt(vp0, fl["value"])) {
                     if !had0
-                        FFM.orig[nm] := cur0     ; committed only now - see pass one
+                        FFM.orig[nm] := cur0, FFM.origAt[nm] := vp0   ; committed only now - see pass one
                     succ++
                     FFMLog("Inject", nm, "OK (resolved) → " fl["value"])
                 } else {
                     fail++, FFM.failed[nm] := true
-                    FFMLog("Inject", nm, "found but write refused")
+                    FFMLog("Inject", nm, "found but write refused" MemIO.WhyStr())
                 }
             }
         }
@@ -7416,7 +7902,7 @@ FFMApplyLive(isAuto := false, silent := false) {
         ; after, not ten minutes later.
         if (ffReApply && succ)
             FFMReApplyBurst()
-        total := FFM.flags.Length
+        total := FFMOnCount()                    ; the ones that were meant to go
         if (!silent) {
             if (succ = 0)
                 FFMSay("INJECT FAILED  " fail " ERRORS", C_ACC)
@@ -7508,18 +7994,30 @@ FFMUninject(silent := false) {
                 return
             }
             bn  := FFMBareOf(nm)
-            vpr := idx.Has(bn) ? idx[bn] : 0
-            if (vpr) {
-                wrote := FFlags.SetVia(vpr, val)
-                vp    := MemIO.ReadU64(vpr + 0xC0)
-                back  := vp ? MemIO.ReadI32Chk(vp) : ""
+            ; ---- back to where INJECT wrote it ----
+            ; The recorded address first (FFM.origAt): a name the table holds
+            ; twice could otherwise be restored on the wrong twin. Without one -
+            ; an original recorded by an older build of this code - the name is
+            ; resolved the way INJECT resolves it, hash chain first and the
+            ; index after, so the two at least agree with each other.
+            vp := FFM.origAt.Has(nm) ? FFM.origAt[nm] : 0
+            if !FFlags._Ptr(vp) {
+                vp := FFlags._FindValuePtr(bn, hdr)
+                if (!vp && idx.Has(bn))
+                    vp := MemIO.ReadU64(idx[bn] + 0xC0)
+            }
+            if (SubStr(val, 1, 4) = "str:") {
+                ; the 32-byte object, exactly as it was - see FFlags.StrObj
+                wrote := FFlags._Ptr(vp) ? FFlags.PutRaw(vp, SubStr(val, 5)) : false
+                so := wrote ? FFlags.StrObj(vp) : ""
+                back := (so != "") ? ("str:" so.hex) : ""
             } else {
-                wrote := FFlags.Set(bn, val, hdr)
-                back  := FFlags.ReadIntChk(bn, hdr)
+                wrote := FFlags._Ptr(vp) ? FFlags.SetAt(vp, val) : false
+                back  := wrote ? MemIO.ReadI32Chk(vp) : ""
             }
             if (!wrote) {
                 bad++
-                FFMLog("Uninject", nm, "WRITE FAILED")
+                FFMLog("Uninject", nm, "WRITE FAILED" MemIO.WhyStr())
                 continue
             }
             if (back = "") {
@@ -7658,7 +8156,7 @@ FFMCloseRoblox() {
     }
 
     FFM.rbx := 0, FFM.rbxAt := A_TickCount, FFM.pid := 0
-    FFM.orig := Map()
+    FFM.orig := Map(), FFM.origAt := Map()
     ; ---- tell LIVE the session is over ----
     ; ProcessClose is TerminateProcess: the client dies mid-frame and never
     ; writes the leave line the log parser is waiting for. So every session
@@ -7679,7 +8177,8 @@ FFMCloseRoblox() {
 FFMSaveFlags() {
     out := "[", n := 0
     for fl in FFM.flags {
-        out .= (n ? "," : "") '{"name":"' FFMEsc(fl["name"]) '","value":"' FFMEsc(fl["value"]) '","type":"' fl["type"] '"}'
+        out .= (n ? "," : "") '{"name":"' FFMEsc(fl["name"]) '","value":"' FFMEsc(fl["value"]) '","type":"' fl["type"] '"'
+             . (FFMOn(fl) ? "" : ',"on":"0"') '}'
         n++
     }
     try {
@@ -7689,13 +8188,82 @@ FFMSaveFlags() {
     }
 }
 
+; ---- the staged list, as it was before something changed it wholesale ----
+; CLEAR, an import, a preset, a community set, PRUNE and CLEAN, UPDATE's
+; renames and a single delete each take a snapshot first; the HISTORY tab of
+; the LOGS overlay lists them and puts any one of them back. An empty list is
+; not worth a snapshot, and restoring takes one of its own, so a restore is
+; never a one-way door either. Persisted, so it survives a relaunch.
+FFMSnap(act) {
+    if (FFM.flags.Length = 0)
+        return
+    lst := []
+    for fl in FFM.flags
+        lst.Push(Map("name", fl["name"], "value", fl["value"], "type", fl["type"], "on", FFMOn(fl) ? 1 : 0))
+    FFM.hist.InsertAt(1, {at: A_Now, t: FormatTime(, "HH:mm:ss"), act: act, flags: lst})
+    while (FFM.hist.Length > FFM_HSMAX)
+        FFM.hist.RemoveAt(FFM.hist.Length)
+    FFMHistSave()
+}
+FFMHistRestore(i) {
+    if (i < 1 || i > FFM.hist.Length)
+        return
+    try FFMEndEdit(false)
+    sn := FFM.hist[i]
+    FFMSnap("restore")                           ; the way back from the way back
+    FFM.flags := [], FFM.flash := Map(), FFM.failed := Map()
+    for fl in sn.flags
+        FFM.flags.Push(Map("name", fl["name"], "value", fl["value"], "type", fl["type"], "on", fl["on"]))
+    FFM.scrT := 0.0, FFM.scr := 0.0
+    FFMReindex()
+    FFMSaveFlags()
+    FFMSay("RESTORED " FFM.flags.Length " FLAG(S) FROM " sn.t "  -  BEFORE " StrUpper(sn.act), 0xFF34D399)
+    HubPoke()
+}
+; One snapshot per line, the staged list's own on-disk shape inside it, so the
+; loader is the flag loader run once per line.
+FFMHistSave() {
+    out := ""
+    for sn in FFM.hist {
+        rec := ""
+        for fl in sn.flags
+            rec .= (rec != "" ? "," : "") '{"name":"' FFMEsc(fl["name"]) '","value":"' FFMEsc(fl["value"]) '","type":"' fl["type"] '"' (fl["on"] ? "" : ',"on":"0"') '}'
+        out .= '{"at":"' sn.at '","t":"' sn.t '","act":"' FFMEsc(sn.act) '","flags":[' rec ']}`n'
+    }
+    try {
+        fh := FileOpen(ffHist, "w", "UTF-8-RAW")
+        fh.Write(out)
+        fh.Close()
+    }
+}
+FFMHistLoad() {
+    FFM.hist := []
+    if !FileExist(ffHist)
+        return
+    body := ""
+    try body := FileRead(ffHist, "UTF-8")
+    for ln in StrSplit(body, "`n", "`r") {
+        if !RegExMatch(ln, '^\{"at":"([^"]*)","t":"([^"]*)","act":"([^"]*)","flags":\[(.*)\]\}$', &h)
+            continue
+        lst := [], pos := 1
+        while (pos := RegExMatch(h[4], '\{"name":"([^"]+)","value":"([^"]*)","type":"([^"]+)"(?:,"on":"([01])")?\}', &m, pos)) {
+            lst.Push(Map("name", m[1], "value", m[2], "type", m[3], "on", (m[4] = "0") ? 0 : 1))
+            pos += m.Len
+        }
+        if lst.Length
+            FFM.hist.Push({at: h[1], t: h[2], act: h[3], flags: lst})
+        if (FFM.hist.Length >= FFM_HSMAX)
+            break
+    }
+}
+
 FFMLoadFlags() {
     if !FileExist(ffFile)
         return
     try {
         c := FileRead(ffFile, "UTF-8"), pos := 1
-        while (pos := RegExMatch(c, '\{"name":"([^"]+)","value":"([^"]*)","type":"([^"]+)"\}', &m, pos)) {
-            FFM.flags.Push(Map("name", m[1], "value", m[2], "type", m[3]))
+        while (pos := RegExMatch(c, '\{"name":"([^"]+)","value":"([^"]*)","type":"([^"]+)"(?:,"on":"([01])")?\}', &m, pos)) {
+            FFM.flags.Push(Map("name", m[1], "value", m[2], "type", m[3], "on", (m[4] = "0") ? 0 : 1))
             pos += m.Len
         }
     }
@@ -7705,8 +8273,29 @@ FFMAdd(name, value) {
     name := Trim(name)
     if (name = "")
         return 0
+    ; ---- a prefix Roblox never had ----
+    ; Community lists carry "DFlag" - someone's typo for DFFlag, copied ever
+    ; since - and the singleton stores bare names, so it matches nothing either
+    ; way. Stripped to the bare name here, on the one path every add and every
+    ; import comes through; the clean pass fits a real prefix from the live
+    ; list. DFFlag, DFInt and the rest are untouched: they are real.
+    if RegExMatch(name, "^DFlag(?=[A-Z])")
+        name := SubStr(name, 6)
     if (value = "")
-        value := "true"
+        value := FFMDefaultFor(name)
+    ; ---- the value has to fit the name ----
+    ; FFMTypeFault already knew that "tru" is not a bool and "abc" is not an
+    ; int; it was only asked at clean time, after the value had sat in the
+    ; list looking fine. Asked here, on the one path every add and every
+    ; import comes through. A refusal returns 0; a bulk import counts them
+    ; (FFM.badN) and its message says how many, a single add is told why.
+    pfxV := FFMPfxOf(name)
+    if (pfxV != "" && (fault := FFMTypeFault(pfxV, Trim(value))) != "") {
+        FFM.badN := FFM.badN + 1
+        if !FFM.bulk
+            FFMSay(StrUpper(fault), C_ACC)
+        return 0
+    }
     k := StrLower(name)
     if FFM.map.Has(k) {
         fl := FFM.flags[FFM.map[k]]
@@ -7718,7 +8307,7 @@ FFMAdd(name, value) {
         FFM.flCacheQ := "`f"
         return 2
     }
-    FFM.flags.Push(Map("name", name, "value", value, "type", FFMType(value)))
+    FFM.flags.Push(Map("name", name, "value", value, "type", FFMType(value), "on", 1))
     FFM.map[k] := FFM.flags.Length
     ; During a bulk import we skip the per-flag disk write and the flash
     ; highlight entirely: writing the whole file once per flag is O(n^2) I/O,
@@ -7734,6 +8323,7 @@ FFMAdd(name, value) {
 FFMDel(i) {
     if (i < 1 || i > FFM.flags.Length)
         return
+    FFMSnap("delete")
     FFM.flags.RemoveAt(i)
     FFM.flash := Map()
     FFMReindex()
@@ -7747,11 +8337,12 @@ FFMClearAll() {
         FFMSay("NOTHING STAGED", 0xFFFBBF24)
         return
     }
+    FFMSnap("clear")
     FFM.flags := [], FFM.flash := Map()
     FFM.scrT := 0.0, FFM.scr := 0.0
     FFMReindex()
     FFMSaveFlags()
-    FFMSay("CLEARED " n " FLAG(S)", C_ACC)
+    FFMSay("CLEARED " n " FLAG(S)  -  HISTORY HAS THEM", C_ACC)
 }
 
 FFMCycle(i) {
@@ -7800,11 +8391,13 @@ FFMMaxScr(count, vis) => Max(0.0, count*HL.ffrh - vis*HL.ffrh + 0.0)
 ; ---------------- import / export ----------------
 FFMParseInto(text) {
     n := 0, pos := 1
+    FFM.badN := 0
+    FFMSnap("import")                   ; the list as it was, in case this is not what was wanted
     FFM.bulk := 1                       ; one disk write at the end, not n of them
     try {
         while (pos := RegExMatch(text, '"(?P<K>[^"]+)"\s*:\s*(?:"(?P<V>[^"]*)"|(?P<N>[^,\}\s]+))', &m, pos)) {
-            FFMAdd(m["K"], (m["V"] != "") ? m["V"] : m["N"])
-            n++
+            if FFMAdd(m["K"], (m["V"] != "") ? m["V"] : m["N"])
+                n++                             ; a refused value is not an import
             pos += m.Len
         }
     }
@@ -7841,8 +8434,9 @@ FFMImportFiles(sel) {
         total += c
         ok += (c > 0) ? 1 : 0
     }
-    FFMSay(total ? "IMPORTED " total " FROM " ok " FILE(S)" : "NO FLAGS FOUND IN FILE(S)"
-         , total ? 0xFF34D399 : C_ACC)
+    FFMSay((total ? "IMPORTED " total " FROM " ok " FILE(S)" : "NO FLAGS FOUND IN FILE(S)")
+         . (FFM.badN ? ("  -  " FFM.badN " REFUSED, VALUE DOES NOT FIT THE NAME") : "")
+         , total ? (FFM.badN ? 0xFFFBBF24 : 0xFF34D399) : C_ACC)
     HubPoke()
 }
 
@@ -7854,7 +8448,9 @@ FFMImportClip() {
         return
     }
     n := FFMParseInto(clipTxt)
-    FFMSay(n ? "IMPORTED " n " FROM CLIPBOARD" : "NO FLAGS IN CLIPBOARD", n ? 0xFF34D399 : C_ACC)
+    FFMSay((n ? "IMPORTED " n " FROM CLIPBOARD" : "NO FLAGS IN CLIPBOARD")
+         . (FFM.badN ? ("  -  " FFM.badN " REFUSED, VALUE DOES NOT FIT THE NAME") : "")
+         , n ? (FFM.badN ? 0xFFFBBF24 : 0xFF34D399) : C_ACC)
 }
 
 FFMExport() {
@@ -7880,6 +8476,21 @@ FFMExport() {
 ; flags: the settings file takes them happily, MemIO cannot write them at all.
 ; The old CLEAN read FFM.failed without that distinction, so a valid FString
 ; the injector skipped was thrown out of a JSON file it would have worked in.
+;
+; ---- and it disagrees about two more things, which is why the FILE now sees
+;      only two of the four drop signals ----
+; An injection failure is not a verdict on the flag. The reasons the injector
+; records are "not in this build's table", "table unreadable", "original
+; unreadable", "page locked by the anti-cheat" and "too long to write live" -
+; every one of them a fact about writing process memory, and the last two are
+; precisely the flags the settings file exists to carry. Only a bad VALUE says
+; anything about the file, and signal 3 catches that on its own. So signal 1
+; is the audit's (PRUNE), never the file's.
+; Two staged names sharing a bare name are one flag to the injector, because
+; the client's table has no prefixes - but they are two keys in the settings
+; file, and FFlagX and DFFlagX are both real. So signal 4 is the audit's too.
+; The client ignores a key it does not know; it cannot un-ignore one CLEAN
+; threw away. When in doubt the file keeps the flag.
 FFMCleanScan(forFile := true) {
     scan := { drop: Map(), fix: Map(), why: Map() }
     seenBare := Map()
@@ -7892,18 +8503,18 @@ FFMCleanScan(forFile := true) {
         pfx := FFMPfxOf(nm)
         bk  := StrLower(FFMBareOf(nm))
 
-        ; 1. the memory write was refused - the old signal, narrowed
-        if FFM.failed.Has(nm) {
-            if (!forFile || (fl["type"] != "string" && FFlags.Coerce(val) != "")) {
-                scan.drop[k] := true, scan.why[k] := "injection refused"
-                continue
-            }
+        ; 1. the memory write was refused - the audit's signal, not the file's
+        if (!forFile && FFM.failed.Has(nm)) {
+            scan.drop[k] := true, scan.why[k] := "injection refused"
+            continue
         }
 
         ; 2. retired outright. Only asked once UPDATE has actually run, so a
         ;    user who has never pressed it gets the old behaviour rather than a
-        ;    CLEAN that drops everything against an empty index.
-        if (haveLive && !FFM.live.Has(nm) && !FFM.bare.Has(bk)) {
+        ;    CLEAN that drops everything against an empty index - and only on
+        ;    a list that came back whole (FFM.livePartial): a name missing from
+        ;    a list missing a source is missing from nothing.
+        if (haveLive && !FFM.livePartial && !FFM.live.Has(nm) && !FFM.bare.Has(bk)) {
             scan.drop[k] := true, scan.why[k] := "not in the live flag list"
             continue
         }
@@ -7922,8 +8533,9 @@ FFMCleanScan(forFile := true) {
         ; 4. injection strips prefixes, so two staged names sharing a bare name
         ;    are ONE flag to the writer and the later one silently wins. Keep
         ;    the first, drop the rest. FFMJson's seen-map does not catch this:
-        ;    it dedupes on the full name, and FFlagX / DFFlagX differ there.
-        if seenBare.Has(bk) {
+        ;    it dedupes on the full name, and FFlagX / DFFlagX differ there -
+        ;    which is exactly why the FILE keeps both: there they are two keys.
+        if (!forFile && seenBare.Has(bk)) {
             scan.drop[k] := true, scan.why[k] := "duplicate of " seenBare[bk]
             continue
         }
@@ -7974,6 +8586,8 @@ FFMJsonClean(scan) {
         k := StrLower(fl["name"])
         if scan.drop.Has(k)
             continue
+        if !FFMOn(fl)
+            continue                           ; switched off: kept, not written
         out := scan.fix.Has(k) ? scan.fix[k] : fl["name"]
         ok  := StrLower(out)
         if seen.Has(ok)                        ; a repair can collide with an
@@ -7997,6 +8611,7 @@ FFMPrune() {
         FFMSay("NOTHING TO PRUNE", 0xFF34D399)
         return
     }
+    FFMSnap("prune")
     n := 0, i := FFM.flags.Length
     while (i >= 1) {                           ; backwards - RemoveAt shifts the tail
         k := StrLower(FFM.flags[i]["name"])
@@ -8052,6 +8667,7 @@ FFMClean() {
 
 ; ---------------- presets: replace the staged set ----------------
 FFMInsertPreset(label, set) {
+    FFMSnap("preset")
     ; FFM.map is the name -> row index. Emptying FFM.flags without emptying it
     ; left every name from the OLD set still "present", so FFMAdd took its
     ; update branch and indexed into the now-empty array. The throw was
@@ -8085,6 +8701,7 @@ FFMInsertPreset(label, set) {
 FFMCommInsert(ci, slot) {
     if (ci < 1 || ci > FFM_COMM.Length)
         return
+    FFMSnap("community set")
     ent := FFM_COMM[ci]
     ds  := FFMCommState(ent.folder)
     si  := ds.s + slot
@@ -8099,7 +8716,7 @@ FFMCommInsert(ci, slot) {
         ; away while the panel was open. Re-sync rather than just complaining.
         st.have := 0
         FFMSay(StrUpper(st.file) " IS MISSING FROM THE CACHE - RESYNCING", C_ACC)
-        FFMCommSync()
+        FFMCommSync(1)
         return
     }
     ; Same clearing FFMInsertPreset does, and for the same reason: FFM.map is
@@ -8406,9 +9023,16 @@ FFMUpdateGot(path) {
     ;   tokOf    - name -> its tokens, space joined, as the child wrote them
     ;   df       - token -> how many names carry it
     live := Map(), bareAll := Map(), tokOf := Map(), df := Map(), n := 0
+    srcOk := 3, srcN := 3
     Loop Parse, body, "`n", "`r" {
         if (A_LoopField = "")
             continue
+        if (SubStr(A_LoopField, 1, 9) = "#sources ") {
+            hp := StrSplit(A_LoopField, " ")
+            if (hp.Length >= 3)
+                srcOk := Integer(hp[2]), srcN := Integer(hp[3])
+            continue
+        }
         p := StrSplit(A_LoopField, "`t")
         if (p.Length < 2)
             continue
@@ -8434,6 +9058,12 @@ FFMUpdateGot(path) {
         HubPoke()
         return
     }
+    ; ---- short of a source: nothing is retired on its say-so ----
+    ; The desktop dump alone is ~22k names; a list under 15k has lost it.
+    ; A partial list still repairs prefixes and confirms what it does hold,
+    ; but a name it lacks is "not judged", never "retired" - and CLEAN reads
+    ; the same flag before it drops anything as not live.
+    FFM.livePartial := (srcOk < srcN || n < 15000) ? 1 : 0
 
     ; Inverse document frequency. A token in 90% of the list carries almost no
     ; information; one in three names carries a lot. The old matcher weighted
@@ -8471,6 +9101,8 @@ FFMUpdateGot(path) {
 
     ; ---- reconcile ----
     undo := [], taken := Map(), remap := Map()
+    hN := FFM.hist.Length
+    FFMSnap("update")                          ; the names as they were, for HISTORY
     for fl in FFM.flags {
         undo.Push(fl["name"])
         taken[StrLower(fl["name"])] := true
@@ -8524,6 +9156,11 @@ FFMUpdateGot(path) {
         }
 
         ; --- retired: score every plausible candidate ---
+        if FFM.livePartial {
+            unk++
+            FFMUpdLog(old, "", "SKIPPED", 0.0, "live list incomplete - a source did not download; not judged")
+            continue
+        }
         q := FFMTok(clean)
         if (q.Length = 0) {
             unk++
@@ -8663,8 +9300,16 @@ FFMUpdateGot(path) {
              . (unk ? " - " unk " UNKNOWN" : ""), rev ? 0xFFFBBF24 : 0xFF34D399)
     } else {
         FFM.updUndo := 0
-        FFMSay(unk ? (okCnt " CURRENT - " unk " UNKNOWN FLAG(S)")
-                   : "ALL " okCnt " FLAG(S) ALREADY CURRENT", 0xFF34D399)
+        ; nothing was renamed, so the snapshot taken above records no change -
+        ; drop it rather than fill HISTORY with identical entries
+        if (FFM.hist.Length > hN) {
+            FFM.hist.RemoveAt(1)
+            FFMHistSave()
+        }
+        FFMSay((unk ? (okCnt " CURRENT - " unk " UNKNOWN FLAG(S)")
+                    : "ALL " okCnt " FLAG(S) ALREADY CURRENT")
+             . (FFM.livePartial ? "  -  LIST INCOMPLETE, NOTHING JUDGED RETIRED" : "")
+             , FFM.livePartial ? 0xFFFBBF24 : 0xFF34D399)
     }
     if bareN
         FFMUpdLog("-", "", "NOTE", 0.0
@@ -8684,6 +9329,7 @@ FFMOpenView(v) {
         FFMEndEdit(false)
         FFM.logScrT := 0.0, FFM.logScr := 0.0
         FFM.updScrT := 0.0, FFM.updScr := 0.0
+        FFM.hsScrT := 0.0, FFM.hsScr := 0.0
     } else if (v = "comm") {
         FFMEndEdit(false)
         FFM.commAt := A_TickCount
@@ -9273,9 +9919,15 @@ FFMEndEdit(commit := true) {
             v := Trim(FFM.buf)
             if (v != "") {
                 fl := FFM.flags[FFM.editRow]
-                fl["value"] := v, fl["type"] := FFMType(v)
-                FFM.flash[FFM.editRow] := A_TickCount
-                FFMSaveFlags()
+                pfxE := FFMPfxOf(fl["name"])
+                if (pfxE != "" && (fault := FFMTypeFault(pfxE, v)) != "") {
+                    ; refused, and the old value stays - see FFMAdd
+                    FFMSay(StrUpper(fault), C_ACC)
+                } else {
+                    fl["value"] := v, fl["type"] := FFMType(v)
+                    FFM.flash[FFM.editRow] := A_TickCount
+                    FFMSaveFlags()
+                }
             }
         } else if (FFM.edit = "q") {
             FFM.q2 := Trim(FFM.buf)
@@ -9293,6 +9945,9 @@ FFMEndEdit(commit := true) {
             ; the no-op a Delete usually is - the same trap FFMBtn's clickAt
             ; sweep documents. Committing an emptied field for a flag that has
             ; already gone would have taken the render thread down with it.
+            ; same strip as RSetFxAdd: the bar separates fields in the ini blob,
+            ; and this was the one route into a value that did not remove it
+            v := StrReplace(v, "|", "")
             if (v = "")
                 (RSET.extra.Has(RSET.fxSel) && RSET.extra.Delete(RSET.fxSel))
             else
@@ -9500,9 +10155,10 @@ FFMKey(hook, vk, sc) {
             lst := FFMDbList()
             if lst.Length {
                 nm := FFM.db[lst[1]]
-                r := FFMAdd(nm, "true")
+                r := FFMAdd(nm, "")
                 FFM.dbIns[StrLower(nm)] := A_TickCount
-                FFMSay(r = 2 ? "UPDATED " nm : "STAGED " nm, 0xFF34D399)
+                if r
+                    FFMSay(FFMStagedMsg(r, nm), 0xFF34D399)
             }
         } else if (FFM.edit = "rfd") {
             dl := RSetDbList()
@@ -9511,17 +10167,38 @@ FFMKey(hook, vk, sc) {
         } else if (FFM.edit = "q") {
             nm := Trim(FFM.buf)
             if (nm != "") {
-                r := FFMAdd(nm, "true")
+                r := FFMAdd(nm, "")
                 FFM.buf := "", FFM.q2 := "", FFM.car := 0, FFM.sel := -1
                 FFM.flCacheQ := "`f"
-                FFMSay(r = 2 ? "UPDATED " nm : "STAGED " nm, 0xFF34D399)
+                if r
+                    FFMSay(FFMStagedMsg(r, nm), 0xFF34D399)
             }
+        } else if (FFM.edit = "rfn") {
+            ; ---- the add row reads left to right ----
+            ; Enter in the NAME box used to end the edit and leave the caret
+            ; nowhere, so adding a flag was type, click, type, click. Enter moves
+            ; on to the VALUE box; Enter there is ADD, with ADD's own checks and
+            ; its own words when they fail; Tab walks between the two.
+            FFMEndEdit(true)
+            FFMBeginEdit("rfv", 0)
+        } else if (FFM.edit = "rfv") {
+            ; and after an add, the caret is back in the empty NAME box, so a
+            ; list of flags goes in without a click between them
+            if RSetFxAdd()
+                FFMBeginEdit("rfn", 0)
         } else {
             FFMEndEdit(true)
         }
         HubPoke()
     } else if (vk = 9) {
-        FFMEndEdit(true)
+        if (FFM.edit = "rfn") {
+            FFMEndEdit(true)
+            FFMBeginEdit("rfv", 0)
+        } else if (FFM.edit = "rfv") {
+            FFMEndEdit(true)
+            FFMBeginEdit("rfn", 0)
+        } else
+            FFMEndEdit(true)
     }
 }
 
@@ -9607,6 +10284,8 @@ FFMZone(ux, uy) {
         r := Floor((uy - HL.ffly - 6 + FFM.scr)/HL.ffrh) + 1
         vis := r - Floor(FFM.scr/HL.ffrh)
         if (r >= 1 && r <= FFMFlagList().Length && vis >= 1 && vis <= HL.ffrows) {
+            if (ux >= ax + 3 && ux < ax + 20)
+                return 510 + vis                  ; the ON/OFF pip
             if (ux >= ax + HL.abw - 38 && ux < ax + HL.abw - 14)
                 return 500 + vis
             if (ux >= ax + HL.abw - 170)
@@ -9635,11 +10314,24 @@ FFMCommZone(ux, uy) {
     bodyY := y + FFMCommBodyY(), bodyH := FFMCommBodyH()
     mx := x + 14, mw := w - 28
     bx := mx + 12, bw := mw - 24
+    ; the hero reel: the whole banner is the skip target, when there is a reel
+    if (FFM_COMM_ART.Length > 1 && !hubLowPerf && uy >= bodyY && uy <= bodyY + bodyH) {
+        hby := bodyY - FFM.cmScr
+        if (ux >= mx && ux <= mx + mw && uy >= hby && uy <= hby + FFM_COMM_BANNERH)
+            return 2010
+    }
     if (uy >= bodyY && uy <= bodyY + bodyH) {
         loop Min(FFM_COMM.Length, FFM_COMM_MAXC) {
             gi  := A_Index
             ent := FFM_COMM[gi]
             ds  := FFMCommState(ent.folder)
+            ; the card's thumbnail is its own skip target, when it has a reel
+            if (ent.kind != "general" && ent.place != "" && SPFThumbN(ent.place) > 1) {
+                tty := bodyY - FFM.cmScr + FFMCommCardTop(gi) + 12
+                if (ux >= mx + 12 && ux <= mx + 160
+                    && uy >= Max(tty, bodyY) && uy <= Min(tty + 84, bodyY + bodyH))
+                    return 2020 + gi
+            }
             ly  := bodyY - FFM.cmScr + FFMCommCardTop(gi) + FFMCommSetY(ent)
             lw  := FFMCommSetRowW(ent, mw - 24)
             ; a row's INSERT, by visible slot
@@ -9790,6 +10482,10 @@ FFMClick(z) {
         if (FFM.logTab = 2) {
             FFM.upd := [], FFM.updScr := 0.0, FFM.updScrT := 0.0
             FFMSay("UPDATE RECORD CLEARED", 0)
+        } else if (FFM.logTab = 3) {
+            FFM.hist := [], FFM.hsScr := 0.0, FFM.hsScrT := 0.0
+            FFMHistSave()
+            FFMSay("HISTORY CLEARED", 0)
         } else {
             FFM.logs := [], FFM.logScr := 0.0, FFM.logScrT := 0.0
             FFMSay("LOGS CLEARED", 0)
@@ -9803,8 +10499,8 @@ FFMClick(z) {
         FFMUpdateUndo()
         HubPoke()
     }
-    else if (z = 475 || z = 476) {
-        nt := (z = 475) ? 1 : 2
+    else if (z = 475 || z = 476 || z = 478) {
+        nt := (z = 475) ? 1 : (z = 476) ? 2 : 3
         if (nt != FFM.logTab) {
             if !(FFM.logTabAt && A_TickCount - FFM.logTabAt < FFM_TABMS
                  && Ease3((A_TickCount - FFM.logTabAt)/FFM_TABMS) < 0.5)
@@ -9826,10 +10522,11 @@ FFMClick(z) {
         if (nm = "")
             FFMBeginEdit("q", 0)
         else {
-            r := FFMAdd(nm, "true")
+            r := FFMAdd(nm, "")
             FFM.buf := "", FFM.q2 := "", FFM.car := 0, FFM.sel := -1
             FFM.flCacheQ := "`f"
-            FFMSay(r = 2 ? "UPDATED " nm : "STAGED " nm, 0xFF34D399)
+            if r
+                FFMSay(FFMStagedMsg(r, nm), 0xFF34D399)
         }
     }
     else if (z = 437) {
@@ -9845,6 +10542,8 @@ FFMClick(z) {
     }
     else if (z >= 501 && z <= 505)
         FFMDel(FFMRealRow(z - 500))
+    else if (z >= 511 && z <= 515)
+        FFMToggleOn(FFMRealRow(z - 510))
     else if (z >= 521 && z <= 525)
         FFMCycle(FFMRealRow(z - 520))
     else if (z >= 541 && z <= 545) {
@@ -9854,16 +10553,21 @@ FFMClick(z) {
             FFMFldMouse(fmx)
         }
     }
+    else if (z >= 620 && z <= 619 + FFM_HSROWS + 1) {
+        FFM.clickAt[z] := A_TickCount
+        FFMHistRestore(Floor(FFM.hsScr/FFM_HSRH) + (z - 619))
+    }
     else if (z >= 601 && z <= 611) {
         lst := FFMDbList()
         idx := Floor(FFM.dbScr/HL.ffrh) + (z - 600)
         if (idx >= 1 && idx <= lst.Length) {
             nm := FFM.db[lst[idx]]
-            r := FFMAdd(nm, "true")
+            r := FFMAdd(nm, "")
             ; stamped on BOTH outcomes: re-clicking one that is already staged
             ; is still an act that needs an answer, or the row looks dead
             FFM.dbIns[StrLower(nm)] := A_TickCount
-            FFMSay(r = 2 ? "ALREADY STAGED" : "STAGED " nm, r = 2 ? 0xFFFBBF24 : 0xFF34D399)
+            if r
+                FFMSay(r = 2 ? "ALREADY STAGED" : FFMStagedMsg(r, nm), r = 2 ? 0xFFFBBF24 : 0xFF34D399)
         }
     }
     ; record click pop for button animation
@@ -9924,6 +10628,9 @@ FFMDragScroll(sy) {
         if (FFM.logTab = 2) {
             FFM.updScrT := FFMScrollFromY(uy, ly + 2, lh - 4, tot, lh, thmb, FFM.updScr)
             FFM.updScr := FFM.updScrT
+        } else if (FFM.logTab = 3) {
+            FFM.hsScrT := FFMScrollFromY(uy, ly + 2, lh - 4, tot, lh, thmb, FFM.hsScr)
+            FFM.hsScr := FFM.hsScrT
         } else {
             FFM.logScrT := FFMScrollFromY(uy, ly + 2, lh - 4, tot, lh, thmb, FFM.logScr)
             FFM.logScr := FFM.logScrT
@@ -10087,7 +10794,7 @@ FFMTogDraw(tx, ty, tw, thm, on, acc, hv, ff) {
     Pop(st)
 }
 
-FFMBtn(z, bx, by, bw, bh, label, acc, ff, kind := 0) {
+FFMBtn(z, bx, by, bw, bh, label, acc, ff, kind := 0, fnt := 0) {
     hv  := HL.h.Get(z, 0.0)
     hvE := Ease3(hv)                      ; eased hover for non-linear feel
 
@@ -10269,7 +10976,7 @@ FFMBtn(z, bx, by, bw, bh, label, acc, ff, kind := 0) {
     }
 
     ; label lifts by a hair on hover, sinks on press
-    TxtP(label, bx, by - 1 - (hubLowPerf ? 0 : 0.6*hvE - 0.8*press), bw, bh, fBadge, tc, fmtC)
+    TxtP(label, bx, by - 1 - (hubLowPerf ? 0 : 0.6*hvE - 0.8*press), bw, bh, fnt ? fnt : fBadge, tc, fmtC)
     Pop(st)
 }
 
@@ -10432,7 +11139,7 @@ FFMModDivider2(mx, my, ff, now, acc) {
 ; are five cards - FAST FLAG MANAGER, CURSOR, CLIENT SETTINGS, SPECIAL,
 ; FORSAKEN - and it said four. Off the constant now, like every other count in
 ; the hub.
-global HUB_MODN := 6
+global HUB_MODN := 7
 FFMCards(x0, y0, dx, dy2, ff, now, acc) {
     Txt("MODULES", x0, y0 + 36, 120, 14, fBadge, FA(0x62C7CBE0, ff), fmtL)
     Txt(HUB_MODN " listed", x0 + 66, y0 + 36, 80, 14, HL.fS, FA(Alpha(acc, 120), ff), fmtL)
@@ -10751,6 +11458,68 @@ FFMCards(x0, y0, dx, dy2, ff, now, acc) {
     b := SBrush(FA(Alpha(dDot, dopN ? 230 : 70), ff))
     FillEll(mx + HL.mdw - 18, my6 + 14, 6, 6, b), DelB(b)
     Pop(stc6)
+
+    ; ---- card 7 : LOGIN ITEMS ----
+    my7 := HL.m7y + dy2, mh7 := HL.m7h
+    hv7 := HL.h.Get(406, 0.0)
+    sel7 := hubMod = 7, out7 := HL.modOut = 7
+    st7 := ModSelT(sel7, out7, HL.modAt, now)
+    stc7 := PushXform(mx + HL.mdw/2, my7 + mh7/2, ((sel7 || out7) ? mpop : 1)*(1 + 0.012*st7 + 0.02*hv7), 0)
+    if (st7 > 0.01) {
+        b := SBrush(FA(Alpha(acc, 26*st7), ff))
+        FillRR(mx - 4*st7, my7 - 3*st7, HL.mdw + 8*st7, mh7 + 6*st7, 12, b), DelB(b)
+    }
+    b := VBrush(mx, my7, HL.mdw, mh7, FA(Mix(0xFF171A30, 0xFF20254A, Max(hv7*0.7, st7*0.9)), ff), FA(0xFF12141F, ff))
+    FillRR(mx, my7, HL.mdw, mh7, 10, b), DelB(b)
+    MiniBackdrop(mx, my7, HL.mdw, mh7, 10, acc, ff, now, 0.8)
+    pn := Pen(FA(Alpha(acc, 60 + 110*st7 + 80*hv7*(1 - st7)), ff), 1.2)
+    StrokeRR(mx, my7, HL.mdw, mh7, 10, pn), DelP(pn)
+    if (st7 > 0.01) {
+        bh7 := (mh7 - 20)*st7
+        b := SBrush(FA(Alpha(acc, 220*st7), ff))
+        FillRR(mx, my7 + mh7/2 - bh7/2, 3, bh7, 1.5, b), DelB(b)
+    }
+    if (sel7 || out7)
+        ModRing(mx, my7, HL.mdw, mh7, 10, acc, ff, HL.modAt, now, 620, 16, sel7)
+
+    ; icon: an app window with a bolt on its corner - a program, and the thing
+    ; that fires it. The bolt lights green while the module is armed and has
+    ; something to fire.
+    lgN := LGI.items.Length
+    icx7 := mx + 24, icy7 := my7 + mh7/2
+    wc := FA(Alpha(AccHi(acc, 0.3), 160 + 55*st7 + 40*hv7), ff)
+    pn := Pen(wc, 1.4)
+    StrokeRR(icx7 - 11, icy7 - 9, 18, 15, 3, pn)
+    Line(icx7 - 11, icy7 - 5, icx7 + 7, icy7 - 5, pn), DelP(pn)
+    b := SBrush(FA(Alpha(acc, 30 + 30*Max(st7, hv7)), ff))
+    FillRR(icx7 - 9.5, icy7 - 3.5, 15, 8, 2, b), DelB(b)
+    bcol := (LGI.on && lgN) ? C_ON : 0xFF9AA8C0
+    bx7 := icx7 + 6, by7 := icy7 + 1
+    DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &bp7 := 0)
+    DllCall("gdiplus\GdipAddPathLine", "ptr", bp7, "float", bx7 + 1.5, "float", by7 - 8, "float", bx7 - 4.5, "float", by7 + 1)
+    DllCall("gdiplus\GdipAddPathLine", "ptr", bp7, "float", bx7 - 4.5, "float", by7 + 1, "float", bx7 - 0.5, "float", by7 + 1)
+    DllCall("gdiplus\GdipAddPathLine", "ptr", bp7, "float", bx7 - 0.5, "float", by7 + 1, "float", bx7 - 2.5, "float", by7 + 8)
+    DllCall("gdiplus\GdipAddPathLine", "ptr", bp7, "float", bx7 - 2.5, "float", by7 + 8, "float", bx7 + 4.5, "float", by7 - 1)
+    DllCall("gdiplus\GdipAddPathLine", "ptr", bp7, "float", bx7 + 4.5, "float", by7 - 1, "float", bx7 + 0.5, "float", by7 - 1)
+    DllCall("gdiplus\GdipClosePathFigure", "ptr", bp7)
+    ; a dark keyline first so the bolt reads on the tile it overlaps
+    pn := Pen(FA(Alpha(0xFF0C0E17, 220), ff), 2.6)
+    DllCall("gdiplus\GdipDrawPath", "ptr", G, "ptr", pn, "ptr", bp7), DelP(pn)
+    b := SBrush(FA(Alpha(bcol, (LGI.on && lgN) ? 240 : 150), ff))
+    DllCall("gdiplus\GdipFillPath", "ptr", G, "ptr", b, "ptr", bp7), DelB(b)
+    DllCall("gdiplus\GdipDeletePath", "ptr", bp7)
+
+    ; one line of title and one of caption, on the two-line card's own rhythm
+    ; (CURSOR's): three lines were being fitted into a card sized for two,
+    ; which put the caption on the border
+    TxtP("LOGIN ITEMS", mx + 44 + 2*st7, my7 + 12, 100, 16, fBadge
+        , FA(Alpha(THMix(0xFFC7CBE0, 0xFFFFFFFF, st7), 200 + 55*hv7), ff), fmtL)
+    Txt(lgN ? (lgN " app" (lgN = 1 ? "" : "s") (LGI.on ? "" : "  -  off")) : "none yet", mx + 44 + 2*st7, my7 + 28, 96, 14
+        , fHint, FA(0x72C7CBE0, ff), fmtL)
+    lDot := (LGI.on && lgN) ? C_ON : (lgN ? AMBER : 0xFFC7CBE0)
+    b := SBrush(FA(Alpha(lDot, lgN ? 230 : 70), ff))
+    FillEll(mx + HL.mdw - 18, my7 + 14, 6, 6, b), DelB(b)
+    Pop(stc7)
 
     Pop(stRail)
     DllCall("gdiplus\GdipDeletePath", "ptr", pRail)
@@ -11219,8 +11988,27 @@ FFMSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
             FillRR(ax + 3, ry, HL.abw - 16, HL.ffrh - 2, 6, b), DelB(b)
         }
         bcol := fg["type"] = "bool" ? (StrLower(fg["value"]) = "true" ? C_ON : 0xFF6E7590) : AMBER
-        b := SBrush(FA(Alpha(bcol, 215), fl2))
-        FillRR(ax + 9, ry + 8, 3, 9, 1.5, b), DelB(b)
+        ; ---- the switch ----
+        ; The bar that used to sit here only echoed the value's colour. It is a
+        ; pip now, and the pip is the row's ON/OFF: filled in the value's colour
+        ; while the flag is applied, a hollow ring while it is kept but not -
+        ; and the rest of the row dims with it, so an off flag reads as off from
+        ; across the panel and not only at its pip. The hit zone is 510 + row.
+        onF := FFMOn(fg) ? 1.0 : 0.0
+        hvP := HL.h.Get(510 + k, 0.0)
+        if (hvP > 0.02) {
+            b := SBrush(FA(Alpha(0xFFFFFF, Round(14*hvP)), fl2))
+            FillEll(ax + 4, ry + 3, HL.ffrh - 8, HL.ffrh - 8, b), DelB(b)
+        }
+        pcx := ax + 4 + (HL.ffrh - 8)/2, pcy := ry + 3 + (HL.ffrh - 8)/2
+        if (onF) {
+            b := SBrush(FA(Alpha(bcol, 225), fl2))
+            FillEll(pcx - 3.6, pcy - 3.6, 7.2, 7.2, b), DelB(b)
+        } else {
+            pn := Pen(FA(Alpha(0xFFC7CBE0, 120 + 90*hvP), fl2), 1.3)
+            Ell(pcx - 3.4, pcy - 3.4, 6.8, 6.8, pn), DelP(pn)
+        }
+        fl2 := fl2*(onF ? 1.0 : 0.55)          ; the rest of the row, dimmed when off
 
         pfx := FFMPfxOf(fg["name"])
         bare := (pfx != "") ? FFMBareOf(fg["name"]) : fg["name"]
@@ -11258,6 +12046,7 @@ FFMSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
         cxx := ax + HL.abw - 26, cyy := ry + (HL.ffrh - 2)/2
         Line(cxx - 4, cyy - 4, cxx + 4, cyy + 4, pn)
         Line(cxx + 4, cyy - 4, cxx - 4, cyy + 4, pn), DelP(pn)
+        fl2 := fl2/(onF ? 1.0 : 0.55)          ; back to the list's own fade for the next row
     }
     Pop(stFL)
     DllCall("gdiplus\GdipDeletePath", "ptr", lClip)
@@ -11395,7 +12184,7 @@ FFMCommBanner(x, y, w, h, fo, now, acc) {
     ; is drawn and opening the panel does not restart it mid-fade.
     n := FFM_COMM_ART.Length
     per := FFM_COMM_HOLD + FFM_COMM_FADE
-    tot := Mod(DecT(now), per*n)
+    tot := Mod(DecT(now) + FFM.cmReelOff, per*n)   ; + the skips - see FFMCommReelSkip
     idx := (tot // per) + 1
     into := Mod(tot, per)
     ft := (into > FFM_COMM_HOLD)
@@ -11449,8 +12238,51 @@ FFMCommBanner(x, y, w, h, fo, now, acc) {
             FillEll(bx2 + (k - 1)*gp2 - rr + dr2, y + h - 14 - rr, rr*2, rr*2, b), DelB(b)
         }
     }
+    ; click-to-skip, the same plate and ring the saved-place carousel wears
+    BannerSkipHover(2010, FFM.cmReelSkipAt, x, y, w, h, n, fo, now, acc)
     Pop(sv)
     DllCall("gdiplus\GdipDeletePath", "ptr", pB)
+}
+; ---- click-to-skip on a game card's thumbnail reel ----
+; Same rule as the hero's, on the card's own offset from the view's clock.
+FFMCommThumbSkip(gi) {
+    if (gi < 1 || gi > FFM_COMM.Length)
+        return
+    ent := FFM_COMM[gi]
+    if (ent.kind = "general" || ent.place = "")
+        return
+    nB := SPFThumbN(ent.place)
+    if (nB < 2)
+        return
+    ds := FFMCommState(ent.folder)
+    per := FFM_COMM_HOLD + FFM_COMM_FADE
+    now := A_TickCount
+    into := Mod(Mod(now - FFM.commAt + ds.off, per*nB), per)
+    if (into >= FFM_COMM_HOLD)
+        return
+    ds.off := Mod(ds.off + (FFM_COMM_HOLD - into), per*nB)
+    ds.skipAt := now
+    HubPoke()
+}
+; ---- click-to-skip on the hero reel ----
+; The reel is a function of the wall clock, so a skip is an offset on that
+; clock: enough to put this frame at the start of its crossfade right now,
+; which runs the same fade the timer would have - the point of the click is
+; the next picture, not a seam. A click during a fade is ignored: the next
+; picture is already on its way. The offset is kept modulo one full cycle so
+; a session of skipping cannot grow it.
+FFMCommReelSkip() {
+    n := FFM_COMM_ART.Length
+    if (n < 2 || hubLowPerf)
+        return
+    per := FFM_COMM_HOLD + FFM_COMM_FADE
+    now := A_TickCount
+    into := Mod(Mod(DecT(now) + FFM.cmReelOff, per*n), per)
+    if (into >= FFM_COMM_HOLD)
+        return
+    FFM.cmReelOff := Mod(FFM.cmReelOff + (FFM_COMM_HOLD - into), per*n)
+    FFM.cmReelSkipAt := now
+    HubPoke()
 }
 ; Decode on first sight, then keep. Returns 0 if a frame will not decode, and
 ; the caller simply skips it rather than the whole banner going blank.
@@ -11571,7 +12403,7 @@ FFMCommView(ff, now, acc, dx := 0, dy2 := 0) {
         Txt(FFMCommSyncing() ? "fetching the community sets..."
           : (FFM_COMM_MSG != "") ? FFM_COMM_MSG : "no sets cached yet"
           , mx, ey + 44, mw, 20, fBadge, FA(Alpha(0xFFE8EAF6, 210), fo*mt2), fmtC)
-        Txt(FFMCommSyncing() ? "this only runs when the panel is opened"
+        Txt(FFMCommSyncing() ? "it ran at launch; this is a refresh"
           : "they are downloaded once and kept for offline use"
           , mx, ey + 68, mw, 16, fHint, FA(0x66C7CBE0, fo*mt2), fmtC)
     }
@@ -11644,8 +12476,12 @@ FFMCommGameCard(gi, ent, mx, sy, mw, fo, now, acc) {
     StrokeRR(mx, sy, mw, mh, 10, pn), DelP(pn)
 
     ; ---- game thumbnail ----
-    tw2 := 124, th2 := 70
+    tw2 := 148, th2 := 84
     tx2 := mx + 12, ty2 := sy + 12
+    ; a halo that lifts the picture off the card, in the accent, as the hub's
+    ; own cards do for the thing on them that matters most
+    b := SBrush(FA(Alpha(acc, 20), fo))
+    FillRR(tx2 - 4, ty2 - 3, tw2 + 8, th2 + 8, 11, b), DelB(b)
     b := SBrush(FA(0xFF080A12, fo))
     FillRR(tx2, ty2, tw2, th2, 8, b), DelB(b)
     ; ---- the shot, and an honest empty state ----
@@ -11663,13 +12499,26 @@ FFMCommGameCard(gi, ent, mx, sy, mw, fo, now, acc) {
     ; it was empty. SPFThumbAt owns the cache and reloads from disk, so asking
     ; it again is the only safe way to ask.
     nB := SPFThumbN(pl)
-    bmT := 0
+    bmT := 0, bmN := 0, ft := 0.0, idx := 1, nxt := 1
     if (nB > 0) {
+        ; ---- the reel, with a crossfade and a click-to-skip ----
+        ; It cut from shot to shot on the timer. The hold and the fade were
+        ; both in its period already - the fade simply was not drawn - so the
+        ; incoming shot now blends in over FFM_COMM_FADE like the hero above
+        ; it, and the card's own clock offset (ds.off, see FFMCommThumbSkip)
+        ; is what a click on the picture moves.
         per := FFM_COMM_HOLD + FFM_COMM_FADE
-        idx := Mod(Floor((now - FFM.commAt)/per), nB) + 1
+        tot := Mod(now - FFM.commAt + ds.off, per*nB)
+        idx := (tot // per) + 1
+        into := Mod(tot, per)
+        ft := (into > FFM_COMM_HOLD && !hubLowPerf)
+            ? Ease3(Clamp((into - FFM_COMM_HOLD)/(FFM_COMM_FADE + 0.0), 0.0, 1.0)) : 0.0
+        nxt := Mod(idx, nB) + 1
         bmT := SPFThumbAt(pl, idx)
         if (!bmT && idx != 1)
             bmT := SPFThumbAt(pl, 1)             ; this shot is missing; hold on the first
+        if (ft > 0.001 && nxt != idx)
+            bmN := SPFThumbAt(pl, nxt)
     }
     if bmT {
         {
@@ -11681,6 +12530,19 @@ FFMCommGameCard(gi, ent, mx, sy, mw, fo, now, acc) {
                 , "float", tx2, "float", ty2, "float", tw2, "float", th2
                 , "float", 0, "float", 0, "float", 768, "float", 432
                 , "int", 2, "ptr", IA, "ptr", 0, "ptr", 0)
+            if bmN {
+                SetImgAlpha(fo*ft)
+                DllCall("gdiplus\GdipDrawImageRectRect", "ptr", G, "ptr", bmN
+                    , "float", tx2, "float", ty2, "float", tw2, "float", th2
+                    , "float", 0, "float", 0, "float", 768, "float", 432
+                    , "int", 2, "ptr", IA, "ptr", 0, "ptr", 0)
+                ; the fade throws the same soft accent wash across the seam
+                ; the saved-place carousel does
+                wsh := Sin(3.14159*ft)
+                b := VBrush(tx2, ty2, tw2, th2, FA(Alpha(acc, Round(26*wsh)), fo), Alpha(acc, 0))
+                DllCall("gdiplus\GdipFillRectangle", "ptr", G, "ptr", b
+                    , "float", tx2, "float", ty2, "float", tw2, "float", th2), DelB(b)
+            }
             Pop(stB)
             DllCall("gdiplus\GdipDeletePath", "ptr", pT)
         }
@@ -11697,38 +12559,68 @@ FFMCommGameCard(gi, ent, mx, sy, mw, fo, now, acc) {
     ; never lit under the cursor - it was reading a hover slot no card owns -
     ; and why both cards' INSERT buttons claimed the same zone.
     if (nB > 1) {
-        per := FFM_COMM_HOLD + FFM_COMM_FADE
-        cur := Mod(Floor((now - FFM.commAt)/per), nB) + 1
-        loop Min(nB, 8) {
+        ; the pips sit inside the picture's bottom-left, on a small scrim, the
+        ; way the hero's sit inside its frame - a row of dots hanging under
+        ; the thumbnail was the empty band the header used to carry
+        npk := Min(nB, 8)
+        b := SBrush(FA(Alpha(0x05060C, 120), fo))
+        FillRR(tx2 + 6, ty2 + th2 - 15, npk*8 + 6, 11, 5.5, b), DelB(b)
+        loop npk {
             pk := A_Index
-            b := SBrush(FA(Alpha(pk = cur ? acc : 0xFFC7CBE0, pk = cur ? 220 : 70), fo))
-            FillEll(tx2 + pk*8 - 6, ty2 + th2 + 6, 4, 4, b), DelB(b)
+            on := (pk = idx) ? (1 - ft) : (pk = nxt ? ft : 0.0)
+            b := SBrush(FA(Alpha(on > 0.01 ? AccHi(acc, 0.3) : 0xFFFFFFFF, Round(90 + 150*on)), fo))
+            rp := 1.8 + 0.5*on
+            FillEll(tx2 + 5 + pk*8 - rp, ty2 + th2 - 9.5 - rp, rp*2, rp*2, b), DelB(b)
         }
+        ; click-to-skip, compact: the chevrons without the word. Saved and
+        ; restored around it because the affordance resets the clip on its way
+        ; out, and this card is drawing inside the body's scroll clip.
+        stH := PushG()
+        BannerSkipHover(2020 + gi, ds.skipAt, tx2, ty2, tw2, th2, nB, fo, now, acc, 1)
+        Pop(stH)
     }
 
     ; ---- title block ----
     cx2 := tx2 + tw2 + 14
+    ; ---- the icon beside the name, as a ringed avatar ----
+    ; It went onto the picture's corner for one build and hung out under it,
+    ; which read as a badge that had slipped. Back in the title row at 34 px,
+    ; ringed in the accent: a profile line, with the name and its place chip
+    ; stacked beside it and the two lines level with the top of the picture.
+    ntx := cx2
     if (ico := SPFIco(pl)) {
-        pI := RRPath(cx2, sy + 12, 26, 26, 6)
+        isz := 34, ibx := cx2, iby := sy + 12
+        pI := RRPath(ibx, iby, isz, isz, 8)
         stI := PushG()
         DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pI, "int", 1)
         SetImgAlpha(fo)
         DllCall("gdiplus\GdipDrawImageRectRect", "ptr", G, "ptr", ico
-            , "float", cx2, "float", sy + 12, "float", 26, "float", 26
+            , "float", ibx, "float", iby, "float", isz, "float", isz
             , "float", 0, "float", 0, "float", 256, "float", 256
             , "int", 2, "ptr", IA, "ptr", 0, "ptr", 0)
         Pop(stI)
         DllCall("gdiplus\GdipDeletePath", "ptr", pI)
+        pn := Pen(FA(Alpha(acc, 150), fo), 1.2)
+        StrokeRR(ibx - 1.5, iby - 1.5, isz + 3, isz + 3, 9, pn), DelP(pn)
+        ntx := cx2 + isz + 12
     }
     ; The folder name, not the literal "LOCKED" this used to fall back to - that
     ; was one game's name, and on any other card it would have been a lie while
     ; the lookup was still in flight. The folder is what the repo calls it, which
     ; is the best guess available until Roblox answers.
-    gname := (r && r.nm != "") ? r.nm : ent.folder
-    Txt(gname, cx2 + 34, sy + 10, mw - (cx2 - mx) - 46, 20, fStatus
+    gname := StripEmoji((r && r.nm != "") ? r.nm : ent.folder)
+    ntw := mx + mw - 14 - ntx
+    Txt(FFMElide(gname, fStatus, ntw), ntx, sy + 9, ntw, 20, fStatus
         , FA(Alpha(Mix(0xFFE8EAF6, acc, 0.15), 240), fo), fmtL)
-    Txt("place " pl, cx2 + 34, sy + 32, 220, 14, HL.fS
-        , FA(0x66C7CBE0, fo), fmtL)
+    ; the place as a chip, the way a saved place carries its ID, rather than a
+    ; dim line of text pretending to be a subtitle
+    plS := "PLACE " pl
+    plw := MeasureW(plS, HL.fXs) + 18
+    b := SBrush(FA(Alpha(0xFFFFFF, 12), fo))
+    FillRR(ntx, sy + 31, plw, 17, 6, b), DelB(b)
+    pn := Pen(FA(Alpha(acc, 55), fo), 1)
+    StrokeRR(ntx, sy + 31, plw, 17, 6, pn), DelP(pn)
+    Txt(plS, ntx, sy + 33, plw, 14, HL.fXs, FA(Alpha(0xFFC7CBE0, 200), fo), fmtC)
 
     ; ---- stat chips ----
     if r {
@@ -11737,23 +12629,45 @@ FFMCommGameCard(gi, ent, mx, sy, mw, fo, now, acc) {
         try dn := Integer(r.down)
         tot := up + dn
         cwc := (mw - (cx2 - mx) - 24)/4
-        FFMCommChip(cx2,           sy + 54, cwc - 6, FFMNum(r.playing), "playing",  C_ON,       fo)
-        FFMCommChip(cx2 + cwc,     sy + 54, cwc - 6, FFMNum(r.visits),  "visits",   0xFFE8EAF6, fo)
-        FFMCommChip(cx2 + cwc*2,   sy + 54, cwc - 6, FFMNum(up),        "likes",    C_ON,       fo)
-        FFMCommChip(cx2 + cwc*3,   sy + 54, cwc - 6, FFMNum(dn),        "dislikes", 0xFFF87171, fo)
+        ; the four gauges, 24 tall, and the ratio under them: together they
+        ; end level with the picture, so the header is the picture's height
+        ; and nothing sits under either column
+        FFMCommChip(cx2,           sy + 56, cwc - 6, FFMNum(r.playing), "playing",  C_ON,       fo, 24)
+        FFMCommChip(cx2 + cwc,     sy + 56, cwc - 6, FFMNum(r.visits),  "visits",   0xFFE8EAF6, fo, 24)
+        FFMCommChip(cx2 + cwc*2,   sy + 56, cwc - 6, FFMNum(up),        "likes",    C_ON,       fo, 24)
+        FFMCommChip(cx2 + cwc*3,   sy + 56, cwc - 6, FFMNum(dn),        "dislikes", 0xFFF87171, fo, 24)
         ; like ratio under the chips
         if tot {
+            ; ---- the like ratio, as a bar that IS the ratio ----
+            ; Likes in green from the left, dislikes in red from the right,
+            ; meeting where the vote does; the percentage as a chip at its
+            ; head, the favourites at its foot with a heart, since that is
+            ; what they are. It was a line of dim text over a one-colour bar.
             rw := mw - (cx2 - mx) - 24
-            ; rating line and the bar get separate bands - stacked they used
-            ; to land on top of the description below
-            Txt(Round(100*up/tot) "% rating  -  " FFMNum(r.favs) " favourites"
-                , cx2, sy + 84, rw, 14, HL.fS, FA(0x72C7CBE0, fo), fmtL)
-            ; 100, not 104. The bar ended four pixels above the description and
-            ; the two read as one object - see the plate below.
-            b := SBrush(FA(Alpha(0xFFFFFF, 20), fo))
-            FillRR(cx2, sy + 100, rw, 3, 1.5, b), DelB(b)
-            b := SBrush(FA(Alpha(C_ON, 190), fo))
-            FillRR(cx2, sy + 100, rw*up/tot, 3, 1.5, b), DelB(b)
+            ry := sy + 86
+            pct := Round(100*up/tot)
+            pw := MeasureW(pct "%", HL.fXs) + 14
+            b := SBrush(FA(Alpha(C_ON, 40), fo))
+            FillRR(cx2, ry - 2, pw, 16, 5, b), DelB(b)
+            pn := Pen(FA(Alpha(C_ON, 120), fo), 1)
+            StrokeRR(cx2, ry - 2, pw, 16, 5, pn), DelP(pn)
+            Txt(pct "%", cx2, ry - 1, pw, 14, HL.fXs, FA(Alpha(AccHi(C_ON, 0.3), 240), fo), fmtC)
+            favS := FFMNum(r.favs)
+            fw := MeasureW(favS, HL.fXs) + 20
+            MiniHeart(cx2 + rw - fw + 7, ry + 6, 7, FA(Alpha(0xFFF472B6, 220), fo))
+            Txt(favS, cx2 + rw - fw + 16, ry - 1, fw - 16, 14, HL.fXs, FA(0x9AC7CBE0, fo), fmtR)
+            bx0 := cx2 + pw + 10, bw0 := rw - pw - 10 - fw - 10
+            if (bw0 > 30) {
+                b := SBrush(FA(Alpha(0xFFFFFF, 16), fo))
+                FillRR(bx0, ry + 4, bw0, 4, 2, b), DelB(b)
+                lw := bw0*up/tot
+                b := HBrush(bx0, ry + 4, Max(lw, 4), 4, FA(Alpha(AccHi(C_ON, 0.3), 230), fo), FA(Alpha(C_ON, 200), fo))
+                FillRR(bx0, ry + 4, Max(lw, 4), 4, 2, b), DelB(b)
+                if (bw0 - lw > 6) {
+                    b := SBrush(FA(Alpha(0xFFF87171, 170), fo))
+                    FillRR(bx0 + lw + 2, ry + 4, bw0 - lw - 2, 4, 2, b), DelB(b)
+                }
+            }
         }
     } else
         Txt("loading game details...", cx2, sy + 58, 240, 16, fHint, FA(0x7EC7CBE0, fo), fmtL)
@@ -11785,8 +12699,13 @@ FFMCommGameCard(gi, ent, mx, sy, mw, fo, now, acc) {
     dscY := sy + FFMCommDscY(), dscH := FFMCommDscH()
     b := SBrush(FA(0xFF090B14, fo))
     FillRR(dscX - 6, dscY - 4, dscW + 10, dscH + 8, 8, b), DelB(b)
+    MicroBackdrop(dscX - 6, dscY - 4, dscW + 10, dscH + 8, 8, acc, fo, now, 0.6)
     pn := Pen(FA(Alpha(0xFFFFFF, 14), fo), 1)
     StrokeRR(dscX - 6, dscY - 4, dscW + 10, dscH + 8, 8, pn), DelP(pn)
+    ; the rail the hub's cards carry down their leading edge: the box reads as
+    ; the game speaking, not as a well the text fell into
+    b := VBrush(dscX - 5, dscY, 2, dscH, FA(Alpha(AccHi(acc, 0.4), 220), fo), FA(Alpha(acc, 60), fo))
+    FillRR(dscX - 5, dscY, 2, dscH, 1, b), DelB(b)
     desc := (r && r.desc != "") ? r.desc : ""
     if (desc = "")
         desc := r ? "no description" : "fetching details..."
@@ -11949,20 +12868,33 @@ FFMCommSetRow(z, st, bx, by, bw, fo, now, acc) {
     ; The contributor is the subject: a set is credited work, and UNKNOWN is an
     ; honest answer rather than a blank - a file with no `// #name` line still
     ; gets listed, it just does not get a name.
+    ; ---- the author as a coin ----
+    ; The first letter on an accent disc, the way the hub badges an account,
+    ; so a list of rows scans by who made them before it is read
+    ini := StrUpper(SubStr(Trim(st.author), 1, 1))
+    if (ini = "")
+        ini := "?"
+    ccx := bx + 30, ccy := by + bh2/2
+    b := VBrush(ccx - 11, ccy - 11, 22, 22, FA(Alpha(AccHi(acc, 0.35), 230), fo), FA(Alpha(acc, 190), fo))
+    FillEll(ccx - 11, ccy - 11, 22, 22, b), DelB(b)
+    pn := Pen(FA(Alpha(AccHi(acc, 0.6), 200), fo), 1)
+    Ell(ccx - 11, ccy - 11, 22, 22, pn), DelP(pn)
+    TxtP(ini, ccx - 11, ccy - 8, 22, 16, HL.fS, FA(0xFFFFFFFF, fo), fmtC)   ; white on the accent, pre-themed like a primary button's label
+    tx0 := bx + 48
     aw := MeasureW(st.author, fBadge)
-    Txt(st.author, bx + 22, by + 5, bw - 130, 16, fBadge
+    Txt(FFMElide(st.author, fBadge, bw - 156), tx0, by + 5, bw - 156, 16, fBadge
         , FA(Alpha(Mix(0xFFE8EAF6, acc, 0.22), 240), fo), fmtL)
     cntS := st.n " flags"
     cbw := 14 + MeasureW(cntS, HL.fXs)
-    if (bx + 22 + aw + 8 + cbw < bx + bw - 108) {
+    if (tx0 + aw + 8 + cbw < bx + bw - 108) {
         b := SBrush(FA(Alpha(acc, 34), fo))
-        FillRR(bx + 22 + aw + 8, by + 5, cbw, 15, 5, b), DelB(b)
+        FillRR(tx0 + aw + 8, by + 5, cbw, 15, 5, b), DelB(b)
         pn := Pen(FA(Alpha(acc, 110), fo), 1)
-        StrokeRR(bx + 22 + aw + 8, by + 5, cbw, 15, 5, pn), DelP(pn)
-        Txt(cntS, bx + 22 + aw + 8, by + 4, cbw, 15, HL.fXs
+        StrokeRR(tx0 + aw + 8, by + 5, cbw, 15, 5, pn), DelP(pn)
+        Txt(cntS, tx0 + aw + 8, by + 4, cbw, 15, HL.fXs
             , FA(Alpha(AccHi(acc, 0.4), 235), fo), fmtC)
     }
-    Txt(FFMElide(st.file, fHint, bw - 130), bx + 22, by + 21, bw - 130, 14, fHint
+    Txt(FFMElide(st.file, fHint, bw - 156), tx0, by + 21, bw - 156, 14, fHint
         , FA(st.have ? 0x72C7CBE0 : 0x50C7CBE0, fo), fmtL)
     ; A row whose file is not on disk gets a label, not a button. Offering
     ; INSERT and then refusing it is the worse of the two.
@@ -11973,15 +12905,33 @@ FFMCommSetRow(z, st, bx, by, bw, fo, now, acc) {
             , FA(Alpha(0xFFFBBF24, 190), fo), fmtC)
 }
 ; a stat chip: value over label, on its own plate
-FFMCommChip(cx, cy, cw, val, label, col, fo) {
-    b := SBrush(FA(0x14FFFFFF, fo))
-    FillRR(cx, cy, cw, 28, 6, b), DelB(b)
-    pn := Pen(FA(Alpha(0xFFFFFF, 16), fo), 1)
-    StrokeRR(cx, cy, cw, 28, 6, pn), DelP(pn)
-    Txt(val, cx, cy + 2, cw, 14, HL.fXs, FA(Alpha(col, 235), fo), fmtC)
-    Txt(label, cx, cy + 14, cw, 12, HL.fS, FA(0x6EC7CBE0, fo), fmtC)
+FFMCommChip(cx, cy, cw, val, label, col, fo, ch := 28) {
+    b := VBrush(cx, cy, cw, ch, FA(0x1CFFFFFF, fo), FA(0x08FFFFFF, fo))
+    FillRR(cx, cy, cw, ch, 6, b), DelB(b)
+    pn := Pen(FA(Alpha(0xFFFFFF, 18), fo), 1)
+    StrokeRR(cx, cy, cw, ch, 6, pn), DelP(pn)
+    ; the stat's colour as a hairline along the foot of the chip. The number
+    ; already carries it; the line is what makes four chips read as a row of
+    ; gauges rather than four boxes. The number is the larger face now, the
+    ; label the smaller - it was the other way round.
+    b := SBrush(FA(Alpha(col, 120), fo))
+    FillRR(cx + 8, cy + ch - 3, cw - 16, 1.5, 0.75, b), DelB(b)
+    Txt(val, cx, cy + 1, cw, 13, HL.fS, FA(Alpha(col, 240), fo), fmtC)
+    Txt(label, cx, cy + ch - 15, cw, 12, HL.fXs, FA(0x6EC7CBE0, fo), fmtC)
 }
 ; thousands separators - the raw counts run to nine digits
+; ---- characters the face cannot draw ----
+; GDI+ draws with one font and has no fallback: a character the face does not
+; carry - an emoji, a dingbat, a private-use glyph - prints as a box, and
+; Roblox game names are full of them ("[X UPD] Forsaken" with a fire where the
+; X is). Taken out for display; nothing keys on the name. The gaps they leave
+; inside brackets are closed so "[ UPD]" reads as "[UPD]".
+StripEmoji(s) {
+    s := RegExReplace(s, "[\x{1F000}-\x{1FAFF}\x{2600}-\x{27BF}\x{2B00}-\x{2BFF}\x{2300}-\x{23FF}\x{2190}-\x{21FF}\x{FE00}-\x{FE0F}\x{200D}\x{20E3}\x{E000}-\x{F8FF}]", "")
+    s := RegExReplace(s, "\[\s+", "["), s := RegExReplace(s, "\s+\]", "]")
+    s := RegExReplace(s, "\(\s+", "("), s := RegExReplace(s, "\s+\)", ")")
+    return Trim(RegExReplace(s, "\s{2,}", " "))
+}
 FFMNum(v) {
     s := Trim(String(v))
     if (s = "")
@@ -13927,6 +14877,1654 @@ DOPSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
     DOPFooter(ax, HL.dopby + dy2, HL.abw, ff, now, acc, mt)
 }
 
+; ============================================================================
+;  LOGIN ITEMS - module 7
+; ============================================================================
+; Programs that come and go with Roblox. Each item is a path with two
+; switches: OPENS - started when a Roblox client appears - and CLOSES - shut
+; when the last client is gone. A master switch arms the whole list. The
+; watcher is its own timer, not a hook on the flag manager's poll: it reads
+; the process list itself, keeps its own idea of "Roblox is up", and only acts
+; on a change that has HELD - a launcher swaps client processes during an
+; update, and a two-second flicker must not close Discord.
+;
+; State is a JSON-ish line file under YURI\, one item per line, and the
+; master switch in the ini. Nothing here touches Roblox itself.
+global LGI := {}
+LGI.items  := []                     ; {path, name, exe, open, close, bmp}
+LGI.on     := 1                      ; the master switch
+LGI.msg    := "", LGI.msgCol := 0, LGI.msgAt := 0
+LGI.scr    := 0.0, LGI.scrT := 0.0
+LGI.t      := Map()                  ; "i|open" / "i|close" -> eased switch travel
+LGI.flashAt := Map()                 ; row -> tick of last change
+LGI.animAt := 0                      ; a switch moved: the busy predicate
+LGI.actAt  := 0                      ; the watcher fired: the footer's pulse
+LGI.pickPid := 0                     ; the picker child while its dialog is up
+LGI.rbx    := -1                     ; the watcher's last decided state, -1 = not yet seen
+LGI.rbxSeen := -1, LGI.rbxSince := 0 ; what the last poll saw, and since when
+LGI.launched := Map()                ; exe -> tick, for "we started that"
+LGI.pending := []                    ; exes to force-close if the gentle close is refused
+LGI.running := Map(), LGI.scanAt := 0 ; the last enumeration's exe names - see LGIScan
+global LGI_RG   := 56, LGI_RH := 46  ; a row, and its plate - tall enough for the switches' on-rings inside their well
+global LGI_VISN := 3                 ; rows in view, under the lifeline strip
+global LGI_TOP  := 48                ; where the rows start: the strip above them
+global LGI_MAX  := 8                 ; the zone bands are sized for this many
+global LGI_HOLD_OPEN  := 2500        ; Roblox must be up this long before items open
+global LGI_HOLD_CLOSE := 6000        ; ... and gone this long before they close
+global LGI_TICK := 1500
+global lgiFile := YURI_ROOT "\login_items.txt"
+
+LGIRowY(i)  => LGI_TOP + (i - 1)*LGI_RG
+LGITotal()  => Max(1, LGI.items.Length)*LGI_RG
+LGIVis()    => LGI_VISN*LGI_RG
+
+LGISay(msg, col := 0) {
+    LGI.msg := msg, LGI.msgCol := col ? col : C_ON, LGI.msgAt := A_TickCount
+    HubPoke()
+}
+
+; ---- persistence ----
+LGILoad() {
+    LGI.items := []
+    try LGI.on := Integer(IniRead(iniPath, "lgi", "on", 1))
+    if !FileExist(lgiFile)
+        return
+    body := ""
+    try body := FileRead(lgiFile, "UTF-8")
+    for ln in StrSplit(body, "`n", "`r") {
+        if !RegExMatch(ln, '^\{"path":"([^"]+)","open":"([01])","close":"([01])"\}$', &m)
+            continue
+        LGIAddItem(FFMUnesc(m[1]), Integer(m[2]), Integer(m[3]), 0)
+        if (LGI.items.Length >= LGI_MAX)
+            break
+    }
+}
+LGISave() {
+    out := ""
+    for it in LGI.items
+        out .= '{"path":"' FFMEsc(it.path) '","open":"' it.open '","close":"' it.close '"}`n'
+    try {
+        if !DirExist(YURI_ROOT)
+            DirCreate(YURI_ROOT)
+        fh := FileOpen(lgiFile, "w", "UTF-8-RAW")
+        fh.Write(out)
+        fh.Close()
+    }
+}
+; the two escapes FFMEsc covers, undone - a path carries backslashes
+FFMUnesc(s) => StrReplace(StrReplace(s, '\"', '"'), "\\", "\")
+
+; ---- the list ----
+; A shortcut is followed to its target so the process name is the real one;
+; a .bat/.cmd keeps its own name and is closed by its console window.
+LGIAddItem(path, open := 1, close := 1, say := 1) {
+    path := Trim(path)
+    if (path = "")
+        return 0
+    SplitPath(path, &fn, , &ext, &base)
+    tgt := path
+    if (ext = "lnk") {
+        try {
+            FileGetShortcut(path, &tgt)
+            if (tgt = "")
+                tgt := path
+        }
+    }
+    SplitPath(tgt, &exe, , &text, &nameNoExt)
+    ; a document or a script is opened by its handler; CLOSES then means that
+    ; handler's process, which is what the user sees running. Asked of the
+    ; shell once, at add time.
+    if (text != "" && text != "exe")
+        exe := LGIHandlerExe(tgt)
+    for it in LGI.items {
+        if (StrLower(it.path) = StrLower(path)) {
+            if say
+                LGISay("ALREADY LISTED - " it.name, AMBER)
+            return 0
+        }
+    }
+    if (LGI.items.Length >= LGI_MAX) {
+        if say
+            LGISay("LIST IS FULL (" LGI_MAX ")", AMBER)
+        return 0
+    }
+    LGI.items.Push({path: path, name: (ext = "lnk") ? base : nameNoExt, exe: exe, open: open ? 1 : 0, close: close ? 1 : 0, bmp: -1})
+    if say {
+        LGISave()
+        LGI.flashAt[LGI.items.Length] := A_TickCount
+        LGISay("ADDED " StrUpper(nameNoExt) "  -  OPENS AND CLOSES WITH ROBLOX", C_ON)
+    }
+    return 1
+}
+; ---- who opens this file ----
+; AssocQueryString for the executable behind a document's extension, so a
+; .txt lists as notepad.exe (or whatever it is really set to) and can be
+; closed by name. A .bat/.cmd runs in a console host; a .lnk was resolved
+; before this is asked. Falls back to the file's own name when the shell has
+; no answer, which leaves CLOSES with nothing to match - and that is honest.
+LGIHandlerExe(path) {
+    SplitPath(path, &fn, , &ext)
+    if (ext = "")
+        return fn
+    if (ext = "bat" || ext = "cmd")
+        return "cmd.exe"
+    if (ext = "url" || ext = "website")
+        return ""                                ; a browser; do not close it for a link
+    n := 0
+    buf := Buffer(2, 0)
+    ; ASSOCSTR_EXECUTABLE = 2, ASSOCF_NONE; a first call with a small buffer
+    ; asks for the size (S_FALSE), the second fills it
+    DllCall("shlwapi\AssocQueryStringW", "uint", 0, "int", 2, "wstr", "." ext, "ptr", 0, "ptr", buf, "uint*", &n := 1)
+    if (n < 2 || n > 2048)
+        return fn
+    buf := Buffer(n*2, 0)
+    if DllCall("shlwapi\AssocQueryStringW", "uint", 0, "int", 2, "wstr", "." ext, "ptr", 0, "ptr", buf, "uint*", &n)
+        return fn
+    full := StrGet(buf, "UTF-16")
+    SplitPath(full, &hx)
+    return (hx != "") ? hx : fn
+}
+LGIRemove(i) {
+    if (i < 1 || i > LGI.items.Length)
+        return
+    it := LGI.items[i]
+    if (it.bmp && it.bmp != -1)
+        try DllCall("gdiplus\GdipDisposeImage", "ptr", it.bmp)
+    LGI.items.RemoveAt(i)
+    LGI.t := Map(), LGI.flashAt := Map()
+    LGISave()
+    LGI.scrT := Clamp(LGI.scrT, 0.0, Max(0.0, LGITotal() - LGIVis()))
+    LGISay("REMOVED " StrUpper(it.name), 0xFFC7CBE0)
+}
+LGIToggle(i, which) {
+    if (i < 1 || i > LGI.items.Length)
+        return
+    it := LGI.items[i]
+    if (which = "open")
+        it.open := it.open ? 0 : 1
+    else
+        it.close := it.close ? 0 : 1
+    LGI.flashAt[i] := A_TickCount, LGI.animAt := A_TickCount
+    LGISave()
+    LGISay(StrUpper(it.name) "  -  " (which = "open" ? (it.open ? "OPENS WITH ROBLOX" : "STAYS CLOSED")
+                                                     : (it.close ? "CLOSES WITH ROBLOX" : "STAYS OPEN")), 0)
+}
+LGIMaster() {
+    LGI.on := LGI.on ? 0 : 1
+    LGI.animAt := A_TickCount
+    try IniWrite(LGI.on, iniPath, "lgi", "on")
+    LGISay(LGI.on ? "ARMED - WATCHING FOR ROBLOX" : "OFF - NOTHING OPENS OR CLOSES", LGI.on ? C_ON : 0xFFC7CBE0)
+}
+
+; ---- the picker ----
+LGIPickStart() {
+    if (LGI.pickPid && ProcessExist(LGI.pickPid))
+        return
+    if (LGI.items.Length >= LGI_MAX) {
+        LGISay("LIST IS FULL (" LGI_MAX ")", AMBER)
+        return
+    }
+    cmd := A_IsCompiled ? '"' A_ScriptFullPath '" lgipick ' HL.gui.Hwnd
+                        : '"' A_AhkPath '" "' A_ScriptFullPath '" lgipick ' HL.gui.Hwnd
+    try Run(cmd, , , &pid)
+    LGI.pickPid := pid
+    HubPickWatch(pid)                            ; raise the hub again when the dialog closes
+    LGISay("CHOOSE A PROGRAM", 0xFFFBBF24)
+}
+LGIPicked(sel) {
+    LGI.pickPid := 0
+    if (sel = "`f") {
+        LGISay("NOTHING ADDED", 0xFFC7CBE0)
+        HubPoke()
+        return
+    }
+    LGIAddItem(sel, 1, 1, 1)
+    HubPoke()
+}
+
+; ---- the program's own icon ----
+; ExtractIcon gives an HICON; GDI+'s own HICON import drops the alpha of a
+; 32-bit icon and leaves black corners, so the colour bitmap is read out with
+; GetDIBits instead and the pixels handed to GDI+ as ARGB. An icon with no
+; alpha channel of its own gets one from its mask. Cached on the item; -1 is
+; "not tried", 0 is "tried, nothing".
+LGIIconBmp(it) {
+    if (it.bmp != -1)
+        return it.bmp
+    it.bmp := 0
+    src := it.path
+    SplitPath(src, , , &ext)
+    if (ext = "lnk")
+        try FileGetShortcut(src, &src)
+    ; the shell's own icon for the file - a program's first icon, a
+    ; document's handler icon, a shortcut's target - through SHGetFileInfo;
+    ; ExtractIcon only knows files that carry icons
+    hIco := 0
+    sfi := Buffer(A_PtrSize*2 + 8 + 520 + 160, 0)         ; SHFILEINFOW
+    if DllCall("shell32\SHGetFileInfoW", "wstr", src, "uint", 0, "ptr", sfi, "uint", sfi.Size, "uint", 0x100)   ; SHGFI_ICON
+        hIco := NumGet(sfi, 0, "ptr")
+    if (hIco <= 1)
+        try hIco := DllCall("shell32\ExtractIconW", "ptr", 0, "wstr", src, "uint", 0, "ptr")
+    if (hIco <= 1)
+        return 0
+    ii := Buffer(A_PtrSize = 8 ? 32 : 20, 0)
+    if !DllCall("GetIconInfo", "ptr", hIco, "ptr", ii) {
+        DllCall("DestroyIcon", "ptr", hIco)
+        return 0
+    }
+    hMask := NumGet(ii, A_PtrSize = 8 ? 16 : 12, "ptr"), hCol := NumGet(ii, A_PtrSize = 8 ? 24 : 16, "ptr")
+    bmS := Buffer(A_PtrSize = 8 ? 32 : 24, 0)
+    DllCall("GetObject", "ptr", hCol ? hCol : hMask, "int", bmS.Size, "ptr", bmS)
+    w := NumGet(bmS, 4, "int"), h := NumGet(bmS, 8, "int")
+    if (!hCol)
+        h := h // 2                              ; a mask-only icon stacks its two planes
+    if (w >= 8 && w <= 256 && h >= 8 && h <= 256) {
+        bi := Buffer(40, 0)
+        NumPut("uint", 40, bi, 0), NumPut("int", w, bi, 4), NumPut("int", -h, bi, 8)
+        NumPut("ushort", 1, bi, 12), NumPut("ushort", 32, bi, 14)
+        px := Buffer(w*h*4, 0)
+        hdc := DllCall("GetDC", "ptr", 0, "ptr")
+        if hCol
+            DllCall("GetDIBits", "ptr", hdc, "ptr", hCol, "uint", 0, "uint", h, "ptr", px, "ptr", bi, "uint", 0)
+        ; alpha: keep the icon's own if it has any, else cut it from the mask
+        anyA := 0
+        loop w*h {
+            if NumGet(px, (A_Index - 1)*4 + 3, "uchar") {
+                anyA := 1
+                break
+            }
+        }
+        if (!anyA && hMask) {
+            mk := Buffer(w*h*4, 0)
+            DllCall("GetDIBits", "ptr", hdc, "ptr", hMask, "uint", 0, "uint", h, "ptr", mk, "ptr", bi, "uint", 0)
+            loop w*h {
+                o := (A_Index - 1)*4
+                NumPut("uchar", NumGet(mk, o, "uchar") ? 0 : 255, px, o + 3)
+            }
+        }
+        DllCall("ReleaseDC", "ptr", 0, "ptr", hdc)
+        ; ---- into a bitmap GDI+ owns ----
+        ; A Scan0 bitmap borrows the caller's buffer and keeps borrowing it -
+        ; and cloning one is not guaranteed to copy the pixels. The buffer
+        ; here dies with this function, so the icon was drawn from freed
+        ; memory: fine until something else moved in, then noise. The bitmap
+        ; is created with GDI+'s own memory and the rows copied in under a
+        ; lock, which is the one way to hand GDI+ pixels it will keep.
+        bm := 0
+        if !DllCall("gdiplus\GdipCreateBitmapFromScan0", "int", w, "int", h, "int", 0, "int", 0x26200A, "ptr", 0, "ptr*", &bm) {
+            rc := Buffer(16, 0)
+            NumPut("int", w, rc, 8), NumPut("int", h, rc, 12)
+            bd := Buffer(A_PtrSize = 8 ? 32 : 24, 0)      ; BitmapData
+            if !DllCall("gdiplus\GdipBitmapLockBits", "ptr", bm, "ptr", rc, "uint", 2, "int", 0x26200A, "ptr", bd) {
+                stride := NumGet(bd, 8, "int"), scan := NumGet(bd, 16, "ptr")
+                loop h
+                    DllCall("RtlMoveMemory", "ptr", scan + (A_Index - 1)*stride, "ptr", px.Ptr + (A_Index - 1)*w*4, "uptr", w*4)
+                DllCall("gdiplus\GdipBitmapUnlockBits", "ptr", bm, "ptr", bd)
+                it.bmp := bm
+            } else
+                DllCall("gdiplus\GdipDisposeImage", "ptr", bm)
+        }
+    }
+    if hCol
+        DllCall("DeleteObject", "ptr", hCol)
+    if hMask
+        DllCall("DeleteObject", "ptr", hMask)
+    DllCall("DestroyIcon", "ptr", hIco)
+    return it.bmp
+}
+
+; ---- the watcher ----
+; ---- what it costs ----
+; Nothing of its own. The flag manager already enumerates the process list
+; every 1.2 s to see whether a client is up (FFMPoll); this watcher is told
+; the answer from there rather than enumerating again on a timer of its own.
+; The only enumeration this module ever makes itself is LGIScan, and it runs
+; in exactly two cases: the moment a Roblox transition has held long enough
+; to act on (to see which items are already running or still running), and
+; while the LOGIN ITEMS panel is on screen, every two seconds, for the live
+; dots on the rows. With the panel closed and Roblox steady, the module
+; costs zero.
+LGIWatchStart() {
+    ; kept for the boot sequence; the poll drives the watcher now
+}
+; one process enumeration -> the set of running exe names, lower-cased
+LGIScan(force := 0) {
+    now := A_TickCount
+    if (!force && LGI.scanAt && now - LGI.scanAt < 2000)
+        return
+    LGI.scanAt := now
+    run := Map()
+    snap := DllCall("CreateToolhelp32Snapshot", "UInt", 0x02, "UInt", 0, "Ptr")
+    if (snap && snap != -1) {
+        sz := (A_PtrSize = 8) ? 568 : 556
+        pe := Buffer(sz, 0)
+        NumPut("UInt", sz, pe, 0)
+        nameOff := (A_PtrSize = 8) ? 44 : 36
+        if DllCall("Process32FirstW", "Ptr", snap, "Ptr", pe) {
+            loop {
+                run[StrLower(StrGet(pe.Ptr + nameOff, "UTF-16"))] := 1
+                if !DllCall("Process32NextW", "Ptr", snap, "Ptr", pe)
+                    break
+            }
+        }
+        DllCall("CloseHandle", "Ptr", snap)
+    }
+    LGI.running := run
+}
+; called from FFMPoll with what it just saw: a client is up, or none is
+LGIObserve(up) {
+    now := A_TickCount
+    up := up ? 1 : 0
+    if (up != LGI.rbxSeen)
+        LGI.rbxSeen := up, LGI.rbxSince := now
+    if (LGI.rbx = -1) {
+        ; first sight: whatever Roblox is doing now is the baseline, not an event
+        LGI.rbx := up
+        return
+    }
+    if (up = LGI.rbx)
+        return
+    held := now - LGI.rbxSince
+    if (up && held < LGI_HOLD_OPEN)
+        return
+    if (!up && held < LGI_HOLD_CLOSE)
+        return
+    LGI.rbx := up
+    if !LGI.on
+        return
+    LGIScan(1)                                   ; one fresh look, for the decision below
+    if up
+        LGIOpenAll("roblox opened")
+    else
+        LGICloseAll("roblox closed")
+}
+; answered from the last scan - no enumeration per call
+LGIRunning(it) => it.exe != "" && LGI.running.Has(StrLower(it.exe))
+LGIOpenAll(why := "") {
+    if (why = "")
+        LGIScan(1)                               ; the manual button: look before opening
+    n := 0, skip := 0
+    for it in LGI.items {
+        if !it.open
+            continue
+        if LGIRunning(it) {
+            skip++
+            continue
+        }
+        ok := 0
+        try {
+            Run('"' it.path '"')
+            ok := 1
+        }
+        if ok {
+            n++
+            LGI.launched[StrLower(it.exe)] := A_TickCount
+        }
+    }
+    LGI.actAt := A_TickCount
+    if (n || skip)
+        LGISay("OPENED " n " APP" (n = 1 ? "" : "S") (skip ? "  -  " skip " ALREADY RUNNING" : "")
+             . (why != "" ? "  -  " StrUpper(why) : ""), n ? C_ON : 0xFFC7CBE0)
+    else if (why = "")
+        LGISay("NOTHING SET TO OPEN", 0xFFC7CBE0)
+    HubPoke()
+}
+; Gently first - WM_CLOSE to every window the program owns, which lets it
+; save and tidy - and only if it is still there four seconds later is it
+; ended. A program with no window (a tray tool) gets the second step alone.
+LGICloseAll(why := "") {
+    if (why = "")
+        LGIScan(1)
+    n := 0
+    LGI.pending := []
+    for it in LGI.items {
+        if (!it.close || !LGIRunning(it))
+            continue
+        try WinClose("ahk_exe " it.exe)
+        LGI.pending.Push(it.exe)
+        n++
+    }
+    if n
+        SetTimer(LGIForceClose, -4000)
+    LGI.actAt := A_TickCount
+    LGISay(n ? ("CLOSING " n " APP" (n = 1 ? "" : "S") (why != "" ? "  -  " StrUpper(why) : ""))
+             : (why = "" ? "NOTHING TO CLOSE" : "NOTHING OPEN TO CLOSE"), n ? AMBER : 0xFFC7CBE0)
+    HubPoke()
+}
+LGIForceClose() {
+    k := 0
+    for exe in LGI.pending {
+        if ProcessExist(exe) {
+            try ProcessClose(exe)
+            k++
+        }
+    }
+    LGI.pending := []
+    if k
+        LGISay(k " APP" (k = 1 ? "" : "S") " HAD TO BE ENDED", AMBER)
+}
+
+; ---- zones ----
+; 2101-2108 row body, 2111-2118 OPENS switch, 2121-2128 CLOSES switch,
+; 2131-2138 remove; 2140 the bar; 2141 ADD APP, 2142 OPEN ALL, 2143 CLOSE
+; ALL, 2144 the master switch; 2145 footer body, 2146 panel body (inert).
+LGIZone(ux, uy) {
+    ax := HL.abx, ay := HL.aby
+    vis := LGIVis()
+    if (LGITotal() > vis && ux >= ax + HL.abw - 12 && ux <= ax + HL.abw
+        && uy >= ay + LGI_TOP && uy <= ay + LGI_TOP + vis)
+        return 2140
+    if (uy >= ay + LGI_TOP - 4 && uy <= ay + LGI_TOP + vis && ux >= ax && ux <= ax + HL.abw) {
+        loop Min(LGI.items.Length, LGI_MAX) {
+            i := A_Index
+            ry := ay + LGIRowY(i) - LGI.scr
+            top := Max(ry, ay + LGI_TOP - 2), bot := Min(ry + LGI_RH, ay + LGI_TOP + vis)
+            if (uy >= top && uy <= bot) {
+                if (ux >= ax + HL.abw - 32 && ux <= ax + HL.abw - 8)
+                    return 2130 + i              ; remove
+                if (ux >= ax + HL.abw - 108 && ux <= ax + HL.abw - 42)
+                    return 2120 + i              ; CLOSES
+                if (ux >= ax + HL.abw - 174 && ux <= ax + HL.abw - 110)
+                    return 2110 + i              ; OPENS
+                return 2100 + i
+            }
+        }
+    }
+    fby := HL.lgiby
+    fy := fby + HL.lgibh - 32
+    if (uy >= fy && uy <= fy + 24) {
+        if (ux >= ax + 16 && ux <= ax + 120)
+            return 2141
+        if (ux >= ax + 128 && ux <= ax + 232)
+            return 2142
+        if (ux >= ax + 240 && ux <= ax + 344)
+            return 2143
+    }
+    if (ux >= ax + HL.abw - 64 && ux <= ax + HL.abw - 16 && uy >= fby + 12 && uy <= fby + 32)
+        return 2144
+    if (ux >= ax && ux <= ax + HL.abw && uy >= fby && uy <= fby + HL.lgibh)
+        return 2145
+    if (ux >= ax && ux <= ax + HL.abw && uy >= ay && uy <= ay + HL.lgih)
+        return 2146
+    return 0
+}
+LGIClick(z) {
+    if (z >= 2111 && z <= 2110 + LGI_MAX) {
+        LGIToggle(z - 2110, "open")
+        return
+    }
+    if (z >= 2121 && z <= 2120 + LGI_MAX) {
+        LGIToggle(z - 2120, "close")
+        return
+    }
+    if (z >= 2131 && z <= 2130 + LGI_MAX) {
+        LGIRemove(z - 2130)
+        return
+    }
+    if (z >= 2101 && z <= 2100 + LGI_MAX) {
+        i := z - 2100
+        if (i <= LGI.items.Length)
+            try Run('explorer.exe /select,"' LGI.items[i].path '"')
+        return
+    }
+    if (z = 2141)
+        LGIPickStart()
+    else if (z = 2142)
+        LGIOpenAll()
+    else if (z = 2143)
+        LGICloseAll()
+    else if (z = 2144)
+        LGIMaster()
+}
+
+; ---- the panel ----
+; The same instrument DOPSystems is: the frame that warms as it opens, one
+; clip around everything, rows that arrive after the frame edge, the footer
+; card under it with the status and the controls.
+LGISystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
+    mt := HL.modT
+    nI := LGI.items.Length
+    if (nI && mt > 0.5)
+        LGIScan()                                ; the live dots; throttled inside to one look per two seconds
+    Txt("SYSTEMS", ax, y0 + 36, 120, 14, fBadge, FA(0x62C7CBE0, ff), fmtL)
+    Txt(mt > 0.5 ? (nI " listed") : "0 listed", ax + 66, y0 + 36, 80, 14, HL.fS
+        , FA(Alpha(acc, 60 + 120*mt), ff), fmtL)
+    fm := Clamp(mt/DOP_FRAME, 0.0, 1.0)
+    pah := 26 + (HL.lgih - 26)*fm
+    b := VBrush(ax, ay, HL.abw, pah, FA(Mix(0xFF141728, 0xFF181C34, fm), ff), FA(0xFF12141F, ff))
+    FillRR(ax, ay, HL.abw, pah, 12, b), DelB(b)
+    MiniBackdrop(ax, ay, HL.abw, pah, 12, acc, ff, now, 0.9)
+    HubEmptyGhost(ax, ay, pah, ff)
+    pn := Pen(FA(Alpha(acc, 70 + 90*fm), ff), 1.2)
+    StrokeRR(ax, ay, HL.abw, pah, 12, pn), DelP(pn)
+    gl := 40*fm
+    pn := Pen(FA(Alpha(AccHi(acc, 0.4), 200*fm), ff), 1.6)
+    Line(ax + 14, ay + 0.6, ax + 14 + gl, ay + 0.6, pn)
+    Line(ax + HL.abw - 14 - gl, ay + pah - 0.6, ax + HL.abw - 14, ay + pah - 0.6, pn), DelP(pn)
+    ModRing(ax, ay, HL.abw, pah, 12, acc, ff, HL.modAt, now, 700, 18, hubMod != 0)
+    if (mt < 0.02)
+        return
+
+    pClip := RRPath(ax, ay, HL.abw, pah, 12)
+    stL := PushG()
+    DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pClip, "int", 1)
+
+    vis := LGIVis()
+    LGI.scrT := Clamp(LGI.scrT, 0.0, Max(0.0, LGITotal() - vis))
+    LGI.scr += (LGI.scrT - LGI.scr)*EK(0.26)
+    if (Abs(LGI.scrT - LGI.scr) < 0.4)
+        LGI.scr := LGI.scrT
+    scr := LGI.scr
+    cg0 := Clamp((mt - DOP_ROW0)/DOP_ROWS, 0.0, 1.0)
+    armed := LGI.on && nI
+    rbxUp := (LGI.rbx = 1)
+
+    ; ---- the lifeline ----
+    ; A strip across the top: Roblox's tile on the left, a line running to
+    ; the right with the listed programs' icons strung along it, a state pill
+    ; at the end. While the module is armed and a client is up, pulses run
+    ; the line - the thing the module does, drawn as the thing it is.
+    sy := ay + 12
+    b := VBrush(ax + 10, sy, HL.abw - 20, 30, FA(Alpha(0xFFFFFF, Round(12*cg0)), ff), FA(Alpha(0xFFFFFF, Round(4*cg0)), ff))
+    FillRR(ax + 10, sy, HL.abw - 20, 30, 8, b), DelB(b)
+    pn := Pen(FA(Alpha(acc, Round(50*cg0)), ff), 1)
+    StrokeRR(ax + 10, sy, HL.abw - 20, 30, 8, pn), DelP(pn)
+    ; Roblox: the tilted square with the square cut out of it
+    rtx := ax + 30, rty := sy + 15
+    stR := PushXform(rtx, rty, 1.0, 45)
+    b := SBrush(FA(Alpha(rbxUp ? C_ON : 0xFF9AA8C0, Round((rbxUp ? 225 : 120)*cg0)), ff))
+    FillRR(rtx - 6.5, rty - 6.5, 13, 13, 2, b), DelB(b)
+    b := SBrush(FA(Alpha(0xFF12141F, Round(240*cg0)), ff))
+    FillRR(rtx - 2.2, rty - 2.2, 4.4, 4.4, 0.8, b), DelB(b)
+    Pop(stR)
+    Txt("ROBLOX", ax + 44, sy + 9, 50, 12, HL.fXs, FA(Alpha(rbxUp ? C_ON : 0xFFC7CBE0, Round((rbxUp ? 220 : 130)*cg0)), ff), fmtL)
+    lx0 := ax + 96, lx1 := ax + HL.abw - 96, ly := sy + 15
+    pn := Pen(FA(Alpha(armed ? acc : 0xFFC7CBE0, Round((armed ? 110 : 50)*cg0)), ff), 1.2)
+    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+    Line(lx0, ly, lx1, ly, pn), DelP(pn)
+    if (armed && rbxUp && !hubLowPerf) {
+        loop 3 {
+            pp := Mod(DecT(now)*0.00035 + (A_Index - 1)/3.0, 1.0)
+            px2 := lx0 + (lx1 - lx0)*pp
+            b := SBrush(FA(Alpha(C_ON, Round(60*cg0)), ff))
+            FillEll(px2 - 5, ly - 5, 10, 10, b), DelB(b)
+            b := SBrush(FA(Alpha(AccHi(C_ON, 0.3), Round(230*cg0)), ff))
+            FillEll(px2 - 2, ly - 2, 4, 4, b), DelB(b)
+        }
+    }
+    ; the programs, strung along the line in list order
+    nStr := Min(nI, 6)
+    if nStr {
+        gapS := Min(30, (lx1 - lx0 - 20)/Max(1, nStr))
+        loop nStr {
+            it := LGI.items[A_Index]
+            cx3 := lx0 + 12 + (A_Index - 1)*gapS + 8, cy3 := ly
+            b := SBrush(FA(Alpha(0xFF12141F, Round(235*cg0)), ff))
+            FillRR(cx3 - 9, cy3 - 9, 18, 18, 5, b), DelB(b)
+            actv := LGI.on && (it.open || it.close)
+            pn := Pen(FA(Alpha(actv ? acc : 0xFFC7CBE0, Round((actv ? 170 : 60)*cg0)), ff), 1)
+            StrokeRR(cx3 - 9, cy3 - 9, 18, 18, 5, pn), DelP(pn)
+            if (bm := LGIIconBmp(it)) {
+                pI := RRPath(cx3 - 7, cy3 - 7, 14, 14, 3)
+                stI := PushG()
+                DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pI, "int", 1)
+                SetImgAlpha(ff*cg0*(actv ? 1.0 : 0.5))
+                wI := 0, hI := 0
+                DllCall("gdiplus\GdipGetImageWidth", "ptr", bm, "uint*", &wI)
+                DllCall("gdiplus\GdipGetImageHeight", "ptr", bm, "uint*", &hI)
+                DllCall("gdiplus\GdipDrawImageRectRect", "ptr", G, "ptr", bm
+                    , "float", cx3 - 7, "float", cy3 - 7, "float", 14, "float", 14
+                    , "float", 0, "float", 0, "float", wI, "float", hI
+                    , "int", 2, "ptr", IA, "ptr", 0, "ptr", 0)
+                Pop(stI)
+                DllCall("gdiplus\GdipDeletePath", "ptr", pI)
+            }
+        }
+    }
+    ; the state pill
+    pTxt := !LGI.on ? "OFF" : !nI ? "EMPTY" : rbxUp ? "LINKED" : "WAITING"
+    pCol := !LGI.on ? 0xFF9AA8C0 : !nI ? AMBER : rbxUp ? C_ON : acc
+    pw2 := MeasureW(pTxt, HL.fXs) + 18
+    b := SBrush(FA(Alpha(pCol, Round(40*cg0)), ff))
+    FillRR(ax + HL.abw - 20 - pw2, sy + 7, pw2, 16, 8, b), DelB(b)
+    pn := Pen(FA(Alpha(pCol, Round(130*cg0)), ff), 1)
+    StrokeRR(ax + HL.abw - 20 - pw2, sy + 7, pw2, 16, 8, pn), DelP(pn)
+    Txt(pTxt, ax + HL.abw - 20 - pw2, sy + 9, pw2, 12, HL.fXs, FA(Alpha(AccHi(pCol, 0.3), Round(235*cg0)), ff), fmtC)
+
+    if (nI = 0) {
+        ; ---- the empty state: an invitation, then the explanation ----
+        ey := ay + LGI_TOP + 6
+        pn := Pen(FA(Alpha(acc, Round(90*cg0)), ff), 1.2)
+        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+        StrokeRR(ax + 14, ey, HL.abw - 28, 60, 10, pn), DelP(pn)
+        b := SBrush(FA(Alpha(acc, Round(14*cg0)), ff))
+        FillRR(ax + 14, ey, HL.abw - 28, 60, 10, b), DelB(b)
+        pcx := ax + HL.abw/2, pcy := ey + 22
+        b := SBrush(FA(Alpha(acc, Round(60*cg0)), ff))
+        FillEll(pcx - 11, pcy - 11, 22, 22, b), DelB(b)
+        pn := Pen(FA(Alpha(AccHi(acc, 0.5), Round(230*cg0)), ff), 1.8)
+        Line(pcx - 5, pcy, pcx + 5, pcy, pn)
+        Line(pcx, pcy - 5, pcx, pcy + 5, pn), DelP(pn)
+        Txt("ADD APP to string a program onto the line", ax + 24, ey + 38, HL.abw - 48, 14, HL.fS
+            , FA(Alpha(0xFFE8EAF6, Round(200*cg0)), ff), fmtC)
+        Txt("Anything goes: a program, a shortcut, a script, a document. OPENS starts it when a"
+            , ax + 24, ey + 74, HL.abw - 48, 15, HL.fS, FA(Alpha(0xFFC7CBE0, Round(140*cg0)), ff), fmtL)
+        Txt("Roblox client appears, CLOSES shuts it once the last one is gone. A change has to"
+            , ax + 24, ey + 90, HL.abw - 48, 15, HL.fS, FA(Alpha(0xFFC7CBE0, Round(140*cg0)), ff), fmtL)
+        Txt("hold a few seconds first, so a client restarting mid-update never closes anything."
+            , ax + 24, ey + 106, HL.abw - 48, 15, HL.fS, FA(Alpha(0xFFC7CBE0, Round(140*cg0)), ff), fmtL)
+    }
+    loop Min(nI, LGI_MAX) {
+        i := A_Index
+        it := LGI.items[i]
+        ry := ay + LGIRowY(i) - scr
+        cg := Clamp((mt - DOP_ROW0 - (i - 1)*DOP_ROWD)/DOP_ROWS, 0.0, 1.0)
+        if (cg <= 0.01)
+            continue
+        if (ry + LGI_RH < ay + LGI_TOP - 6 || ry > ay + pah)
+            continue
+        fb := ff*cg
+        hv := Max(HL.h.Get(2100 + i, 0.0), HL.h.Get(2110 + i, 0.0), HL.h.Get(2120 + i, 0.0), HL.h.Get(2130 + i, 0.0))
+        sld := (1 - cg)*10
+        axs := ax + sld
+        fl := 0.0
+        if LGI.flashAt.Has(i) {
+            fe := (now - LGI.flashAt[i])/520.0
+            if (fe >= 1)
+                LGI.flashAt.Delete(i)
+            else
+                fl := 1 - fe
+        }
+        live := LGIRunning(it)
+        on := (it.open || it.close) && LGI.on
+
+        ; ---- the row is a plate, like a set row in the community panel ----
+        b := VBrush(ax + 8, ry, HL.abw - 16, LGI_RH, FA(Mix(0xFF171A34, 0xFF1E2346, Max(hv, fl)), fb), FA(0xFF0E1019, fb))
+        FillRR(ax + 8, ry, HL.abw - 16, LGI_RH, 9, b), DelB(b)
+        MiniBackdrop(ax + 8, ry, HL.abw - 16, LGI_RH, 9, acc, fb, now, 0.7)
+        pn := Pen(FA(Alpha(on ? acc : 0xFFC7CBE0, on ? 50 + 70*hv : 24 + 30*hv), fb), 1)
+        StrokeRR(ax + 8, ry, HL.abw - 16, LGI_RH, 9, pn), DelP(pn)
+        b := VBrush(axs + 16, ry + 10, 3, LGI_RH - 20, FA(Alpha(on ? AccHi(acc, 0.35) : 0xFFC7CBE0, on ? 235 : 60), fb)
+                  , FA(Alpha(on ? acc : 0xFFC7CBE0, on ? 150 : 40), fb))
+        FillRR(axs + 16, ry + 10, 3, LGI_RH - 20, 1.5, b), DelB(b)
+
+        ; the program's icon, on a plate; a live dot at its corner while it runs
+        ibx := axs + 28, iby := ry + LGI_RH/2 - 12
+        b := SBrush(FA(Alpha(0xFFFFFF, 12), fb))
+        FillRR(ibx, iby, 24, 24, 6, b), DelB(b)
+        pn := Pen(FA(Alpha(on ? acc : 0xFFC7CBE0, on ? 90 : 40), fb), 1)
+        StrokeRR(ibx, iby, 24, 24, 6, pn), DelP(pn)
+        if (bm := LGIIconBmp(it)) {
+            pI := RRPath(ibx + 2, iby + 2, 20, 20, 4)
+            stI := PushG()
+            DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pI, "int", 1)
+            SetImgAlpha(fb*(on ? 1.0 : 0.6))
+            wI := 0, hI := 0
+            DllCall("gdiplus\GdipGetImageWidth", "ptr", bm, "uint*", &wI)
+            DllCall("gdiplus\GdipGetImageHeight", "ptr", bm, "uint*", &hI)
+            DllCall("gdiplus\GdipDrawImageRectRect", "ptr", G, "ptr", bm
+                , "float", ibx + 2, "float", iby + 2, "float", 20, "float", 20
+                , "float", 0, "float", 0, "float", wI, "float", hI
+                , "int", 2, "ptr", IA, "ptr", 0, "ptr", 0)
+            Pop(stI)
+            DllCall("gdiplus\GdipDeletePath", "ptr", pI)
+        } else {
+            pn := Pen(FA(Alpha(on ? acc : 0xFF9AA8C0, on ? 200 : 110), fb), 1.4)
+            StrokeRR(ibx + 5, iby + 6, 14, 12, 2, pn)
+            Line(ibx + 5, iby + 9.5, ibx + 19, iby + 9.5, pn), DelP(pn)
+        }
+        if live {
+            b := SBrush(FA(Alpha(0xFF12141F, 240), fb))
+            FillEll(ibx + 17, iby - 3, 10, 10, b), DelB(b)
+            b := SBrush(FA(Alpha(C_ON, 235), fb))
+            FillEll(ibx + 19, iby - 1, 6, 6, b), DelB(b)
+        }
+
+        tw := HL.abw - 246
+        Txt(FFMElide(it.name, fBadge, tw), axs + 62, ry + 7, tw, 16, fBadge
+            , FA(Alpha(Mix(0xFFE8EAF6, acc, 0.18), 235), fb), fmtL)
+        ht := !LGI.on ? "off - the master switch is down"
+            : (it.open && it.close) ? "opens with roblox, closes with it"
+            : it.open ? "opens with roblox"
+            : it.close ? "closes with roblox"
+            : "listed, both switches off"
+        Txt(FFMElide(ht (live ? "  -  running" : ""), HL.fS, tw), axs + 62, ry + 26, tw, 15, HL.fS
+            , FA(on ? Alpha(C_ON, 175) : 0x8AC7CBE0, fb), fmtL)
+
+        ; ---- the switch pair, in one well ----
+        ; The well is sized for the switch's whole footprint - the on-ring
+        ; sits 2.5 px outside the track and the hover swell adds more - so
+        ; nothing crosses its border.
+        wx := ax + HL.abw - 178, ww := 138
+        b := SBrush(FA(Alpha(0x000000, 60), fb))
+        FillRR(wx, ry + 4, ww, LGI_RH - 8, 8, b), DelB(b)
+        pn := Pen(FA(Alpha(0xFFFFFF, 14), fb), 1)
+        StrokeRR(wx, ry + 4, ww, LGI_RH - 8, 8, pn), DelP(pn)
+        sx1 := wx + 6, sx2 := wx + 72
+        Txt("OPENS", sx1, ry + 7, 60, 11, HL.fXs, FA(Alpha(it.open ? AccHi(acc, 0.3) : 0xFFC7CBE0, it.open ? 220 : 110), fb), fmtC)
+        Txt("CLOSES", sx2, ry + 7, 60, 11, HL.fXs, FA(Alpha(it.close ? AccHi(acc, 0.3) : 0xFFC7CBE0, it.close ? 220 : 110), fb), fmtC)
+        k1 := i "|open", k2 := i "|close"
+        c1 := LGI.t.Has(k1) ? LGI.t[k1] : (it.open ? 1.0 : 0.0)
+        c1 += ((it.open ? 1.0 : 0.0) - c1)*EK(0.22), LGI.t[k1] := c1
+        c2 := LGI.t.Has(k2) ? LGI.t[k2] : (it.close ? 1.0 : 0.0)
+        c2 += ((it.close ? 1.0 : 0.0) - c2)*EK(0.22), LGI.t[k2] := c2
+        FFMTogDraw(sx1 + 6, ry + 21, 48, 18, c1, acc, HL.h.Get(2110 + i, 0.0), fb*(LGI.on ? 1.0 : 0.6))
+        FFMTogDraw(sx2 + 6, ry + 21, 48, 18, c2, acc, HL.h.Get(2120 + i, 0.0), fb*(LGI.on ? 1.0 : 0.6))
+
+        ; remove: a cross in a ring at the row's end, lit on hover
+        hvX := HL.h.Get(2130 + i, 0.0)
+        cxx := ax + HL.abw - 21, cyy := ry + LGI_RH/2
+        if (hvX > 0.02) {
+            b := SBrush(FA(Alpha(C_BAD, Round(50*hvX)), fb))
+            FillEll(cxx - 9, cyy - 9, 18, 18, b), DelB(b)
+        }
+        pn := Pen(FA(Alpha(hvX > 0.2 ? C_BAD : 0xFFC7CBE0, 70 + 170*hvX), fb), 1.4)
+        Line(cxx - 3.5, cyy - 3.5, cxx + 3.5, cyy + 3.5, pn)
+        Line(cxx + 3.5, cyy - 3.5, cxx - 3.5, cyy + 3.5, pn), DelP(pn)
+    }
+
+    if (LGITotal() > vis) {
+        sbA := HL.h.Get(2140, 0.0)
+        sw := 3 + 4*sbA
+        sx3 := ax + HL.abw - 12 - 3*sbA
+        b := SBrush(FA(Alpha(0xFFFFFF, 20 + 28*sbA), ff*cg0))
+        FillRR(sx3, ay + LGI_TOP, sw, vis, sw/2, b), DelB(b)
+        thmb := Max(22, vis*(vis/LGITotal()))
+        ty := ay + LGI_TOP + (vis - thmb)*(scr/Max(1, LGITotal() - vis))
+        b := VBrush(sx3, ty, sw, thmb, FA(Alpha(AccHi(acc, 0.35), 200), ff*cg0), FA(Alpha(acc, 180), ff*cg0))
+        FillRR(sx3, ty, sw, thmb, sw/2, b), DelB(b)
+    }
+    Pop(stL)
+    DllCall("gdiplus\GdipDeletePath", "ptr", pClip)
+    LGIFooter(ax, HL.lgiby + dy2, HL.abw, ff, now, acc, mt)
+}
+
+LGIStatus() {
+    n := LGI.items.Length
+    if !n
+        return "nothing listed - ADD APP to begin"
+    o := 0, c := 0
+    for it in LGI.items
+        o += it.open, c += it.close
+    if !LGI.on
+        return "off  -  " n " app" (n = 1 ? "" : "s") " listed, none will open or close"
+    return "armed  -  " o " open" (o = 1 ? "s" : "") " with roblox, " c " close" (c = 1 ? "s" : "")
+         . "  -  roblox " (LGI.rbx = 1 ? "is up" : "is not running")
+}
+LGIFooter(px, py, pw, ff, now, acc, mt) {
+    cg := Clamp((mt - 0.84)/0.12, 0.0, 1.0)
+    if (cg <= 0.01)
+        return
+    fb := ff*cg
+    ph := HL.lgibh
+    py -= (1 - cg)*12
+    b := VBrush(px, py, pw, ph, FA(Mix(0xFF141728, 0xFF1B2038, 0.5), fb), FA(0xFF10121C, fb))
+    FillRR(px, py, pw, ph, 12, b), DelB(b)
+    MiniBackdrop(px, py, pw, ph, 12, acc, fb, now, 0.85)
+    pn := Pen(FA(Alpha(acc, 60 + 40*mt), fb), 1.2)
+    StrokeRR(px, py, pw, ph, 12, pn), DelP(pn)
+    gl := 30*cg
+    pn := Pen(FA(Alpha(AccHi(acc, 0.4), 170*cg), fb), 1.5)
+    Line(px + 12, py + 0.6, px + 12 + gl, py + 0.6, pn)
+    Line(px + pw - 12 - gl, py + ph - 0.6, px + pw - 12, py + ph - 0.6, pn), DelP(pn)
+    pClip := RRPath(px, py, pw, ph, 12)
+    stF := PushG()
+    DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pClip, "int", 1)
+
+    ; the watcher fired: a band crosses the card once
+    if (LGI.actAt && now - LGI.actAt < 1200 && !hubLowPerf) {
+        ap := (now - LGI.actAt)/1200.0
+        bx := px - 40 + (pw + 80)*ap
+        br := VBrush(bx, py, 46, ph, Alpha(0xFFFFFF, 0), FA(Alpha(C_ON, Round(30*(1 - ap))), fb))
+        DllCall("gdiplus\GdipFillRectangle", "ptr", G, "ptr", br
+              , "float", bx, "float", py, "float", 46, "float", ph), DelB(br)
+    }
+    armed := LGI.on && LGI.items.Length
+    dot := armed ? C_ON : 0xFF8A90A6
+    da  := armed ? Round(170 + 60*Abs(Sin(DecT(now)*0.004))) : 90
+    b := SBrush(FA(Alpha(dot, da), fb))
+    FillRR(px + 16, py + 13, 3, 14, 1.5, b), DelB(b)
+    mAge := LGI.msgAt ? (now - LGI.msgAt) : 999999
+    shown := (mAge < 6000) ? LGI.msg : LGIStatus()
+    scol := (mAge < 6000) ? (LGI.msgCol = C_ACC ? acc : LGI.msgCol) : 0x8AC7CBE0
+    Txt(FFMElide(shown, fHint, pw - 130), px + 28, py + 11, pw - 130, 18, fHint, FA(scol, fb), fmtL)
+
+    ; the gauge: one segment per program - green where it opens, amber where
+    ; it only closes, grey where neither - so the list reads at a glance
+    nG := LGI.items.Length
+    if nG {
+        segW := 18, segG := 4
+        tw := nG*segW + (nG - 1)*segG
+        tx := px + pw - 132 - tw
+        loop nG {
+            it := LGI.items[A_Index]
+            sg := Clamp((cg - 0.30 - A_Index*0.05)/0.40, 0.0, 1.0)
+            if (sg <= 0.01)
+                continue
+            sx := tx + (A_Index - 1)*(segW + segG)
+            scl := !LGI.on ? 0xFF8A90A6 : it.open ? C_ON : it.close ? AMBER : 0xFF8A90A6
+            lit := LGI.on && (it.open || it.close)
+            b := SBrush(FA(Alpha(0xFFFFFF, Round(16*sg)), fb))
+            FillRR(sx, py + 30, segW, 5, 2.5, b), DelB(b)
+            if lit {
+                b := HBrush(sx, py + 30, segW, 5, FA(Alpha(AccHi(scl, 0.35), Round(230*sg)), fb), FA(Alpha(scl, Round(230*sg)), fb))
+                FillRR(sx, py + 30, segW, 5, 2.5, b), DelB(b)
+            }
+        }
+    }
+    ; the master switch, top-right, labelled
+    Txt("ARMED", px + pw - 118, py + 15, 50, 12, HL.fXs
+        , FA(Alpha(LGI.on ? AccHi(acc, 0.35) : 0xFFC7CBE0, LGI.on ? 220 : 130), fb), fmtR)
+    mT := LGI.t.Has("master") ? LGI.t["master"] : (LGI.on ? 1.0 : 0.0)
+    mT += ((LGI.on ? 1.0 : 0.0) - mT)*EK(0.22), LGI.t["master"] := mT
+    FFMTogDraw(px + pw - 64, py + 12, 48, 20, mT, acc, HL.h.Get(2144, 0.0), fb)
+
+    bg := Clamp((cg - 0.22)/0.5, 0.0, 1.0)
+    if (bg > 0.01) {
+        by2 := py + ph - 32 + (1 - bg)*6
+        FFMBtn(2141, px + 16,  by2, 104, 24, "ADD APP", acc, ff*bg, LGI.items.Length < LGI_MAX ? 1 : 4)
+        FFMBtn(2142, px + 128, by2, 104, 24, "OPEN ALL", acc, ff*bg, LGI.items.Length ? 0 : 4)
+        FFMBtn(2143, px + 240, by2, 104, 24, "CLOSE ALL", acc, ff*bg, LGI.items.Length ? 3 : 4)
+    }
+    Pop(stF)
+    DllCall("gdiplus\GdipDeletePath", "ptr", pClip)
+}
+
+; ============================================================================
+;  THE TOUR - a first-run walk through the hub
+; ============================================================================
+; A guided sequence over the live interface: a scrim dims everything but a
+; spotlight cut around the control being described, a card beside it says
+; what it is and what it does, a ghost cursor shows the click, and NEXT walks
+; on. The tour drives the hub itself - it changes tabs and opens modules so
+; every step is looking at the real thing, not a picture of it. It runs once,
+; after the opening card has left, and is marked seen in the ini; the
+; dashboard's TOUR button plays it again on demand.
+;
+; Everything here is drawn by the hub's own primitives inside HubRender, after
+; every panel and before the modal gate card, so it sits over the interface
+; and under anything that must stay modal above it. While it is on, HubZone
+; hands out only the tour's zones (and the window grip), so nothing under the
+; scrim can be pressed by accident - the tour presses things for you.
+global TUT := {on: 0, step: 0, stepAt: 0, at: 0, outAt: 0, seen: 0, auto: 0
+             , hx: 0.0, hy: 0.0, hw: 0.0, hh: 0.0, hInit: 0, hasHole: 0
+             , cx: 0.0, cy: 0.0, cw: 372, cwCur: 372, ch: 0, cInit: 0, curAt: 0, lastTab: 0, lastMod: -1
+             , prev: 0, dir: 1, clickAt: 0}
+global TUT_STEPS := []
+global TUT_IN_MS := 420, TUT_OUT_MS := 360, TUT_STEP_MS := 260, TUT_CUR_MS := 1100
+
+; ---- the steps ----
+; Each: which tab to be on, which module to open (0 none, -1 leave as is), a
+; title, the body as pre-wrapped lines (the card is 372 wide in base units and
+; the small face carries ~63 characters), the anchor - a function returning
+; [x, y, w, h] of the thing to light, or 0 for a centred card with no hole -
+; and whether the ghost cursor should travel to it.
+TutBuild() {
+    global TUT_STEPS
+    st := []
+    st.Push({tab: 1, mod: -1, ttl: "WELCOME TO YURI", cur: 0, glyph: "brand", anchor: 0
+        , body: ["This is a hub of tools for Roblox: fast flags, cursors, client"
+               , "settings, saved places, device tweaks and a few automations."
+               , ""
+               , "This tour walks through every part of it. It takes about two"
+               , "minutes, points at real controls, and never presses anything"
+               , "you did not ask for. NEXT to begin; SKIP at any time."]})
+    st.Push({tab: 1, mod: -1, ttl: "THE SIDEBAR", cur: 1, glyph: "nav"
+        , anchor: () => [HL.sbx, HubNavY(1) - 4, HL.sbw, HL.nvg*6]
+        , body: ["The six entries down the left are the hub's tabs. DASHBOARD is"
+               , "the overview; INTEGRATIONS holds the modules - the tools"
+               , "themselves; SCRIPT HUB runs your own scripts; SETTINGS is how"
+               , "the hub behaves and looks; CREDITS and UPDATE LOGS are what"
+               , "they say. Click an entry to switch; the page slides across."]})
+    st.Push({tab: 1, mod: -1, ttl: "WINDOW CONTROLS", cur: 0, glyph: "grip"
+        , anchor: () => [HL.brx + 60, HL.pd + 6, HL.bcx - HL.brx - 46, 32]
+        , body: ["The six-dot grip is the only place the hub can be dragged from -"
+               , "everything else is a control. The dash minimises the hub to a"
+               , "small pill you can park anywhere; the cross closes it. The hub"
+               , "never takes focus from a game, so it can sit over Roblox while"
+               , "you play."]})
+    st.Push({tab: 1, mod: -1, ttl: "YOUR PROFILE", cur: 1, glyph: "people", kick: "SIDEBAR"
+        , anchor: () => [HL.sbx, HL.avcy - 30, HL.sbw, 60]
+        , body: ["The picture and the name at the foot of the sidebar are yours."
+               , "Click the picture to open the gallery and choose a display"
+               , "picture, or to manage the ones you have; the pictures you keep"
+               , "are also the reel on the launch gate. Click the name to show"
+               , "your bio. The small button beside them opens EDIT PROFILE: the"
+               , "name, the bio, the ring drawn round your portrait, and the"
+               , "font the hub writes in. SAVE keeps it."]})
+    st.Push({tab: 1, mod: -1, ttl: "EDIT PROFILE: PICTURE AND RING", cur: 0, glyph: "people", kick: "SIDEBAR  ·  EDIT PROFILE", prof: 1
+        , anchor: () => [HL.pd + HL.cw/2 - 174, HL.pd + HL.ch/2 - 131, 348, 88]
+        , body: ["This is the sheet the small button opens. The portrait on the"
+               , "left is your display picture; CHANGE on it opens the gallery."
+               , "The four RING styles beside it decide how the portrait is"
+               , "framed - the ring follows it everywhere the hub draws you,"
+               , "the sidebar and the launch gate included."]})
+    st.Push({tab: 1, mod: -1, ttl: "EDIT PROFILE: NAME AND BIO", cur: 0, glyph: "list", kick: "SIDEBAR  ·  EDIT PROFILE", prof: 1
+        , anchor: () => [HL.pd + HL.cw/2 - 174, HL.pd + HL.ch/2 - 47, 348, 100]
+        , body: ["NAME is what the sidebar shows under the picture, and what the"
+               , "gate greets you by. BIO is the line that appears when you click"
+               , "the name - anything you like. Click either field to type into"
+               , "it; the caret goes straight in."]})
+    st.Push({tab: 1, mod: -1, ttl: "EDIT PROFILE: FONT, AND SAVE", cur: 0, glyph: "palette", kick: "SIDEBAR  ·  EDIT PROFILE", prof: 1
+        , anchor: () => [HL.pd + HL.cw/2 - 174, HL.pd + HL.ch/2 + 51, 348, 118]
+        , body: ["HUB FONT picks the face the hub writes in - eight choices, from"
+               , "the plain to the loud; the change applies everywhere at once."
+               , "SAVE keeps the whole sheet; the cross at the top right closes"
+               , "it without saving, and so does a click anywhere outside it."]})
+    st.Push({tab: 1, mod: -1, ttl: "DASHBOARD: AT A GLANCE", cur: 0, glyph: "gauge"
+        , anchor: () => [HL.ctx, HL.sty, HL.ctw, HL.sth + 16 + HL.gh]
+        , body: ["The tiles and the graph are the hub's own vital signs - what is"
+               , "armed, what is running, how the session is going. They are"
+               , "informational; nothing here needs pressing."]})
+    st.Push({tab: 1, mod: -1, ttl: "OPEN ROBLOX FROM HERE", cur: 1, glyph: "dart"
+        , anchor: () => [HL.ctx + HL.ctw - 190, HL.cty - 9, 158, 36]
+        , body: ["This launches the Roblox client the way its own shortcut does."
+               , "With AUTO INJECT armed in the flag manager, staged flags are"
+               , "written into the client a few seconds after it starts. The"
+               , "launch gate you saw at start-up has the same button."]})
+    st.Push({tab: 1, mod: -1, ttl: "WHAT'S NEW, AND UPDATES", cur: 0, glyph: "news"
+        , anchor: () => [HL.ctx, HL.ly, HL.ctw - 192, Max(120, HL.pd + HL.ch - 24 - HL.ly)]
+        , body: ["The change list for this build lives here, with the version"
+               , "badge. CHECK FOR UPDATES asks the repository whether a newer"
+               , "build exists and offers to install it - the hub restarts into"
+               , "the new version by itself. SETTINGS can make that automatic."]})
+    st.Push({tab: 2, mod: 0, ttl: "INTEGRATIONS: THE MODULE RAIL", cur: 1, glyph: "rail"
+        , anchor: () => [HL.mdx - 6, MdRailTop(), HL.mdw + 12, MdRailVis()]
+        , body: ["Each card in this rail is a module. Click one and its systems"
+               , "open in the panel to the right; click it again to close. The"
+               , "rail scrolls when it is taller than the window. The dot on a"
+               , "card is its state: lit when the module is armed or applied."]})
+    st.Push({tab: 2, mod: 1, ttl: "FAST FLAG MANAGER", cur: 0, glyph: "flag"
+        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
+        , body: ["The most used module. Fast flags are Roblox's own switches -"
+               , "graphics, physics, debug views - and this manager stages a"
+               , "list of them and delivers it two ways: written into the running"
+               , "client's memory (INJECT), or into the client settings file that"
+               , "Roblox reads at launch (the CLIENT SETTINGS module does that)."]})
+    st.Push({tab: 2, mod: 1, ttl: "STAGING FLAGS", cur: 0, glyph: "list"
+        , anchor: () => [HL.abx + 8, HL.ffqy - 6, HL.abw - 16, HL.fflh + 44]
+        , body: ["Type a flag name in the field, or open DATABASE and pick from"
+               , "the thirty thousand it knows. Each staged row has its value -"
+               , "click it to edit, click a bool to flip it - a type pill, and a"
+               , "pip on the left that is the row's own ON/OFF: a flag switched"
+               , "off stays in the list but is never applied. Values that do not"
+               , "fit the name are refused on the way in."]})
+    st.Push({tab: 2, mod: 1, ttl: "DATABASE, IMPORT, EXPORT, LOGS", cur: 0, glyph: "folder"
+        , anchor: () => [HL.abx - 4, HL.ffby - 6, 410, 38]
+        , body: ["DATABASE searches every known flag. IMPORT takes a JSON file"
+               , "or whatever is on the clipboard; EXPORT writes the list out."
+               , "CLEAR empties it - HISTORY, on the LOGS overlay, keeps a"
+               , "snapshot before every clear, import and preset, so nothing is"
+               , "lost for good. LOGS also shows what each injection did."]})
+    st.Push({tab: 2, mod: 1, ttl: "INJECT, RE-APPLY, AUTO", cur: 0, glyph: "bolt"
+        , anchor: () => [HL.abx, HL.aby, HL.abw, HL.ffh]
+        , body: ["INJECT LIVE writes the staged values into a running client;"
+               , "UNINJECT puts every original value back. RE-APPLY keeps"
+               , "re-asserting values the server keeps resetting. AUTO INJECT"
+               , "does the injection by itself whenever a client appears."
+               , "UPDATE FLAGS renames flags that Roblox renamed; COMMUNITY"
+               , "FLAGS holds curated sets per game that INSERT into the list."]})
+    st.Push({tab: 2, mod: 3, ttl: "CURSORS", cur: 0, glyph: "pointer"
+        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
+        , body: ["Replace the client's cursor textures - the arrow, the far"
+               , "arrow, the text caret - with your own PNGs. The module finds"
+               , "every installed client, including Bloxstrap, Fishstrap and"
+               , "Voidstrap, and writes into their mod stores so the cursors"
+               , "survive updates. REVERT restores the originals."]})
+    st.Push({tab: 2, mod: 4, ttl: "CLIENT SETTINGS", cur: 0, glyph: "sliders"
+        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
+        , body: ["The client's own files. Rows for the frame-rate cap, graphics"
+               , "quality and rendering choices; a page to edit fast flags that"
+               , "go through the settings file; custom fonts and a custom logo."
+               , "APPLY writes it all; REVERT removes every name this module"
+               , "ever wrote, in every client folder it can find."]})
+    st.Push({tab: 2, mod: 5, ttl: "SAVED PLACES AND ACCOUNTS", cur: 0, glyph: "pin"
+        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
+        , body: ["Places you save here launch in one click, with live player"
+               , "counts, ratings and a picture reel. The ACCOUNTS view keeps"
+               , "your Roblox accounts and can launch a place signed in as any"
+               , "of them. The dashboard banner cycles through the saved places"
+               , "- click it to skip to the next."]})
+    st.Push({tab: 2, mod: 6, ttl: "DEVICE OPTIMIZATIONS", cur: 0, glyph: "chip"
+        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
+        , body: ["Windows-side tweaks that help a game run: power plan, game"
+               , "mode, network settings and the like. Every change is recorded"
+               , "and SNAPSHOTS lets you see and undo each one. REVERT ALL puts"
+               , "the machine back exactly as it was found."]})
+    st.Push({tab: 2, mod: 7, ttl: "LOGIN ITEMS", cur: 0, glyph: "power"
+        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
+        , body: ["Programs that come and go with Roblox. ADD APP picks anything"
+               , "- a program, a shortcut, a document. Each gets two switches:"
+               , "OPENS starts it when a client appears, CLOSES shuts it when the"
+               , "last one is gone. A change has to hold a few seconds first, so"
+               , "a client restarting mid-update never closes anything."]})
+    st.Push({tab: 4, mod: -1, ttl: "SETTINGS: APPEARANCE", cur: 0, glyph: "palette"
+        , anchor: () => [HL.ctx, HL.setr - 4, HL.ctw, 4*(HL.rh + HL.rgap) + 4]
+        , body: ["The accent colour runs through every control in the suite;"
+               , "pick one, or set your own. The theme switch flips the whole"
+               , "hub between dark and paper. Opacity makes the window see-"
+               , "through so a game stays visible behind it."]})
+    st.Push({tab: 4, mod: -1, ttl: "SETTINGS: BEHAVIOUR", cur: 0, glyph: "cog"
+        , anchor: () => [HL.ctx, HL.sett - 24, HL.ctw, HL.seth + 30]
+        , body: ["PERFORMANCE MODE turns every decoration off and lets the hub"
+               , "idle at nothing; use it on a weak machine. ON TOP keeps the"
+               , "hub above the game. MINIMIZE decides whether the dash hides"
+               , "the hub or shrinks it to the pill. AUTO UPDATE checks the"
+               , "repository at launch and asks before installing."]})
+    st.Push({tab: 5, mod: -1, ttl: "CREDITS", cur: 0, glyph: "people"
+        , anchor: () => [HL.ctx, HL.cty + 34, HL.ctw, HL.lky + HL.lkh - (HL.cty + 34)]
+        , body: ["Who made it. The card shows a maker's avatar, name and role; the"
+               , "two chips under it switch between ZEAL, who designed, built and"
+               , "animated the hub, and LUNARIS, who wrote its functions and the"
+               , "fast-flag work. The cards below are their links: ROBLOX opens the"
+               , "profile, YOUTUBE the channel, and the DISCORD card copies the tag"
+               , "to your clipboard, ready to paste into a search."]})
+    st.Push({tab: 1, mod: -1, ttl: "THAT'S THE TOUR", cur: 0, glyph: "tick", anchor: 0
+        , body: ["Everything you saw is live: the flags stage, the modules apply,"
+               , "the client launches. Two things worth remembering:"
+               , ""
+               , "  REVERT and UNINJECT always exist. Nothing here is one-way."
+               , "  The TUTORIAL button on the dashboard plays this again."
+               , ""
+               , "FINISH returns you to the dashboard."]})
+    TUT_STEPS := st
+}
+TutPanelH() => Max(160, HL.pd + HL.ch - 34 - HL.aby)
+; ---- a small drawing per step, in the card's header ----
+; Line work in the accent, sixteen pixels across, the way the module cards and
+; the settings tiles draw theirs - so the card belongs to the hub it explains.
+TutGlyph(kind, cx, cy, acc, f) {
+    hi := AccHi(acc, 0.45)
+    pn := Pen(FA(Alpha(hi, 230), f), 1.5)
+    b := SBrush(FA(Alpha(hi, 230), f))
+    if (kind = "nav") {
+        loop 3
+            Line(cx - 7, cy - 6 + (A_Index - 1)*6, cx + 7, cy - 6 + (A_Index - 1)*6, pn)
+    } else if (kind = "grip") {
+        loop 6 {
+            gc := Mod(A_Index - 1, 3), gr := (A_Index - 1) // 3
+            FillEll(cx - 7 + gc*6, cy - 4 + gr*6, 2.6, 2.6, b)
+        }
+    } else if (kind = "gauge") {
+        Arc(cx - 8, cy - 6, 16, 16, 180, 180, pn)
+        Line(cx, cy + 2, cx + 4, cy - 3, pn)
+    } else if (kind = "dart") {
+        HubDart(cx, cy, 7, FA(Alpha(hi, 235), f))
+    } else if (kind = "news") {
+        StrokeRR(cx - 7, cy - 7, 14, 14, 2.5, pn)
+        Line(cx - 4, cy - 3, cx + 4, cy - 3, pn), Line(cx - 4, cy + 1, cx + 4, cy + 1, pn), Line(cx - 4, cy + 4, cx + 1, cy + 4, pn)
+    } else if (kind = "rail") {
+        StrokeRR(cx - 7, cy - 8, 14, 6, 2, pn), StrokeRR(cx - 7, cy + 1, 14, 6, 2, pn)
+    } else if (kind = "shield") {
+        DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &sp := 0)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", sp, "float", cx - 7, "float", cy - 6, "float", cx, "float", cy - 9)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", sp, "float", cx, "float", cy - 9, "float", cx + 7, "float", cy - 6)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", sp, "float", cx + 7, "float", cy - 6, "float", cx + 6, "float", cy + 2)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", sp, "float", cx + 6, "float", cy + 2, "float", cx, "float", cy + 8)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", sp, "float", cx, "float", cy + 8, "float", cx - 6, "float", cy + 2)
+        DllCall("gdiplus\GdipClosePathFigure", "ptr", sp)
+        DllCall("gdiplus\GdipDrawPath", "ptr", G, "ptr", pn, "ptr", sp)
+        DllCall("gdiplus\GdipDeletePath", "ptr", sp)
+    } else if (kind = "flag") {
+        Line(cx - 6, cy - 8, cx - 6, cy + 8, pn)
+        DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &fp := 0)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", fp, "float", cx - 6, "float", cy - 8, "float", cx + 7, "float", cy - 5)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", fp, "float", cx + 7, "float", cy - 5, "float", cx - 6, "float", cy - 1)
+        DllCall("gdiplus\GdipClosePathFigure", "ptr", fp)
+        DllCall("gdiplus\GdipFillPath", "ptr", G, "ptr", b, "ptr", fp)
+        DllCall("gdiplus\GdipDeletePath", "ptr", fp)
+    } else if (kind = "list") {
+        loop 3 {
+            yy := cy - 6 + (A_Index - 1)*6
+            FillEll(cx - 8, yy - 1.3, 2.6, 2.6, b), Line(cx - 3, yy, cx + 8, yy, pn)
+        }
+    } else if (kind = "folder") {
+        StrokeRR(cx - 8, cy - 5, 16, 11, 2, pn), Line(cx - 8, cy - 5, cx - 2, cy - 5, pn), Line(cx - 2, cy - 5, cx, cy - 8, pn)
+    } else if (kind = "bolt") {
+        DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &bp := 0)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", bp, "float", cx + 2, "float", cy - 9, "float", cx - 5, "float", cy + 1)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", bp, "float", cx - 5, "float", cy + 1, "float", cx - 1, "float", cy + 1)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", bp, "float", cx - 1, "float", cy + 1, "float", cx - 2, "float", cy + 9)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", bp, "float", cx - 2, "float", cy + 9, "float", cx + 5, "float", cy - 1)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", bp, "float", cx + 5, "float", cy - 1, "float", cx + 1, "float", cy - 1)
+        DllCall("gdiplus\GdipClosePathFigure", "ptr", bp)
+        DllCall("gdiplus\GdipFillPath", "ptr", G, "ptr", b, "ptr", bp)
+        DllCall("gdiplus\GdipDeletePath", "ptr", bp)
+    } else if (kind = "pointer") {
+        Line(cx - 5, cy - 8, cx - 5, cy + 6, pn), Line(cx - 5, cy - 8, cx + 5, cy + 2, pn)
+        Line(cx + 5, cy + 2, cx, cy + 2, pn), Line(cx, cy + 2, cx + 3, cy + 8, pn), Line(cx - 5, cy + 6, cx - 1, cy + 2, pn)
+    } else if (kind = "sliders") {
+        loop 3 {
+            yy := cy - 6 + (A_Index - 1)*6
+            Line(cx - 8, yy, cx + 8, yy, pn)
+            FillEll(cx - 6 + Mod(A_Index*5, 11) - 1.6, yy - 2.2, 4.4, 4.4, b)
+        }
+    } else if (kind = "pin") {
+        Arc(cx - 6, cy - 9, 12, 12, 200, 140, pn)
+        Line(cx - 5.6, cy - 1, cx, cy + 8, pn), Line(cx + 5.6, cy - 1, cx, cy + 8, pn)
+        FillEll(cx - 2, cy - 5, 4, 4, b)
+    } else if (kind = "chip") {
+        StrokeRR(cx - 6, cy - 6, 12, 12, 2, pn)
+        loop 3 {
+            o := -4 + (A_Index - 1)*4
+            Line(cx + o, cy - 9, cx + o, cy - 6, pn), Line(cx + o, cy + 6, cx + o, cy + 9, pn)
+            Line(cx - 9, cy + o, cx - 6, cy + o, pn), Line(cx + 6, cy + o, cx + 9, cy + o, pn)
+        }
+    } else if (kind = "power") {
+        Arc(cx - 7, cy - 6, 14, 14, 300, 300, pn), Line(cx, cy - 9, cx, cy - 1, pn)
+    } else if (kind = "palette") {
+        Arc(cx - 8, cy - 8, 16, 16, 20, 320, pn)
+        FillEll(cx - 4, cy - 5, 3, 3, b), FillEll(cx + 1, cy - 5, 3, 3, b), FillEll(cx + 3, cy, 3, 3, b)
+    } else if (kind = "cog") {
+        loop 8 {
+            an := (A_Index - 1)*0.785398
+            Line(cx + 5*Cos(an), cy + 5*Sin(an), cx + 8.5*Cos(an), cy + 8.5*Sin(an), pn)
+        }
+        Ell(cx - 5, cy - 5, 10, 10, pn), FillEll(cx - 1.8, cy - 1.8, 3.6, 3.6, b)
+    } else if (kind = "tick") {
+        Line(cx - 7, cy, cx - 2, cy + 5, pn), Line(cx - 2, cy + 5, cx + 8, cy - 6, pn)
+    } else if (kind = "people") {
+        ; two figures: a head and shoulders, and a second behind
+        FillEll(cx - 7, cy - 8, 6.5, 6.5, b)
+        FillRR(cx - 10, cy - 0.5, 12.5, 6.5, 3.2, b)
+        Ell(cx + 1.5, cy - 7, 5.5, 5.5, pn)
+        Arc(cx - 1.5, cy - 0.5, 11.5, 9.5, 200, 140, pn)
+    } else {
+        FillEll(cx - 3.5, cy - 3.5, 7, 7, b)
+    }
+    DelP(pn), DelB(b)
+}
+; the body, wrapped once to the card's width in the reading face; blank
+; entries in the source are paragraph breaks and stay blank
+TutLines(st, w) {
+    if (st.HasOwnProp("wrap") && st.wrapW = w)
+        return st.wrap
+    out := [], para := ""
+    for ln in st.body {
+        if (ln = "") {
+            if (para != "") {
+                for wl in WrapText(para, fHint, w, 40)
+                    out.Push(wl)
+                para := ""
+            }
+            out.Push("")
+            continue
+        }
+        para .= (para != "" ? " " : "") Trim(ln)
+    }
+    if (para != "")
+        for wl in WrapText(para, fHint, w, 40)
+            out.Push(wl)
+    st.wrap := out, st.wrapW := w
+    return out
+}
+; the largest title face the card's width can carry - the full face, then
+; the status face, then the badge face - so a long title on a narrowed card
+; is never cut at the edge
+TutTitleFont(ttl, w) {
+    if (MeasureW(ttl, HL.fT) <= w)
+        return HL.fT
+    if (MeasureW(ttl, fStatus) <= w)
+        return fStatus
+    return fBadge
+}
+; the small line above a title: the part of the hub the step is standing in
+TutKicker(st) {
+    if st.HasOwnProp("kick")
+        return st.kick
+    if (st.tab = 2)
+        return st.mod = 1 ? "INTEGRATIONS  ·  FAST FLAG MANAGER" : st.mod = 2 ? "INTEGRATIONS  ·  FORSAKEN"
+             : st.mod = 3 ? "INTEGRATIONS  ·  CURSOR"
+             : st.mod = 4 ? "INTEGRATIONS  ·  CLIENT SETTINGS" : st.mod = 5 ? "INTEGRATIONS  ·  SPECIAL FEATURES"
+             : st.mod = 6 ? "INTEGRATIONS  ·  DEVICE OPTIMIZATIONS" : st.mod = 7 ? "INTEGRATIONS  ·  LOGIN ITEMS"
+             : "INTEGRATIONS"
+    return st.tab = 4 ? "SETTINGS" : st.tab = 5 ? "CREDITS" : st.tab = 1 ? (st.anchor ? "DASHBOARD" : "YURI") : "HUB"
+}
+
+; ---- lifecycle ----
+TutSeen() {
+    v := 0
+    try v := Integer(IniRead(iniPath, "hub", "tourseen", "0"))
+    return v
+}
+TutStart(auto := 0) {
+    if TUT.on
+        return
+    if !TUT_STEPS.Length
+        TutBuild()
+    TUT.on := 1, TUT.auto := auto, TUT.at := A_TickCount, TUT.outAt := 0
+    TUT.hInit := 0, TUT.cInit := 0, TUT.lastTab := hubTab, TUT.lastMod := hubMod
+    TutGo(1)
+    HubPoke()
+}
+TutEnd() {
+    if (!TUT.on || TUT.outAt)
+        return
+    TUT.outAt := A_TickCount
+    TUT.seen := 1
+    try IniWrite(1, iniPath, "hub", "tourseen")
+    ; home: the dashboard, no module open, no sheet, the way the hub greets you
+    if HL.profOpen
+        TutProfClose()
+    if (hubTab != 1)
+        HubTabSet(1)
+    if hubMod
+        HubModSel(hubMod)
+    HubPoke()
+}
+TutFinish() {
+    TUT.on := 0, TUT.outAt := 0, TUT.step := 0
+}
+; enter a step: navigate the hub to where it looks, then time the card
+TutGo(i) {
+    if (i < 1 || i > TUT_STEPS.Length)
+        return
+    st := TUT_STEPS[i]
+    TUT.prev := TUT.step, TUT.dir := (i >= TUT.step) ? 1 : -1
+    TUT.step := i, TUT.stepAt := A_TickCount, TUT.curAt := 0, TUT.clickAt := 0
+    if (FFM.view != "")
+        FFMCloseView()
+    if (SPF.view != "")
+        SPFViewClose()
+    if (st.tab != hubTab)
+        HubTabSet(st.tab)
+    if (st.mod >= 0 && st.mod != hubMod) {
+        if hubMod
+            HubModSel(hubMod)                     ; closes the one that is open
+        if st.mod
+            HubModSel(st.mod)
+    }
+    ; the EDIT PROFILE sheet, opened for the steps that walk through it and
+    ; closed again the moment the tour moves on - through the sheet's own
+    ; close path, so nothing typed into it is left dangling
+    wantProf := st.HasOwnProp("prof") ? st.prof : 0
+    if (wantProf && !HL.profOpen)
+        HL.profOpen := 1, HL.bioOpen := 0
+    else if (!wantProf && HL.profOpen)
+        TutProfClose()
+    if st.cur
+        TUT.curAt := A_TickCount + 520            ; the cursor sets off once the card has landed
+    HubPoke()
+}
+TutProfClose() {
+    HL.profOpen := 0, HL.bioOpen := 0
+    if (SH.focus >= 4)
+        ScrFocus(0)
+    ProfSave()
+}
+TutNext() {
+    if (TUT.step >= TUT_STEPS.Length)
+        TutEnd()
+    else
+        TutGo(TUT.step + 1)
+}
+TutBack() {
+    if (TUT.step > 1)
+        TutGo(TUT.step - 1)
+}
+
+; ---- zones and clicks ----
+; 2200 NEXT / FINISH, 2201 BACK, 2202 SKIP, 2203 the card (inert), 2204 the
+; spotlight (a click on the thing being shown counts as NEXT), 2206 the
+; scrim (inert); 2207 is the dashboard's TOUR button, live outside the tour.
+TutZone(ux, uy) {
+    if (TUT.outAt || !TUT.cInit)
+        return 2206
+    cx := TUT.cx, cy := TUT.cy, cw := TUT.cwCur, ch := TUT.ch
+    by := cy + ch - 56
+    if (uy >= by && uy <= by + 26) {
+        if (ux >= cx + cw - 96 && ux <= cx + cw - 14)
+            return 2200
+        if (TUT.step > 1 && ux >= cx + cw - 172 && ux <= cx + cw - 104)
+            return 2201
+    }
+    if (ux >= cx + cw - 82 && ux <= cx + cw - 12 && uy >= cy + 11 && uy <= cy + 33)
+        return 2202
+    if (ux >= cx && ux <= cx + cw && uy >= cy && uy <= cy + ch)
+        return 2203
+    if (TUT.hasHole && ux >= TUT.hx && ux <= TUT.hx + TUT.hw && uy >= TUT.hy && uy <= TUT.hy + TUT.hh)
+        return 2204
+    return 2206
+}
+TutClick(z) {
+    if (z = 2207) {
+        TutStart(0)
+        return
+    }
+    if !TUT.on
+        return
+    if (z = 2200 || z = 2204)
+        TutNext()
+    else if (z = 2201)
+        TutBack()
+    else if (z = 2202)
+        TutEnd()
+}
+
+; ---- drawing ----
+TutDraw(now, acc) {
+    static SCRSET := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&"   ; the scramble alphabet - a local of each renderer that decodes text
+    if !TUT.on
+        return
+    st := TUT_STEPS[TUT.step]
+    ; the sheet: in over TUT_IN_MS, out over TUT_OUT_MS, then gone
+    if TUT.outAt {
+        e := Clamp((now - TUT.outAt)/(TUT_OUT_MS + 0.0), 0.0, 1.0)
+        f := 1 - Ease3(e)
+        if (e >= 1) {
+            TutFinish()
+            return
+        }
+    } else
+        f := Ease3(Clamp((now - TUT.at)/(TUT_IN_MS + 0.0), 0.0, 1.0))
+    ; ---- where the light falls ----
+    a := st.anchor ? st.anchor.Call() : 0
+    hasHole := IsObject(a)
+    if hasHole {
+        tx := a[1] - 8, ty := a[2] - 8, tw := a[3] + 16, th := a[4] + 16
+        if !TUT.hInit {
+            TUT.hx := tx, TUT.hy := ty, TUT.hw := tw, TUT.hh := th, TUT.hInit := 1
+        } else {
+            k := EK(0.2)
+            TUT.hx += (tx - TUT.hx)*k, TUT.hy += (ty - TUT.hy)*k
+            TUT.hw += (tw - TUT.hw)*k, TUT.hh += (th - TUT.hh)*k
+        }
+    }
+    TUT.hasHole := hasHole
+    hx := TUT.hx, hy := TUT.hy, hw := TUT.hw, hh := TUT.hh
+    ; the hole eases to the new target; while it travels the card waits
+    settled := !hasHole || (Abs(hx - tx) < 3 && Abs(hy - ty) < 3 && Abs(hw - tw) < 4 && Abs(hh - th) < 4)
+
+    ; ---- the scrim, with the spotlight cut out of it ----
+    ; One path, two figures, alternate fill: the whole window, and the rounded
+    ; hole - so the fill covers everything but the hole in one operation.
+    px := HL.pd, py := HL.pd, pw := HL.cw, ph := HL.ch
+    DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &sp := 0)    ; FillModeAlternate
+    DllCall("gdiplus\GdipAddPathRectangle", "ptr", sp, "float", px, "float", py, "float", pw, "float", ph)
+    if hasHole {
+        hp := RRPath(hx, hy, hw, hh, 12)
+        DllCall("gdiplus\GdipAddPathPath", "ptr", sp, "ptr", hp, "int", 0)
+        DllCall("gdiplus\GdipDeletePath", "ptr", hp)
+    }
+    b := SBrushP(FA(Alpha(0x05060C, 168), f))     ; theme-preserving: a dimming is a dimming in both
+    DllCall("gdiplus\GdipFillPath", "ptr", G, "ptr", b, "ptr", sp), DelB(b)
+    DllCall("gdiplus\GdipDeletePath", "ptr", sp)
+
+    if hasHole {
+        ; the ring around the light: breathing, with the four corner ticks the
+        ; hub's cards wear, and a soft outer bloom
+        brth := (Sin(DecT(now)*0.0035) + 1)/2
+        SoftGlow(hx + hw/2, hy + hh/2, hw/2 + 40, hh/2 + 40, acc, Round((44 + 20*brth)*f), 1.0, 5)
+        pn := Pen(FA(Alpha(acc, Round(150 + 70*brth)), f), 1.6)
+        StrokeRR(hx, hy, hw, hh, 12, pn), DelP(pn)
+        pn := Pen(FA(Alpha(AccHi(acc, 0.4), Round(60 + 40*brth)), f), 4)
+        StrokeRR(hx - 3, hy - 3, hw + 6, hh + 6, 15, pn), DelP(pn)
+        ; a dashed orbit walking round the light, the way the gate's frame does
+        if !hubLowPerf {
+            pn := Pen(FA(Alpha(acc, 110), f), 1)
+            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", -Mod(DecT(now)*0.02, 1000))
+            StrokeRR(hx - 9, hy - 9, hw + 18, hh + 18, 18, pn), DelP(pn)
+        }
+        ; the click flash: the ring blinks bright when the ghost cursor lands
+        if (TUT.clickAt && now - TUT.clickAt < 320) {
+            fl := 1 - (now - TUT.clickAt)/320.0
+            pn := Pen(FA(Alpha(AccHi(acc, 0.7), Round(230*fl)), f), 2.5)
+            StrokeRR(hx - 1, hy - 1, hw + 2, hh + 2, 13, pn), DelP(pn)
+        }
+        pn := Pen(FA(Alpha(AccHi(acc, 0.5), 230), f), 2)
+        tk := 12
+        Line(hx - 6, hy + tk, hx - 6, hy - 6, pn), Line(hx - 6, hy - 6, hx + tk, hy - 6, pn)
+        Line(hx + hw - tk, hy - 6, hx + hw + 6, hy - 6, pn), Line(hx + hw + 6, hy - 6, hx + hw + 6, hy + tk, pn)
+        Line(hx - 6, hy + hh - tk, hx - 6, hy + hh + 6, pn), Line(hx - 6, hy + hh + 6, hx + tk, hy + hh + 6, pn)
+        Line(hx + hw - tk, hy + hh + 6, hx + hw + 6, hy + hh + 6, pn), Line(hx + hw + 6, hy + hh + 6, hx + hw + 6, hy + hh - tk, pn)
+        DelP(pn)
+    }
+
+    ; ---- the card ----
+    ; Sized to its lines, placed where there is room - under the light, above
+    ; it, beside it - or centred when there is nothing to light. It eases to a
+    ; new place between steps, and fades and slides in on each.
+    ; ---- width first ----
+    ; A light that takes the whole panel column leaves no room below, above
+    ; or beside it at the card's full width - and a card laid over the panel
+    ; hides the thing it is describing. So when the full width fits nowhere,
+    ; the card narrows to the room on the left of the light (the sidebar and
+    ; the rail, which are not the subject) down to 300 px, and only when even
+    ; that will not fit does it take the other half of the window.
+    cw := TUT.cw
+    if hasHole {
+        below := hy + hh + 16 + (96 + 6*17 + 76) <= py + ph - 12
+        above := hy - 16 - (96 + 6*17 + 76) >= py + 12
+        rightR := hx + hw + 16 + cw <= px + pw - 12
+        leftR  := hx - 16 - cw >= px + 12
+        if (!below && !above && !rightR && !leftR && hx - 16 - 300 >= px + 12)
+            cw := hx - 16 - (px + 12)
+    }
+    TUT.cwCur := cw
+    lines := TutLines(st, cw - 40)
+    ch := 96 + lines.Length*17 + 76
+    if hasHole {
+        cxT := Clamp(hx + hw/2 - cw/2, px + 12, px + pw - cw - 12)
+        if (hy + hh + 16 + ch <= py + ph - 12)
+            cyT := hy + hh + 16
+        else if (hy - 16 - ch >= py + 12)
+            cyT := hy - 16 - ch
+        else if (hx + hw + 16 + cw <= px + pw - 12) {
+            cyT := Clamp(hy + hh/2 - ch/2, py + 12, py + ph - ch - 12), cxT := hx + hw + 16
+        } else if (hx - 16 - cw >= px + 12) {
+            cyT := Clamp(hy + hh/2 - ch/2, py + 12, py + ph - ch - 12), cxT := hx - 16 - cw
+        } else
+            ; no room on any side even narrowed: the other half of the window
+            cyT := (hy + hh/2 < py + ph/2) ? py + ph - ch - 12 : py + 12
+    } else
+        cxT := px + pw/2 - cw/2, cyT := py + ph/2 - ch/2
+    if !TUT.cInit {
+        TUT.cx := cxT, TUT.cy := cyT, TUT.ch := ch, TUT.cInit := 1
+    } else {
+        k := EK(0.22)
+        TUT.cx += (cxT - TUT.cx)*k, TUT.cy += (cyT - TUT.cy)*k, TUT.ch += (ch - TUT.ch)*k
+    }
+    cx := TUT.cx, cy := TUT.cy, ch := TUT.ch
+    sf := Ease3(Clamp((now - TUT.stepAt)/(TUT_STEP_MS + 0.0), 0.0, 1.0))   ; the step's own entrance
+    ; the plate itself only fades with the sheet; its contents change over
+    cf := f
+    ; the card scales in from slightly small on every step, round its centre
+    stC := PushXform(cx + cw/2, cy + ch/2, 0.97 + 0.03*sf, 0)
+    ShadowDraw(cx, cy + 3, cw, ch, 14, 6, 34, 18, cf, 1.0)
+    b := VBrush(cx, cy, cw, ch, FA(Mix(0xFF1B1F38, 0xFF232948, 0.4), cf), FA(0xFF10121E, cf))
+    FillRR(cx, cy, cw, ch, 14, b), DelB(b)
+    MiniBackdrop(cx, cy, cw, ch, 14, acc, cf, now, 0.85)
+    pn := Pen(FA(Alpha(acc, 130), cf), 1.2)
+    StrokeRR(cx, cy, cw, ch, 14, pn), DelP(pn)
+    ; ---- the header band ----
+    ; A lighter strip across the top with the accent bleeding in from the
+    ; left, the step counter and the kicker on it, the step's glyph in a ring
+    ; at its right, and SKIP as a proper chip. The band is what makes the card
+    ; read as a card of the hub rather than a box of text.
+    hbh := 44
+    pH := RRPath(cx, cy, cw, ch, 14)
+    stH := PushG()
+    DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pH, "int", 1)
+    b := HBrush(cx, cy, cw, hbh, FA(Alpha(acc, 46), cf), FA(Alpha(acc, 8), cf))
+    FillRR(cx, cy, cw, hbh, 0, b), DelB(b)
+    b := VBrush(cx, cy, cw, hbh, FA(Alpha(0xFFFFFF, 14), cf), FA(Alpha(0xFFFFFF, 0), cf))
+    FillRR(cx, cy, cw, hbh, 0, b), DelB(b)
+    b := SBrush(FA(Alpha(acc, 60), cf))
+    FillRR(cx, cy + hbh - 1, cw, 1, 0, b), DelB(b)
+    Pop(stH)
+    DllCall("gdiplus\GdipDeletePath", "ptr", pH)
+    ; the rail grows down the card's edge on each step
+    rlh := (ch - 28)*sf
+    b := VBrush(cx, cy + 14, 3, Max(rlh, 1), FA(Alpha(AccHi(acc, 0.4), 230), cf), FA(Alpha(acc, 90), cf))
+    FillRR(cx, cy + 14, 3, Max(rlh, 1), 1.5, b), DelB(b)
+    ; step counter, as a small chip on the band
+    cnt := TUT.step " / " TUT_STEPS.Length
+    cnw := MeasureW(cnt, HL.fXs) + 14
+    b := SBrush(FA(Alpha(0x000000, 70), cf))
+    FillRR(cx + 16, cy + 13, cnw, 18, 9, b), DelB(b)
+    pn := Pen(FA(Alpha(acc, 110), cf), 1)
+    StrokeRR(cx + 16, cy + 13, cnw, 18, 9, pn), DelP(pn)
+    Txt(cnt, cx + 16, cy + 15, cnw, 14, HL.fXs, FA(Alpha(AccHi(acc, 0.4), 235), cf), fmtC)
+    ; the step's glyph in a ring, right of centre on the band
+    gcx := cx + cw - 118, gcy := cy + hbh/2
+    b := SBrush(FA(Alpha(0x000000, 60), cf))
+    FillEll(gcx - 15, gcy - 15, 30, 30, b), DelB(b)
+    pn := Pen(FA(Alpha(acc, 140), cf), 1.2)
+    Ell(gcx - 15, gcy - 15, 30, 30, pn), DelP(pn)
+    if st.HasOwnProp("glyph")
+        TutGlyph(st.glyph, gcx, gcy, acc, cf*sf)
+    ; ---- SKIP, as a chip ----
+    ; A ghost pill with a double chevron: it reads as a control, lights on
+    ; hover, and sits apart from the step controls at the foot.
+    hvS := HL.h.Get(2202, 0.0)
+    skx := cx + cw - 82, sky := cy + 11, skw := 70
+    b := VBrush(skx, sky, skw, 22, FA(Alpha(0xFFFFFF, Round(10 + 16*hvS)), cf), FA(Alpha(0xFFFFFF, Round(4 + 6*hvS)), cf))
+    FillRR(skx, sky, skw, 22, 11, b), DelB(b)
+    pn := Pen(FA(Alpha(acc, Round(70 + 120*hvS)), cf), 1)
+    StrokeRR(skx, sky, skw, 22, 11, pn), DelP(pn)
+    Txt("SKIP", skx + 10, sky + 4, 34, 14, HL.fXs, FA(Alpha(THMix(0xFFC7CBE0, 0xFFFFFFFF, hvS), Round(180 + 75*hvS)), cf), fmtL)
+    pn := Pen(FA(Alpha(AccHi(acc, 0.4), Round(180 + 60*hvS)), cf), 1.4)
+    chx := skx + skw - 20 + 2*hvS, chy := sky + 11
+    loop 2 {
+        ox := (A_Index - 1)*5
+        Line(chx + ox, chy - 4, chx + ox + 4, chy, pn), Line(chx + ox + 4, chy, chx + ox, chy + 4, pn)
+    }
+    DelP(pn)
+    ; ---- the contents change over ----
+    ; The outgoing step's title and lines slide out and fade the way the new
+    ; ones slide in and fade, in the direction the tour went, so a step
+    ; change reads as the card turning a page rather than swapping a label.
+    if (TUT.prev >= 1 && TUT.prev <= TUT_STEPS.Length && sf < 1) {
+        po := TUT_STEPS[TUT.prev]
+        of := (1 - sf)*cf
+        ox := -14*sf*TUT.dir
+        pl := TutLines(po, cw - 40)
+        Txt(TutKicker(po), cx + 18 + ox, cy + hbh + 8, cw - 60, 12, HL.fXs, FA(Alpha(acc, Round(150*(1 - sf))), of), fmtL)
+        Txt(po.ttl, cx + 18 + ox, cy + hbh + 20, cw - 36, 24, TutTitleFont(po.ttl, cw - 36), FA(Alpha(Mix(0xFFE8EAF6, acc, 0.15), 245), of), fmtL)
+        loop pl.Length {
+            ln := pl[A_Index]
+            if (ln != "")
+                Txt(ln, cx + 18 + ox, cy + 96 + (A_Index - 1)*17, cw - 36, 17, fHint, FA(0xD2C7CBE0, of), fmtL)
+        }
+    }
+    ix := 14*(1 - sf)*TUT.dir
+    Txt(TutKicker(st), cx + 18 + ix, cy + hbh + 8, cw - 60, 12, HL.fXs, FA(Alpha(acc, Round(150*sf)), cf), fmtL)
+    ; the title decodes in, the way the gate's status word does
+    tf := TutTitleFont(st.ttl, cw - 36)
+    if (!st.HasOwnProp("scr") || st.scrF != tf)
+        st.scr := BuildScr(st.ttl, tf), st.scrF := tf
+    scr := st.scr
+    if (now < TUT.stepAt + 120 + scr.chs.Length*22 && !hubLowPerf) {
+        loop scr.chs.Length {
+            i := A_Index
+            if (now < TUT.stepAt + 80 + i*22) {
+                ch2 := SubStr(SCRSET, Random(1, StrLen(SCRSET)), 1)
+                cc := Alpha(Mix(acc, 0xFFE8EAF6, 0.55), 200)
+            } else {
+                ch2 := scr.chs[i]
+                cc := Alpha(Mix(0xFFE8EAF6, acc, 0.15), 245)
+            }
+            Txt(ch2, cx + 18 + ix + scr.xs[i], cy + hbh + 20, 44, 24, tf, FA(cc, cf*sf), fmtL)
+        }
+    } else
+        Txt(st.ttl, cx + 18 + ix, cy + hbh + 20, cw - 36, 24, tf, FA(Alpha(Mix(0xFFE8EAF6, acc, 0.15), 245), cf*sf), fmtL)
+    ; the lines arrive one after another
+    loop lines.Length {
+        ln := lines[A_Index]
+        if (ln = "")
+            continue
+        lf := Clamp(((now - TUT.stepAt) - 60 - (A_Index - 1)*40)/220.0, 0.0, 1.0)
+        lf := Ease3(lf)
+        Txt(ln, cx + 18 + 6*(1 - lf), cy + 96 + (A_Index - 1)*17, cw - 36, 17, fHint, FA(Alpha(0xFFC7CBE0, Round(215*lf)), cf), fmtL)
+    }
+    ; ---- the foot: a rule; the hint and the buttons on one row, the ----
+    ; ---- progress dots on their own row beneath, full width           ----
+    ; Nothing here shares a row with something anchored to the other edge
+    ; at a width that can change: the hint stops where the buttons begin
+    ; whatever the card's width, and the dots have the whole width to
+    ; themselves.
+    fty := cy + ch - 66
+    b := HBrush(cx + 16, fty, cw - 32, 1, FA(Alpha(acc, 90), cf), FA(Alpha(acc, 0), cf))
+    FillRR(cx + 16, fty, cw - 32, 1, 0, b), DelB(b)
+    by := cy + ch - 56
+    if hasHole
+        Txt(FFMElide("click the lit control, or NEXT", HL.fXs, cw - 196), cx + 18, by + 6, cw - 196, 14, HL.fXs, FA(0x6EC7CBE0, cf), fmtL)
+    n := TUT_STEPS.Length
+    dx := cx + 18, dy := cy + ch - 18
+    loop n {
+        i := A_Index
+        on := i = TUT.step
+        w2 := on ? 3 + 9*sf : (i = TUT.prev && TUT.prev != TUT.step ? 3 + 9*(1 - sf) : 3)
+        b := SBrush(FA(Alpha(on ? AccHi(acc, 0.4) : (i < TUT.step ? acc : 0xFFC7CBE0), on ? 235 : (i < TUT.step ? 150 : 60)), cf))
+        FillRR(dx, dy, w2, 3, 1.5, b), DelB(b)
+        dx += w2 + 3
+    }
+    if (TUT.step > 1)
+        FFMBtn(2201, cx + cw - 172, by, 68, 26, "BACK", acc, cf, 0, HL.fS)
+    FFMBtn(2200, cx + cw - 96, by, 82, 26, TUT.step = n ? "FINISH" : "NEXT", acc, cf, 1, HL.fS)
+    ; the welcome card carries the brand as a watermark, low and to the right
+    if (TUT.step = 1) {
+        bw2 := MeasureW(APPNAME, HL.fG)
+        Txt(APPNAME, cx + cw - 18 - bw2, cy + ch - 104, bw2 + 4, 50, HL.fG, FA(Alpha(acc, Round(22*sf)), cf), fmtL)
+    }
+    Pop(stC)
+
+    ; ---- the ghost cursor ----
+    ; Sets off from NEXT once the card has landed, curves to the middle of
+    ; the light, clicks - a ring thrown off the tip - and rests there pulsing
+    ; until the step changes. It is a demonstration, not a pointer: nothing
+    ; it touches is pressed.
+    if (st.cur && hasHole && settled && TUT.curAt && now >= TUT.curAt && !TUT.outAt) {
+        tt := Clamp((now - TUT.curAt)/(TUT_CUR_MS + 0.0), 0.0, 1.0)
+        et := Ease3(tt)
+        x0 := cx + cw - 55, y0 := by + 13
+        x1 := hx + hw/2, y1 := hy + hh/2
+        ; a quadratic arc, bulging away from the straight line
+        mx := (x0 + x1)/2 + (y0 - y1)*0.25, my := (y0 + y1)/2 + (x1 - x0)*0.25
+        gx := (1 - et)**2*x0 + 2*(1 - et)*et*mx + et**2*x1
+        gy := (1 - et)**2*y0 + 2*(1 - et)*et*my + et**2*y1
+        arr := now - (TUT.curAt + TUT_CUR_MS)
+        if (arr >= 0 && arr < 40 && !TUT.clickAt)
+            TUT.clickAt := now                    ; the landing: the ring flashes once
+        ; a trail of fading beads behind the pointer while it travels
+        if (tt < 1 && !hubLowPerf) {
+            loop 5 {
+                bt := Clamp(tt - A_Index*0.06, 0.0, 1.0)
+                be := Ease3(bt)
+                bx2 := (1 - be)**2*x0 + 2*(1 - be)*be*mx + be**2*x1
+                by2 := (1 - be)**2*y0 + 2*(1 - be)*be*my + be**2*y1
+                b := SBrush(FA(Alpha(acc, Round(150/A_Index)), cf))
+                FillEll(bx2 + 2 - 2.5, by2 + 2 - 2.5, 5, 5, b), DelB(b)
+            }
+        }
+        if (arr >= 0 && arr < 700) {
+            rp := arr/700.0
+            pn := Pen(FA(Alpha(acc, Round(200*(1 - rp))), cf), 2.4 - 1.8*rp)
+            Ell(gx - 6 - 26*rp, gy - 6 - 26*rp, 12 + 52*rp, 12 + 52*rp, pn), DelP(pn)
+        }
+        if (arr >= 0) {
+            pls := (Sin(DecT(now)*0.006) + 1)/2
+            b := SBrush(FA(Alpha(acc, Round(40 + 30*pls)), cf))
+            FillEll(gx - 12 - 4*pls, gy - 12 - 4*pls, 24 + 8*pls, 24 + 8*pls, b), DelB(b)
+        }
+        ; the pointer: a small arrow, dark keyline under white fill
+        DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &ap := 0)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", ap, "float", gx, "float", gy, "float", gx, "float", gy + 15)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", ap, "float", gx, "float", gy + 15, "float", gx + 4, "float", gy + 11.5)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", ap, "float", gx + 4, "float", gy + 11.5, "float", gx + 6.5, "float", gy + 17)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", ap, "float", gx + 6.5, "float", gy + 17, "float", gx + 9.5, "float", gy + 15.6)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", ap, "float", gx + 9.5, "float", gy + 15.6, "float", gx + 7, "float", gy + 10.4)
+        DllCall("gdiplus\GdipAddPathLine", "ptr", ap, "float", gx + 7, "float", gy + 10.4, "float", gx + 11.5, "float", gy + 10.4)
+        DllCall("gdiplus\GdipClosePathFigure", "ptr", ap)
+        pn := Pen(FA(Alpha(0xFF0C0E17, 230), cf), 2.4)
+        DllCall("gdiplus\GdipDrawPath", "ptr", G, "ptr", pn, "ptr", ap), DelP(pn)
+        b := SBrushP(FA(0xFFF4F5FA, cf))
+        DllCall("gdiplus\GdipFillPath", "ptr", G, "ptr", b, "ptr", ap), DelB(b)
+        DllCall("gdiplus\GdipDeletePath", "ptr", ap)
+    }
+}
+
 ; ---- the footer card -------------------------------------------------------
 ; Its own frame, its own fade and its own slide, on the same curve SPFLive uses
 ; for the strip under SPECIAL. Nothing about it is tied to how far the panel
@@ -14095,6 +16693,17 @@ FFMLogZone(ux, uy) {
             return 475
         if (ux >= x + 18 + FFM_TABW && ux <= x + 18 + FFM_TABW*2)
             return 476
+        if (ux >= x + 22 + FFM_TABW*2 && ux <= x + 22 + FFM_TABW*3)
+            return 478
+    }
+    ; HISTORY rows: the RESTORE button on each visible row, 619 + slot. The
+    ; slot is turned back into a row against the list as it is now, the same
+    ; way the database rows are.
+    if (FFM.logTab = 3 && uy >= ly && uy <= ly + lh
+        && ux >= x + w - 116 && ux <= x + w - 42) {
+        k := Floor((uy - ly + FFM.hsScr)/FFM_HSRH) - Floor(FFM.hsScr/FFM_HSRH) + 1
+        if (k >= 1 && k <= FFM_HSROWS + 1)
+            return 619 + k
     }
     ; scrollbar thumb drag
     if (FFMLogTot() > lh
@@ -14122,7 +16731,8 @@ FFMLogZone(ux, uy) {
 
 ; Scroll extent of whichever tab is showing. Both the wheel, the thumb drag and
 ; the thumb geometry read this, so the two tabs cannot drift apart.
-FFMLogTot() => (FFM.logTab = 2) ? FFM.upd.Length*FFM_UPRH : FFM.logs.Length*FFM_LGRH
+FFMLogTot() => (FFM.logTab = 2) ? FFM.upd.Length*FFM_UPRH
+             : (FFM.logTab = 3) ? FFM.hist.Length*FFM_HSRH : FFM.logs.Length*FFM_LGRH
 
 FFMLogView(ff, now, acc, dx := 0, dy2 := 0) {
     ; only draw when this overlay is opening, or when it is the one closing
@@ -14153,26 +16763,32 @@ FFMLogView(ff, now, acc, dx := 0, dy2 := 0) {
     ; lt runs 0..1 across the change; u is where the underline sits, 0 on
     ; INJECTION and 1 on UPDATES, eased. Both are 1/settled whenever nothing
     ; has been clicked, so the steady state costs one comparison.
+    ; ---- three chips, one underline ----
+    ; `u` is the underline's position in tab units - 0 on INJECTION, 1 on
+    ; UPDATES, 2 on HISTORY - eased across a switch. Each chip's own selection
+    ; is how close the underline is to it, so the pair being crossed both sit
+    ; part-lit mid-travel exactly as they did with two tabs.
     lt := (FFM.logTabAt && now - FFM.logTabAt < FFM_TABMS)
         ? Ease3((now - FFM.logTabAt)/FFM_TABMS) : 1.0
     swp := (lt < 1) && (FFM.logTabPrev != FFM.logTab)
-    uTo := upTab ? 1.0 : 0.0
-    u   := swp ? Lerp((FFM.logTabPrev = 2) ? 1.0 : 0.0, uTo, lt) : uTo
+    uTo := FFM.logTab - 1.0
+    u   := swp ? Lerp(FFM.logTabPrev - 1.0, uTo, lt) : uTo
 
-    t1x := x + 14, t2x := x + 18 + FFM_TABW
-    FFMLogTab(475, t1x, y + 7, "INJECTION", 1 - u, acc, fo)
-    FFMLogTab(476, t2x, y + 7, "UPDATES",       u, acc, fo)
-    ; one underline, slid between the two chips. It also stretches slightly at
-    ; the midpoint so the travel reads as a single object moving rather than a
-    ; bar teleporting - the overshoot is on the width, not the position, so it
-    ; can never leave the chip it lands on.
-    ubx := Lerp(t1x, t2x, u) + 8
-    ubw := (FFM_TABW - 16) * (1 + 0.35*Sin(3.14159*u))
+    t1x := x + 14, t2x := x + 18 + FFM_TABW, t3x := x + 22 + FFM_TABW*2
+    FFMLogTab(475, t1x, y + 7, "INJECTION", Clamp(1 - Abs(u - 0), 0.0, 1.0), acc, fo)
+    FFMLogTab(476, t2x, y + 7, "UPDATES",   Clamp(1 - Abs(u - 1), 0.0, 1.0), acc, fo)
+    FFMLogTab(478, t3x, y + 7, "HISTORY",   Clamp(1 - Abs(u - 2), 0.0, 1.0), acc, fo)
+    ; one underline, slid between the chips. It also stretches slightly at
+    ; the midpoint of each hop so the travel reads as a single object moving
+    ; rather than a bar teleporting - the overshoot is on the width, not the
+    ; position, so it can never leave the chip it lands on.
+    ubx := t1x + u*(FFM_TABW + 4) + 8
+    ubw := (FFM_TABW - 16) * (1 + 0.35*Sin(3.14159*(u - Floor(u))))
     b := SBrush(FA(Alpha(acc, 210), fo))
     FillRR(ubx - (ubw - (FFM_TABW - 16))/2, y + 26, ubw, 2, 1, b), DelB(b)
 
-    cnt := upTab ? FFM.upd.Length : FFM.logs.Length
-    Txt(cnt " entries", x + 26 + FFM_TABW*2, y + 12, 140, 16, HL.fS, FA(0x66C7CBE0, fo), fmtL)
+    cnt := upTab ? FFM.upd.Length : (FFM.logTab = 3) ? FFM.hist.Length : FFM.logs.Length
+    Txt(cnt " entries", x + 30 + FFM_TABW*3, y + 12, 120, 16, HL.fS, FA(0x66C7CBE0, fo), fmtL)
 
     ; close X - coloured on hover
     hvX := HL.h.Get(440, 0.0)
@@ -14191,22 +16807,13 @@ FFMLogView(ff, now, acc, dx := 0, dy2 := 0) {
     ; and coming back always travels right - the motion tells you which way
     ; through the pair you moved.
     if swp {
-        dir := (FFM.logTab = 2) ? 1 : -1
+        dir := (FFM.logTab > FFM.logTabPrev) ? 1 : -1
         oq  := 1 - lt
-        if (oq > 0.01) {
-            if (FFM.logTabPrev = 2)
-                FFMLogDrawUpd(x - dir*34*lt, w, ly, lh, t, fo*oq, acc)
-            else
-                FFMLogDrawInj(x - dir*34*lt, w, ly, lh, t, fo*oq, acc)
-        }
-        if upTab
-            FFMLogDrawUpd(x + dir*34*(1 - lt), w, ly, lh, t, fo*lt, acc)
-        else
-            FFMLogDrawInj(x + dir*34*(1 - lt), w, ly, lh, t, fo*lt, acc)
-    } else if upTab
-        FFMLogDrawUpd(x, w, ly, lh, t, fo, acc)
-    else
-        FFMLogDrawInj(x, w, ly, lh, t, fo, acc)
+        if (oq > 0.01)
+            FFMLogDrawTab(FFM.logTabPrev, x - dir*34*lt, w, ly, lh, t, fo*oq, acc)
+        FFMLogDrawTab(FFM.logTab, x + dir*34*(1 - lt), w, ly, lh, t, fo*lt, acc)
+    } else
+        FFMLogDrawTab(FFM.logTab, x, w, ly, lh, t, fo, acc)
 
     DllCall("gdiplus\GdipResetClip", "ptr", G)
     DllCall("gdiplus\GdipDeletePath", "ptr", lc)
@@ -14214,7 +16821,7 @@ FFMLogView(ff, now, acc, dx := 0, dy2 := 0) {
     ; scrollbar
     tot := FFMLogTot()
     if (tot > lh) {
-        scr := upTab ? FFM.updScr : FFM.logScr
+        scr := upTab ? FFM.updScr : (FFM.logTab = 3) ? FFM.hsScr : FFM.logScr
         sbA := Max(HL.h.Get(441, 0.0), (HL.drag = 11) ? 1.0 : 0.0)
         sw := 3 + 4*sbA
         sx2 := x + w - 16 - 3*sbA
@@ -14246,7 +16853,73 @@ FFMLogView(ff, now, acc, dx := 0, dy2 := 0) {
 FFMCanUndo() => (FFM.logTab = 2 && IsObject(FFM.updUndo)
               && FFM.updUndo.Length = FFM.flags.Length)
 
+; whichever tab is showing, drawn by its own routine
+FFMLogDrawTab(tab, x, w, ly, lh, t, fo, acc) {
+    if (tab = 2)
+        FFMLogDrawUpd(x, w, ly, lh, t, fo, acc)
+    else if (tab = 3)
+        FFMLogDrawHist(x, w, ly, lh, t, fo, acc)
+    else
+        FFMLogDrawInj(x, w, ly, lh, t, fo, acc)
+}
+
+; ---- HISTORY rows ----
+; Newest first: when it was taken, what was about to happen, how many flags
+; it holds and the first few of them, and RESTORE. Same plate, rail and
+; stagger as the UPDATES rows, so the three tabs read as one instrument.
+FFMLogDrawHist(x, w, ly, lh, t, fo, acc) {
+    if (FFM.hist.Length = 0) {
+        Txt("Nothing yet. A snapshot of the staged list is taken before CLEAR, an import,"
+          , x + 22, ly + lh/2 - 22, w - 44, 18, HL.fS, FA(0x8AC7CBE0, fo), fmtC)
+        Txt("a preset, a community set, PRUNE, UPDATE and a delete - and any one can be put back."
+          , x + 22, ly + lh/2 - 4, w - 44, 18, HL.fS, FA(0x66C7CBE0, fo), fmtC)
+        return
+    }
+    rowR := x + w - 32
+    bX   := x + w - 116, bW := 74
+    nmX  := x + 150
+    nmW  := Max(80, bX - 12 - nmX)
+    first := Floor(FFM.hsScr/FFM_HSRH) + 1
+    visCount := Max(0, Min(FFM_HSROWS + 1, FFM.hist.Length - first + 1))
+    loop visCount {
+        k   := A_Index
+        idx := first + k - 1
+        if (idx < 1 || idx > FFM.hist.Length)
+            continue
+        sn := FFM.hist[idx]
+        ry := ly + (idx - 1)*FFM_HSRH - FFM.hsScr
+        rowF := fo * Clamp((t - (k - 1)*0.04)/0.6, 0.0, 1.0)
+        if (rowF < 0.01)
+            continue
+        hv := HL.h.Get(619 + k, 0.0)
+        mc := (sn.act = "restore") ? 0xFF38BDF8 : (sn.act = "clear" || sn.act = "delete") ? AMBER : C_ON
+        b := SBrush(FA(Alpha(mc, Round((34 + 14*hv)*rowF)), fo))
+        FillRR(x + 14, ry + 1, w - 46, FFM_HSRH - 3, 5, b), DelB(b)
+        b := SBrush(FA(Alpha(mc, Round(215*rowF)), fo))
+        FillRR(x + 14, ry + 3, 2.5, FFM_HSRH - 7, 1.2, b), DelB(b)
+        Txt(sn.t, x + 22, ry + 1, 52, 14, HL.fS
+          , FA(Alpha(0xFFC7CBE0, Round(150*rowF)), fo), fmtL)
+        b := SBrush(FA(Alpha(mc, Round(60*rowF)), fo))
+        FillRR(x + 78, ry + 3, 66, 12, 3, b), DelB(b)
+        Txt("before " sn.act, x + 78, ry + 2, 66, 12, HL.fXs
+          , FA(Alpha(mc, Round(245*rowF)), fo), fmtC)
+        Txt(sn.flags.Length " flag" (sn.flags.Length = 1 ? "" : "s"), nmX, ry + 1, nmW, 14, HL.fMs
+          , FA(Alpha(0xFFE8EAF6, Round(220*rowF)), fo), fmtL)
+        names := ""
+        for fl in sn.flags {
+            names .= (names != "" ? ", " : "") fl["name"]
+            if (StrLen(names) > 120)
+                break
+        }
+        Txt(FFMElide(names, HL.fS, nmW), nmX, ry + 15, nmW, 15, HL.fS
+          , FA(Alpha(0x9AC7CBE0, Round(220*rowF)), fo), fmtL)
+        FFMBtn(619 + k, bX, ry + 4, bW, 24, "RESTORE", acc, rowF, 0)
+    }
+}
+
 FFMLogFoot() {
+    if (FFM.logTab = 3)
+        return FFM.hist.Length = 0 ? "no snapshots" : (FFM.hist.Length " snapshot" (FFM.hist.Length = 1 ? "" : "s") "  -  newest first, " FFM_HSMAX " kept")
     if (FFM.logTab != 2)
         return FFM.logs.Length = 0 ? "no entries" : FFM.logs.Length " entries"
     if (FFM.upd.Length = 0)
@@ -14518,16 +17191,45 @@ CurScan() {
         dirs.Push({d: A_LoopFileFullPath "\content\textures\Cursors", mk: 0, only: 0})
         dirs.Push({d: A_LoopFileFullPath "\content\textures", mk: 0, only: 0})
     }
-    if DirExist(lad "\Bloxstrap") {
+    ; ---- the strappers ----
+    ; Bloxstrap, Fishstrap and Voidstrap all install the client in a Versions
+    ; tree of their own (since 2.5 or so), and all three carry a Modifications
+    ; store the launcher lays over the client at every start. Only Bloxstrap
+    ; was known here, and only its store: a player on Fishstrap had the files
+    ; sitting in Fishstrap\Versions\version-*\content and this scan never
+    ; looked, so there was nothing to write and the panel said so.
+    for lc in ["Bloxstrap", "Fishstrap", "Voidstrap"] {
+        if !DirExist(lad "\" lc)
+            continue
+        loop Files, lad "\" lc "\Versions\version-*", "D" {
+            if !FileExist(A_LoopFileFullPath "\RobloxPlayerBeta.exe")
+                continue
+            dirs.Push({d: A_LoopFileFullPath "\content\textures\Cursors\KeyboardMouse", mk: 0, only: 0})
+            dirs.Push({d: A_LoopFileFullPath "\content\textures\Cursors", mk: 0, only: 0})
+            dirs.Push({d: A_LoopFileFullPath "\content\textures", mk: 0, only: 0})
+        }
         ; we create these, so only make the folder each file truly belongs in.
         ; only: 0 here would scatter a copy of every slot through all three
-        ; folders and Bloxstrap would apply mods Roblox never reads.
-        dirs.Push({d: lad "\Bloxstrap\Modifications\content\textures\Cursors\KeyboardMouse", mk: 1, only: 1})
+        ; folders and the launcher would apply mods Roblox never reads.
+        md := lad "\" lc "\Modifications\content\textures"
+        dirs.Push({d: md "\Cursors\KeyboardMouse", mk: 1, only: 1})
         ; second pass over the same folder for slot 4 - `only` is one index, and
         ; the I-beam belongs beside the arrow pair rather than in its own place
-        dirs.Push({d: lad "\Bloxstrap\Modifications\content\textures\Cursors\KeyboardMouse", mk: 1, only: 4})
-        dirs.Push({d: lad "\Bloxstrap\Modifications\content\textures\Cursors", mk: 1, only: 3})
-        dirs.Push({d: lad "\Bloxstrap\Modifications\content\textures", mk: 1, only: 2})
+        dirs.Push({d: md "\Cursors\KeyboardMouse", mk: 1, only: 4})
+        dirs.Push({d: md "\Cursors", mk: 1, only: 3})
+        dirs.Push({d: md, mk: 1, only: 2})
+    }
+    ; ---- and wherever a client is actually running from ----
+    ; a custom install, or a launcher this list does not know
+    for pid in FFMProcList() {
+        exe := ""
+        try exe := ProcessGetPath(pid)
+        if (exe = "")
+            continue
+        SplitPath(exe, , &vdir)
+        dirs.Push({d: vdir "\content\textures\Cursors\KeyboardMouse", mk: 0, only: 0})
+        dirs.Push({d: vdir "\content\textures\Cursors", mk: 0, only: 0})
+        dirs.Push({d: vdir "\content\textures", mk: 0, only: 0})
     }
     for e in dirs {
         for si, sl in CUR_SLOTS {
@@ -16752,6 +19454,13 @@ if spfFps {
     SPFFpsManage()
 }
 AcctLoad()
+; The community index was read only when the panel opened, so FFM_COMM was
+; EMPTY when the two boot queues below and in BootWarmStart walked it: the
+; games' names, icons, banners, stats and thumbnails were never loaded until
+; the panel was opened, whatever the loading screen said. Read here, first, so
+; last session's games are queued with the saved places; FFMCommQueueGames
+; adds whatever the launch sync brings that this did not know about.
+FFMCommIndexLoad()
 SPFPrefetchStart()                         ; queue their details for the loader
 
 ; Every setting in this module saves through here. A bare `try IniWrite`
@@ -18023,11 +20732,12 @@ SPFPrefetchStart() {
     ; FFMCommView asks for these stats itself, from inside the renderer, on the
     ; first frame the tab is drawn - so the name, icon, votes, visits and the
     ; whole thumbnail reel started resolving at the moment the user opened the
-    ; panel and the panel was empty until they came back. It is a fixed id known
-    ; at startup and it belongs in the same queue as everything else the hub
-    ; needs before it is worth showing. The lazy call in FFMCommView stays as
-    ; the fallback: SPFStatsFetch refuses to re-fetch a resolved record, so by
-    ; then it is a no-op.
+    ; panel and the panel was empty until they came back. The ids are known at
+    ; startup - FFMCommIndexLoad has read the cached index by now - and they
+    ; belong in the same queue as everything else the hub needs before it is
+    ; worth showing; a sync that brings new ones adds them (FFMCommQueueGames).
+    ; The lazy call in FFMCommView stays as the fallback: SPFStatsFetch refuses
+    ; to re-fetch a resolved record, so by then it is a no-op.
     ; GENERAL has no place id, so there is nothing to look up for it. `ent`,
     ; not `g`: a loop variable named g IS the graphics handle - see the note on
     ; FFMCommGameCard. Harmless here only because nothing in this function draws.
@@ -18055,6 +20765,8 @@ SPFPrefetchTick() {
     }
     if (SPF.statFor = id && A_TickCount - SPF.statAt < 9000)
         return 1                                 ; in flight, give it time
+    if DragBusy()
+        return 1                                 ; not during a drag - see DragBusy; the id stays at the head
     SPFStatsFetch(id, 1)
     return 1
 }
@@ -18188,6 +20900,10 @@ BootWarmTick() {
     ; Bounded, because a file that is never coming must not keep the pump alive:
     ; eight attempts, and after the loading screen those are 600 ms apart.
     if (j.k = "ico" || j.k = "thm") {
+        if DragBusy() {
+            LD_warm.InsertAt(1, j)                ; not during a drag - see DragBusy
+            return LD_warm.Length
+        }
         got := (j.k = "ico") ? SPFIco(j.v) : SPFThumbAt(j.v, j.n)
         if (got)
             BootWarmProgress()
@@ -24644,7 +27360,7 @@ SPFSavedView(ff, now, acc, dx := 0, dy2 := 0) {
     ; The name always sits in the same place - over the scrim on the artwork, or
     ; in the same spot on the placeholder. Drawing it below the box when there
     ; was no image put it straight through the id chip.
-    nmTxt := r ? (r.nm != "" ? r.nm : sel.id) : sel.id
+    nmTxt := StripEmoji(r ? (r.nm != "" ? r.nm : sel.id) : sel.id)
     Txt(FFMElide(nmTxt, fBadge, dw - 24), dx + 12, ly + ih - 32, dw - 24, 22, fBadge
         , FA(Alpha(th ? 0xFFFFFF : 0xFFE8EAF6, th ? 245 : 205), fo), fmtL)
     ty := ly + ih + 12
@@ -24888,36 +27604,56 @@ SPFRenSheet(x, y, w, h, fo, now, acc) {
 ; A single banner has nothing to skip TO, so it gets no affordance at all
 ; rather than a control that would do nothing.
 SPFBannerHover(dx, ly, dw, ih, n, fo, now, acc) {
+    BannerSkipHover(1010, SPF.bnFadeAt, dx, ly, dw, ih, n, fo, now, acc)
+}
+; ---- the same affordance, wherever a reel is ----
+; One drawing for every click-to-skip banner in the suite - the saved place's
+; carousel, the community hero, each community game's thumbnail - so a reel
+; answers the pointer the same way everywhere. z is the hit zone the hover
+; value is read from; pressAt is when the last skip started, which drives the
+; press flash and the ring (a click still registers while the crossfade it
+; started is running, so the flash is driven off the fade rather than the
+; pointer). compact is for a thumbnail: the plate shrinks to the chevrons and
+; drops the word, because a 96 px pill on a 124 px picture is the picture.
+BannerSkipHover(z, pressAt, dx, ly, dw, ih, n, fo, now, acc, compact := 0) {
     if (n < 2)
         return
-    hv := Ease3(HL.h.Get(1010, 0.0))
-    ; a click still registers while the crossfade it started is running, so the
-    ; press flash is driven off the fade rather than off the pointer
-    pr := SPF.bnFadeAt ? Clamp(1 - (now - SPF.bnFadeAt)/320.0, 0.0, 1.0) : 0.0
+    hv := Ease3(HL.h.Get(z, 0.0))
+    pr := pressAt ? Clamp(1 - (now - pressAt)/320.0, 0.0, 1.0) : 0.0
     if (hv < 0.004 && pr < 0.004)
         return
     e := Max(hv, pr)
-    pC := RRPath(dx, ly, dw, ih, 10)
-    DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pC, "int", 0)
+    rad := compact ? 8 : 10
+    ; ---- inside the caller's clip, not instead of it ----
+    ; This used to REPLACE the clip with the banner's rectangle (mode 0) and
+    ; reset it on the way out. On the saved-place panel that was harmless. In
+    ; the community panel the banner and the thumbnails scroll inside a body
+    ; clip, and a replaced clip let the scrim, the plate and the ring paint
+    ; over the part of a half-scrolled banner that the panel had already cut
+    ; away - the one thing on that page that did not scroll like the rest.
+    ; Intersect (mode 1) keeps the body's cut; the saved state puts it back.
+    pC := RRPath(dx, ly, dw, ih, rad)
+    stC := PushG()
+    DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pC, "int", 1)
     ; Scrim: theme-PRESERVING. It sits on a Roblox thumbnail, which looks the
     ; same in both themes, and 0x05060C is dark enough that THLight flips it to
     ; near-white - which turned the dimming wash into a brightening one.
     b := SBrushP(ElA(FA(Alpha(0x05060C, Round(120*hv + 60*pr)), fo)))
-    FillRR(dx, ly, dw, ih, 10, b), DelB(b)
+    FillRR(dx, ly, dw, ih, rad, b), DelB(b)
 
-    cx := dx + dw/2, cy := ly + ih/2 - 6
+    cx := dx + dw/2, cy := ly + ih/2 - (compact ? 0 : 6)
     ; the plate scales in from slightly small, and kicks on a press
     sc := 0.88 + 0.12*Ease3(hv) + 0.06*pr
-    st := PushXform(cx, cy + 6, sc, 0)
-    pw2 := 96, ph2 := 30
+    st := PushXform(cx, cy + (compact ? 0 : 6), sc, 0)
+    pw2 := compact ? 46 : 96, ph2 := compact ? 24 : 30
     ; Plate: 0x10131F, not pure black. Black is the one value THLight passes
     ; through untouched, so the plate stayed black on paper while the glyph and
     ; the label - which go through AccHi - correctly darkened, leaving dark ink
     ; on a dark pill. 0x10131F is in the theme map and becomes white.
     b := SBrush(FA(Alpha(0x10131F, Round(150*e)), fo))
-    FillRR(cx - pw2/2, cy - ph2/2, pw2, ph2, 15, b), DelB(b)
+    FillRR(cx - pw2/2, cy - ph2/2, pw2, ph2, ph2/2, b), DelB(b)
     pn := Pen(FA(Alpha(acc, Round(150*e)), fo), 1.2)
-    StrokeRR(cx - pw2/2, cy - ph2/2, pw2, ph2, 15, pn), DelP(pn)
+    StrokeRR(cx - pw2/2, cy - ph2/2, pw2, ph2, ph2/2, pn), DelP(pn)
 
     ; ---- skip glyph: a double chevron running into a bar ----
     ; The ink has to invert with the plate. On the dark plate AccHi brightens
@@ -24926,8 +27662,8 @@ SPFBannerHover(dx, ly, dw, ih, n, fo, now, acc) {
     ; grey because its target IS a grey. So paper mixes toward near-black
     ; instead, which keeps the hue: 5.2:1 with 54 of chroma still in it.
     ink := (thT > 0.5) ? Mix(acc, 0xFF23242B, 0.55) : AccHi(acc, 0.45)
-    gx := cx - 30, gy := cy
-    pn := Pen(FA(Alpha(ink, Round(235*e)), fo), 1.8)
+    gx := compact ? cx - 6 : cx - 30, gy := cy   ; centred alone, or left of the word
+    pn := Pen(FA(Alpha(ink, Round(235*e)), fo), compact ? 1.6 : 1.8)
     loop 2 {
         i := A_Index
         ; the two chevrons chase each other rightwards, the second trailing
@@ -24938,18 +27674,19 @@ SPFBannerHover(dx, ly, dw, ih, n, fo, now, acc) {
     }
     Line(gx + 11, gy - 5.5, gx + 11, gy + 5.5, pn), DelP(pn)
 
-    Txt("SKIP", cx - 8, cy - 8, 44, 16, fBadge
-        , FA(Alpha(ink, Round(240*e)), fo), fmtL)
+    if !compact
+        Txt("SKIP", cx - 8, cy - 8, 44, 16, fBadge
+            , FA(Alpha(ink, Round(240*e)), fo), fmtL)
     Pop(st)
 
     ; a ring pushing outward on the press, so the click is acknowledged even
     ; though the picture behind it takes a moment to change
     if (pr > 0.01) {
-        ex := (1 - pr)*26
+        ex := (1 - pr)*(compact ? 14 : 26)
         pn := Pen(FA(Alpha(acc, Round(170*pr)), fo), 1.6*pr + 0.3)
-        StrokeRR(cx - pw2/2 - ex, cy - ph2/2 - ex*0.6, pw2 + ex*2, ph2 + ex*1.2, 15 + ex*0.3, pn), DelP(pn)
+        StrokeRR(cx - pw2/2 - ex, cy - ph2/2 - ex*0.6, pw2 + ex*2, ph2 + ex*1.2, ph2/2 + ex*0.3, pn), DelP(pn)
     }
-    DllCall("gdiplus\GdipResetClip", "ptr", G)
+    Pop(stC)
     DllCall("gdiplus\GdipDeletePath", "ptr", pC)
 }
 
@@ -25499,6 +28236,8 @@ RSET.appExe  := ["", ""], RSET.appExeAt := 0
 RSET.lnkTg   := [0, 0],   RSET.lnkTgAt  := 0
 RSET.preset  := 0, RSET.presetAt := 0      ; last preset pressed, for the flash
 RSET.xmlHave := Map()              ; xml property -> current value in the file
+RSET.wrCut   := 0                  ; names the last REVERT removed from the client files
+RSET.paths   := [], RSET.pathsAt := 0   ; RSetAppSettingsPaths, memoised for the state card
 
 global RSET_SEPH  := 26            ; gap opened wherever the row group changes
 
@@ -26481,10 +29220,19 @@ RSetXmlOwes() => (RSetXmlOwned().Count > 0) || FileExist(RSetXmlBak())
 ; at startup, so this module writes there too.
 ;
 ; The file is MERGED, never replaced: other tools and the user's own flags stay
-; put, we only add our own keys. Whatever those keys held before is saved off
-; so REVERT can put the previous state back exactly instead of just deleting.
-RSetAppSettingsPaths() {
-    out := []
+; put, APPLY only adds this module's keys. REVERT then REMOVES every name this
+; module knows - see RSetKnownKeys and the note on RSetWriteAppSettings - so
+; the client is on Roblox's own default for each of them, whatever any tool
+; had set before.
+; Cached for four seconds, the way RSetAppExe and RSetLnkTargets are: the
+; state card asks for this EVERY FRAME to print a count, and the answer walks
+; the version folders and now snapshots the process list as well. The two
+; writers ask with `force` and always get a fresh look.
+RSetAppSettingsPaths(force := false) {
+    if (!force && RSET.pathsAt && A_TickCount - RSET.pathsAt < 4000)
+        return RSET.paths
+    RSET.pathsAt := A_TickCount
+    RSET.paths := (out := [])
     lad := ""
     try lad := EnvGet("LOCALAPPDATA")
     if (lad = "")
@@ -26500,8 +29248,39 @@ RSetAppSettingsPaths() {
     ; Writing only the version folder means the next launch through either
     ; launcher throws our flags away, so their copy gets written too.
     for b in ["Fishstrap", "Bloxstrap", "Voidstrap"] {
-        if DirExist(lad "\" b)
-            out.Push(lad "\" b "\Modifications\ClientSettings")
+        if !DirExist(lad "\" b)
+            continue
+        out.Push(lad "\" b "\Modifications\ClientSettings")
+        ; ... and the client the launcher actually runs. Since Bloxstrap 2.5
+        ; the launchers install Roblox under their OWN folder, not Roblox's, so
+        ; the version folder above never saw them at all. The stamp at launch
+        ; overwrites this copy anyway; writing it too covers a client started
+        ; from the exe directly, and a REVERT that must not wait for a launch.
+        loop Files, lad "\" b "\Versions\version-*", "D" {
+            if FileExist(A_LoopFileFullPath "\RobloxPlayerBeta.exe")
+                out.Push(A_LoopFileFullPath "\ClientSettings")
+        }
+    }
+    ; ---- and wherever a client is actually running from ----
+    ; A custom install path, or a launcher this list has never heard of, is
+    ; still a client reading a ClientAppSettings.json beside its exe. Each
+    ; running process is asked for its own image path rather than guessed at.
+    for pid in FFMProcList() {
+        exe := ""
+        try exe := ProcessGetPath(pid)
+        if (exe = "")
+            continue
+        SplitPath(exe, , &vdir)
+        d := vdir "\ClientSettings"
+        dup := 0
+        for x in out {
+            if (x = d) {
+                dup := 1
+                break
+            }
+        }
+        if !dup
+            out.Push(d)
     }
     return out
 }
@@ -26535,10 +29314,22 @@ RSetDumpJson(m) {
     return out "`n}"
 }
 
-; write := the flags to set; when write is 0 the module's keys are removed and
-; their recorded previous values restored
+; write := the flags to set; when write is 0 every name this module knows is
+; REMOVED from every file - not restored to a recorded previous value.
+;
+; It used to restore. The record captured what a key held before APPLY, and
+; REVERT put that back - which is faithful to "undo APPLY" and wrong for
+; "back to the Roblox default", because the value it faithfully restored was
+; whatever a launcher preset, an older build of this module or a hand edit had
+; put there first. DFIntDebugFRMQualityLevelOverride 21 captured that way came
+; back on every REVERT, and the client sat at maximum quality with a slider
+; that only moved the render distance, however many times REVERT was pressed.
+; A flag the client is not given is that flag at its default, so REVERT
+; deletes. The record is still written by APPLY: it is how REVERT knows about
+; a name that is no longer in the table or the overrides.
+; RSET.wrCut says how many distinct names actually came out.
 RSetWriteAppSettings(write) {
-    dirs := RSetAppSettingsPaths()
+    dirs := RSetAppSettingsPaths(true)
     if !dirs.Length
         return 0
     RSetEnsureDirs()
@@ -26552,21 +29343,25 @@ RSetWriteAppSettings(write) {
 
     if write {
         ; Record every key we are about to own, with the value it held before -
-        ; or the sentinel when it held nothing. prev is therefore the exact set
-        ; this module wrote, which is what REVERT must undo. Deriving that set
-        ; from the current picks instead would strand keys the moment a
-        ; dropdown changed between APPLY and REVERT.
+        ; or the sentinel when it held nothing. REVERT no longer restores those
+        ; values (see the note above), but the record is still the one list of
+        ; names this module has written that survives a pick changing or an
+        ; override being deleted between APPLY and REVERT, so it is kept.
         for k, v in RSetFlags() {
             if !prev.Has(k)
                 prev[k] := "`f"
         }
     }
 
+    known := write ? 0 : RSetKnownKeys()
+    cut := Map()
     ok := 0
     for d in dirs {
+        p := d "\ClientAppSettings.json"
+        if (!write && !FileExist(p))
+            continue                         ; nothing to take out of a file that is not there
         if !DirExist(d)
             try DirCreate(d)
-        p := d "\\ClientAppSettings.json"
         curM := Map()
         if FileExist(p) {
             body := ""
@@ -26585,17 +29380,12 @@ RSetWriteAppSettings(write) {
             for k, v in mine
                 curM[k] := v
         } else {
-            for k, v in prev {
-                ; `f marks a key that was NOT in the file before we wrote it, so
-                ; reverting means removing it - and it may already be absent if
-                ; something else rewrote the file in between. Same throw, same
-                ; guard as the ones in FFMReApplyTick.
-                if (v = "`f") {
-                    if curM.Has(k)
-                        curM.Delete(k)
-                }
-                else
-                    curM[k] := v
+            ; absent already is fine - something else may have rewritten the
+            ; file in between. Same throw, same guard as the ones in
+            ; FFMReApplyTick.
+            for k, v in known {
+                if curM.Has(k)
+                    curM.Delete(k), cut[k] := 1
             }
         }
         try {
@@ -26611,14 +29401,41 @@ RSetWriteAppSettings(write) {
             fh.Write(RSetDumpJson(prev))
             fh.Close()
         }
-    } else
+    } else {
         try FileDelete(RSetPrevPath())
+        RSET.wrCut := cut.Count
+    }
     return ok
 }
 
+; Every flag name this module could have put in the file: each choice of every
+; row (not only the chosen one - the pick may have moved since APPLY), the
+; overrides typed into EDIT FAST FLAGS, and whatever the record says APPLY
+; wrote (an override deleted from the list since is still in there). This is
+; what REVERT removes. It contains nothing the FAST FLAG MANAGER owns: that
+; module never writes this file, and this one never reads its list.
+RSetKnownKeys() {
+    out := Map()
+    for o in RSET_OPTS {
+        if !o.HasOwnProp("f")
+            continue
+        for fm in o.f
+            for k, v in fm
+                out[k] := 1
+    }
+    for k, v in RSET.extra
+        out[k] := 1
+    if FileExist(RSetPrevPath()) {
+        body := ""
+        try body := FileRead(RSetPrevPath(), "UTF-8")
+        if (body != "")
+            for k, v in RSetParseJson(body)
+                out[k] := 1
+    }
+    return out
+}
 ; Exactly the keys this module put into ClientAppSettings, taken from the
-; record rather than from the current picks - REVERT has to undo what was
-; written, not what happens to be selected now.
+; record rather than from the current picks.
 RSetOwnedKeys() {
     out := Map()
     if FileExist(RSetPrevPath()) {
@@ -27043,89 +29860,132 @@ RSetApply() {
     HubPoke()
 }
 
-RSetRevert() {
-    ; nothing to unstage - see RSetApply, this module never put anything in
-    ; the flag manager. It only takes back the keys it wrote to the file.
-    nf := RSetOwnedKeys().Count
-
-    ncs := RSetWriteAppSettings(0)
-
-    ; The client file half. This no longer copies a whole-file backup back over
-    ; the settings file, and RSetXmlOwnPath explains at length why: that backup
-    ; is captured on the first APPLY that finds none, and there was a path that
-    ; made the capture record this module's own output as "the original". Once
-    ; that happened, every REVERT afterwards restored the APPLIED settings - a
-    ; client pinned at GRAPHICS QUALITY 10 after the HIGH preset, no matter how
-    ; many times REVERT was pressed. Replaying a snapshot can only ever be as
-    ; good as the snapshot.
-    ;
-    ; So REVERT edits the live file in place and DELETES the properties this
-    ; module can write. UserGameSettings is an ordinary instance with built-in
-    ; defaults, so a property that is not in the XML is that property at its
-    ; shipped Roblox value, and the client writes the element back itself the
-    ; next time it saves. That is "back to the Roblox default" without this
-    ; suite having to hold an opinion about what the default is - and it is the
-    ; one form of the undo a poisoned baseline cannot corrupt. Properties this
-    ; module never writes are not touched at all.
-    ;
-    ; It still refuses while a client is up, for the reason APPLY refuses:
-    ; Roblox holds the file open, keeps its values in memory and rewrites it
-    ; from that copy on exit, so an edit underneath it is discarded.
-    nx := 0, xpend := 0
+; ---- the client settings file half of REVERT, on its own ----
+; Pulled out of RSetRevert so the watcher below can run the same thing later.
+; It edits the live file in place and DELETES the properties this module can
+; write. UserGameSettings is an ordinary instance with built-in defaults, so a
+; property that is not in the XML is that property at its shipped Roblox value,
+; and the client writes the element back itself the next time it saves. That
+; is "back to the Roblox default" without this suite having to hold an opinion
+; about what the default is - and it is the one form of the undo a poisoned
+; baseline cannot corrupt (RSetXmlOwnPath explains the whole-file backup that
+; used to replay the applied settings). Properties this module never writes
+; are not touched at all.
+;
+; It refuses while a client is up, for the reason APPLY refuses: Roblox holds
+; the file open, keeps its values in memory and rewrites it from that copy on
+; exit, so an edit underneath it is discarded. Refusing here does not mean a
+; second press any more - RSetXmlPendTick finishes it when the client closes.
+;
+; Returns {nx, pend}: how many properties came out, and whether the file half
+; is still owed - by a running client, an unreadable file or a failed write. A
+; file that cannot be FOUND is not owed: there is nothing to put back, so the
+; records are cleared rather than left to keep a watcher alive for nothing.
+RSetXmlRevertFile() {
+    r := {nx: 0, pend: 0}
+    if !RSetXmlOwes()
+        return r
+    if ProcessExist("RobloxPlayerBeta.exe") {
+        r.pend := 1
+        return r
+    }
     bak := RSetXmlBak()
-    if ProcessExist("RobloxPlayerBeta.exe")
-        xpend := RSetXmlOwes() ? 1 : 0
-    else {
-        path := RSetXml(true)
-        if (path = "")
-            xpend := RSetXmlOwes() ? 1 : 0
-        else {
-            ; drop the read-only lock first or nothing below can touch the file,
-            ; and leave it dropped so the client owns its settings again
-            try FileSetAttrib("-R", path)
-            body := ""
-            try body := FileRead(path, "UTF-8")
-            if (body = "")
-                xpend := RSetXmlOwes() ? 1 : 0
-            else {
-                cut := 0
-                for prop, tg in RSetXmlProps() {
-                    if RSetXmlDel(&body, prop)
-                        cut++
-                }
-                ok := 1
-                if cut {
-                    ok := 0
-                    try {
-                        fh := FileOpen(path, "w", "UTF-8")
-                        fh.Write(body)
-                        fh.Close()
-                        ok := 1
-                    }
-                }
-                if ok {
-                    ; verified the same way APPLY verifies its writes: read the
-                    ; file back and see that nothing of ours is left in it
-                    left := 0
-                    for prop, tg in RSetXmlProps() {
-                        if (RSetXmlRead(path, prop) != "")
-                            left++
-                    }
-                    if left
-                        xpend := 1
-                    else {
-                        nx := cut
-                        ; the record and the old whole-file backup have both
-                        ; done their job; the next APPLY captures a clean one
-                        RSetXmlOwnSave(Map())
-                        try FileDelete(bak)
-                    }
-                } else
-                    xpend := 1               ; a failed write stays revertable
-            }
-            RSetReadXml()
+    path := RSetXml(true)
+    if (path = "") {
+        RSetXmlOwnSave(Map())
+        try FileDelete(bak)
+        return r
+    }
+    ; drop the read-only lock first or nothing below can touch the file, and
+    ; leave it dropped so the client owns its settings again
+    try FileSetAttrib("-R", path)
+    body := ""
+    try body := FileRead(path, "UTF-8")
+    if (body = "") {
+        r.pend := 1
+        return r
+    }
+    cut := 0
+    for prop, tg in RSetXmlProps() {
+        if RSetXmlDel(&body, prop)
+            cut++
+    }
+    ok := 1
+    if cut {
+        ok := 0
+        try {
+            fh := FileOpen(path, "w", "UTF-8")
+            fh.Write(body)
+            fh.Close()
+            ok := 1
         }
     }
+    if !ok {
+        r.pend := 1                          ; a failed write stays revertable
+        RSetReadXml()
+        return r
+    }
+    ; verified the same way APPLY verifies its writes: read the file back and
+    ; see that nothing of ours is left in it
+    left := 0
+    for prop, tg in RSetXmlProps() {
+        if (RSetXmlRead(path, prop) != "")
+            left++
+    }
+    if left
+        r.pend := 1
+    else {
+        r.nx := cut
+        ; the record and the old whole-file backup have both done their job;
+        ; the next APPLY captures a clean one
+        RSetXmlOwnSave(Map())
+        try FileDelete(bak)
+    }
+    RSetReadXml()
+    return r
+}
+
+; ---- and the watcher that finishes it ----
+; REVERT under a running client used to end with "close Roblox, then revert
+; again", and the second press was the one thing nobody did: the panel read
+; REVERTED, the file still carried GRAPHICS QUALITY 10, and the next launch
+; picked it up. Now the module is switched off at the first press and this
+; waits for the client to leave, then clears the file. Armed by REVERT and by
+; RSetBoot (a revert left pending by a previous session survives in the
+; records, since the switch is off and the file half is still owed). It stops
+; itself the moment there is nothing owed, or APPLY puts the module back on.
+RSetXmlPendArm() {
+    if (!RSET.on && RSetXmlOwes())
+        SetTimer(RSetXmlPendTick, 2000)
+}
+RSetXmlPendTick() {
+    if (RSET.on || !RSetXmlOwes()) {
+        SetTimer(RSetXmlPendTick, 0)
+        return
+    }
+    if ProcessExist("RobloxPlayerBeta.exe")
+        return
+    r := RSetXmlRevertFile()
+    if r.pend
+        return                               ; unreadable or unwritable right now - try again in 2 s
+    SetTimer(RSetXmlPendTick, 0)
+    RSetSay((r.nx ? (r.nx " CLIENT SETTING(S) BACK TO ROBLOX DEFAULT") : "CLIENT SETTINGS FILE CLEAN")
+          . "  -  REVERT FINISHED", C_ON)
+    HubPoke()
+}
+
+RSetRevert() {
+    ; nothing to unstage - see RSetApply, this module never put anything in
+    ; the flag manager. Every name it knows comes out of the client files
+    ; (RSetWriteAppSettings, RSetKnownKeys); nf is what was actually there.
+    RSET.wrCut := 0
+    ncs := RSetWriteAppSettings(0)
+    nf := RSET.wrCut
+
+    ; the client settings file half - see RSetXmlRevertFile; under a running
+    ; client it is owed, and RSetXmlPendTick pays it when the client closes
+    xr := RSetXmlRevertFile()
+    nx := xr.nx, xpend := xr.pend
 
     nfo := RSetFontRevert()
     nlg := RSetLogoRevert()
@@ -27134,27 +29994,26 @@ RSetRevert() {
     ; than in a file - see RSetFpsLiveRevert
     lfp := RSetFpsLiveRevert()
 
-    ; The rows themselves. Putting the client back and leaving the panel showing
-    ; VULKAN, QUALITY 10 and a custom font is the drift RSetLogoRestore already
-    ; refuses to leave behind, for two reasons that apply to the whole module
-    ; and not just to its logo rows: the panel then disagrees with the client it
-    ; is describing, and the next APPLY silently writes all of it back. So a
-    ; completed revert ends with every row on its leave-alone choice.
-    ;
-    ; Only a COMPLETED one. With the client file half still outstanding the
-    ; module is still applied, and a default-looking panel over a client that is
-    ; not yet on the defaults is the same lie in the other direction. The rows
-    ; are not what drives the undo either way - REVERT works off the records in
-    ; RSetXmlOwned, RSetPrevPath and RSET.bakLog, never off the current picks -
-    ; so clearing them cannot strand anything the second press still owes.
-    nr := xpend ? 0 : RSetRowsToDefault()
+    ; ---- the hub's half, unconditionally ----
+    ; The rows, the flag overrides, the flag source and the staged files all go
+    ; back to their defaults here, whatever the client file is still owed. They
+    ; used to wait on the file half - the argument was that a default-looking
+    ; panel over a client not yet on the defaults is a lie - but the file half
+    ; now finishes on its own, and what the wait actually produced was the
+    ; report that started this: REVERT pressed with Roblox open, every row
+    ; still showing what was applied, and no visible reason why. The undo does
+    ; not run off the picks (RSetXmlOwned, RSetPrevPath and RSET.bakLog carry
+    ; it), so clearing them cannot strand anything still owed.
+    nr := RSetHubToDefault()
 
-    ; Only clear the switch when nothing is left owed. With the client file
-    ; still to put back the module IS still applied, and saying otherwise is
-    ; how the state on disk and the state in the panel drift apart.
-    RSET.on := xpend ? 1 : 0
+    ; Off, whatever is still owed: the module is no longer applying anything,
+    ; and RSetXmlPendTick reads this to know the pending file half is a revert
+    ; and not an apply it should leave alone.
+    RSET.on := 0
     RSET.applyAt := A_TickCount
-    try IniWrite(RSET.on, iniPath, "rset", "on")
+    try IniWrite(0, iniPath, "rset", "on")
+    if xpend
+        RSetXmlPendArm()
     rbx := ProcessExist("RobloxPlayerBeta.exe") ? "  -  RESTART ROBLOX" : ""
     xs  := nx ? (", " nx " CLIENT SETTING(S) BACK TO ROBLOX DEFAULT") : ""
     fs  := nfo ? (", " nfo " FONT FILE(S)") : ""
@@ -27165,12 +30024,69 @@ RSetRevert() {
     fs  .= (lfp > 0)  ? ", FPS CAP LIFTED LIVE"
          : (lfp = -1) ? ", FPS CAP NEEDS A RESTART"
                       : ""
-    fs  .= nr ? (", " nr " ROW(S) BACK TO DEFAULT") : ""
+    fs  .= nr ? (", " nr " SETTING(S) BACK TO DEFAULT") : ""
     if xpend
-        RSetSay("REVERTED " nf " FLAG(S)" fs "  -  CLOSE ROBLOX, THEN REVERT AGAIN FOR THE CLIENT FILE", AMBER)
+        RSetSay("REVERTED " nf " FLAG(S)" fs "  -  THE CLIENT SETTINGS FILE GOES BACK WHEN ROBLOX CLOSES", AMBER)
     else
         RSetSay("REVERTED  " nf " FLAG(S) FROM " ncs " CLIENT(S)" xs fs rbx, C_ON)
     HubPoke()
+}
+
+; ---- every setting the hub holds for this module, back to its default ----
+; RSetRowsToDefault covers the rows. REVERT also owes the rest of what the
+; panel keeps: the flags typed into EDIT FAST FLAGS, the FLAG SOURCE choice,
+; and the font and logo files picked for their rows - all of which the next
+; APPLY would otherwise put straight back. Deliberately NOT the FAST FLAG
+; MANAGER's staged list: that module owns its own set, and this one never
+; touches it (see RSetApply). Returns how many things actually changed.
+RSetHubToDefault() {
+    global rsetSrcOn, rsetSrcSel
+    ; the EDIT FAST FLAGS page can be up - the header's REVERT reaches past it -
+    ; and its list is about to be emptied. A field left live would keep a caret
+    ; on a row that no longer exists, so the edit is dropped (not committed:
+    ; whatever was typed is being reverted too) and the page steps out.
+    if RSET.fx {
+        try FFMEndEdit(false)
+        RSetFxClose()
+    }
+    n := RSetRowsToDefault()
+    ; EDIT FAST FLAGS: the overrides, and the page's own state around them
+    if RSET.extra.Count {
+        n += RSET.extra.Count
+        RSET.extra := Map()
+        RSET.fxGone := Map()
+        RSET.fxSel := "", RSET.fxName := "", RSET.fxVal := ""
+        RSET.fxScr := 0.0, RSET.fxScrT := 0.0
+        RSetExtraSave()                      ; persists, and bumps the flag list's memo
+    }
+    ; FLAG SOURCE: back to MIX
+    if (rsetSrcOn || rsetSrcSel != 1) {
+        n++
+        rsetSrcOn := 0, rsetSrcSel := 1
+        RSET.srcAt := A_TickCount
+        RSET.flashAt["src"] := A_TickCount
+        try IniWrite(0, iniPath, "rset", "srcon")
+        try IniWrite(1, iniPath, "rset", "srcpick")
+        RSetFxBump()                         ; the row locks read off this
+    }
+    ; the staged files: rows are already on KEEP, this forgets what they held
+    if (RSET.font != "") {
+        n++
+        RSET.font := ""
+        try IniWrite("", iniPath, "rset", "fontfile")
+    }
+    if (RSET.logo != "" || RSET.logoS != "" || RSET.logoSub != "" || RSET.logoSubS != "") {
+        n++
+        RSET.logo := "", RSET.logoS := ""
+        RSET.logoSub := "", RSET.logoSubS := ""
+        try IniWrite("", iniPath, "rset", "logofile")
+        try IniWrite("", iniPath, "rset", "logofileS")
+        try IniWrite("", iniPath, "rset", "logosub")
+        try IniWrite("", iniPath, "rset", "logosubS")
+        RSetLogoLoad()                       ; drops both staged previews
+        RSetLogoScan(1, true)
+    }
+    return n
 }
 
 RSetToggle() {
@@ -27279,6 +30195,9 @@ RSetBoot() {
     RSetXml(true)
     RSET.msg := RSET.on ? "APPLIED" : "NOT APPLIED"
     RSET.msgCol := RSET.on ? C_ON : 0xFFC7CBE0
+    ; a REVERT that could not reach the client settings file last session -
+    ; Roblox was up - is still owed; the watcher finishes it once it is not
+    RSetXmlPendArm()
 }
 
 ; ---------------- CLIENT SETTINGS: geometry ----------------
@@ -29250,11 +32169,11 @@ RSetFxAdd() {
     n := Trim(RSET.fxName), v := Trim(RSET.fxVal)
     if !RSetFlagNameOK(n) {
         RSetSay("THAT IS NOT A FLAG NAME", C_OFF)
-        return
+        return 0
     }
     if (v = "") {
         RSetSay("GIVE IT A VALUE", C_OFF)
-        return
+        return 0
     }
     ; The bar is the field separator in the ini blob and would split one flag
     ; into two on the next launch. Stripped rather than refused: it cannot
@@ -29264,14 +32183,16 @@ RSetFxAdd() {
     ; the same consequence: the row hands over and switches off
     o9 := RSetFlagRowOf(n)
     took := (o9 && RSetPresetFlags().Has(n)) ? RSetTakeRow(o9) : 0
+    had := RSET.extra.Has(n)
     RSET.extra[n] := v
     RSET.fxFlash[n] := A_TickCount
     RSET.fxAddAt := A_TickCount
     RSET.fxName := "", RSET.fxVal := ""
     RSetExtraSave()
     RSetSay(took ? (StrUpper(o9.n) " IS NOW YOURS - THE ROW IS OFF")
-          : RSET.on ? "ADDED - PRESS APPLY AGAIN TO WRITE IT" : "ADDED", RSET.on ? AMBER : 0)
+          : (had ? "UPDATED" : "ADDED") (RSET.on ? " - PRESS APPLY AGAIN TO WRITE IT" : ""), RSET.on ? AMBER : 0)
     HubPoke()
+    return 1
 }
 ; ---- two different things wear the same X ----
 ; Pressing it on a flag you typed REMOVES it. Pressing it on a preset pair you
@@ -29310,7 +32231,12 @@ RSetFxDel(name) {
         o := RSetFlagRowOf(name)
         if o {
             also := RSetTakeRow(o)
-            RSET.extra.Delete(name)   ; RSetTakeRow re-added it; it is going
+            ; RSetTakeRow re-added it, unless the row it found was not the one
+            ; writing it and was already on its leave-alone choice - two rows
+            ; can name the same flag - in which case there is nothing to remove
+            ; and Map.Delete on a missing key would throw out of a click
+            if RSET.extra.Has(name)
+                RSET.extra.Delete(name)   ; it is going
         }
     }
     RSET.fxGone[name] := {at: A_TickCount, v: val, own: own}
@@ -29561,12 +32487,15 @@ RSetFxBody(ax, ay, ay2, lTop, lBot, ff, sld, now, acc) {
         ; off - so the row name is looked up against every choice rather than
         ; against what is live, and the line says the row is off rather than
         ; pretending the flag arrived from nowhere.
+        ; "is off" only while it is. A row switched back on from CLIENT
+        ; SETTINGS after the take-over writes the flag again, and this override
+        ; wins the merge (see RSetFlags) - which is what the line says then.
         if !e.ext
             sub := (e.own != "") ? ("from " e.own) : "from a preset"
         else if (st2 != 1)
             sub := "off roblox's list - ignored in the file"
         else if (e.own != "")
-            sub := "yours  ·  " e.own " is off"
+            sub := pfB.Has(e.n) ? ("yours  ·  overrides " e.own) : ("yours  ·  " e.own " is off")
         else
             sub := "yours  ·  on roblox's list"
         Txt(FFMElide(sub, HL.fXs, nwid), rx + 34, ry + 17, nwid, 13, HL.fXs
@@ -30613,6 +33542,7 @@ try hubArmTint := Integer(IniRead(iniPath, "hub", "armtint", "1"))
 try hubLowPerf := Integer(IniRead(iniPath, "hub", "lowperf", "0"))
 try hubTop     := Integer(IniRead(iniPath, "hub", "ontop",   "1"))
 try hubTrueMin := Integer(IniRead(iniPath, "hub", "truemin", "0"))
+try hubAutoUpd := Integer(IniRead(iniPath, "hub", "autoupdate", "0"))
 thT := hubTheme ? 1.0 : 0.0
 try hubOpacity := Clamp(Number(IniRead(iniPath, "hub", "opacity", "1.0")), 0.35, 1.0)
 try bgOpacity := Clamp(Number(IniRead(iniPath, "hub", "bg", "1.0")), 0.15, 1.0)
@@ -30660,7 +33590,8 @@ global CHANGELOG := [["+", "tabs, save / export + saved-script library"]
     , ["*", "BETTER MATCHMAKING renamed AUTO-REGION FINDER"]
     , ["+", "new BETTER MATCHMAKING - picks measured servers"]
     , ["*", "JOIN only rerolls with AUTO-REGION FINDER on"]
-    , ["+", "CHECK FOR UPDATES + AUTO UPDATE setting"]]
+    , ["+", "CHECK FOR UPDATES + AUTO UPDATE setting"]
+    , ["+", "FLAG MANAGER: string flags inject live, refusals say why"]]
 global famP := 0, fP := 0, fPs := 0
 try profName := IniRead(iniPath, "profile", "name", "USERNAME")
 try profBio := IniRead(iniPath, "profile", "bio", "EMPTY BIO")
@@ -30788,12 +33719,13 @@ SetTimer(UsageTick, 1000)
 CurBoot()
 RSetBoot()
 
-; ================= password gate =================
-; Launched BEFORE the gate so the round trip overlaps the intro animation and
-; whatever time the user spends typing - by the time anyone presses Enter the
-; list is normally already in. The gate never waits on it; see GSubmit.
-KeyFetchStart()
-PasswordGate()
+; ================= the gate moved ================
+; It used to stand here, before anything was loaded, and it asked for a key.
+; It asks for nothing now and it stands AFTER the loading screen - see
+; LaunchGate, called just before the hub opens - so that opening the .ahk
+; starts the load at once and the first thing anybody decides is where to
+; start: Roblox and the hub, or the hub alone. The key machinery (KeyFetch*,
+; KeyOk, the keyfetch child) is left in place and idle.
 
 ; ================= window (autoblock overlay: created dormant, shown by the hub) =================
 ; Created BEFORE the loading screen, not after. Every background lookup the
@@ -30893,9 +33825,25 @@ if (bindKey != "")
 ; PUZZLE AI's two keys are created by PuzHotkeys() when the module is armed and
 ; released when it is not, each under its own HotIf context - see PuzHotkeys.
 
-; ================= main hub =================
+; ================= the launch gate, then the main hub =================
+; Everything above is loaded. The gate's two buttons decide what opens.
+global gateChoice := ""
+global gateDrag := 0                       ; 1 while the launch gate is being dragged - see FlagSingleton.Get and DragBusy
+LaunchGate()
 TrayInit()
 HubOpen()
+LGILoad()                                  ; LOGIN ITEMS: the list, then the watcher
+LGIWatchStart()
+if (gateChoice = "roblox")
+    HubOpenRoblox()                            ; OPEN ROBLOX: the client too, the way the dashboard's LAUNCH does it
+else if (gateChoice = "acct") {
+    ; ACCOUNTS: the hub, opened straight onto the account manager - the
+    ; INTEGRATIONS tab, the saved-places module, its accounts view
+    HubTabSet(2)
+    if (hubMod != 5)
+        HubModSel(5)
+    SPFViewOpen("acct")
+}
 ; Capture the machine as it is NOW - once, before anything here has touched
 ; it. This is what a revert puts back, not merely the state one click ago.
 DOPBaseEnsure()
@@ -31587,10 +34535,11 @@ LoadingScreen() {
            : savN            ? ("resolving saved places [" savN "]")
            : acctN           ? ("signing in saved accounts [" acctN "]")
            :                   "arming hotkey matrix"
-    steps := [[0, "verifying credentials"], [430, "decrypting asset pool"]
-        , [980, "mounting avatar pool [" selN "]"]
-        , [1560, ldSay]
-        , [2140, "syncing interface"]]
+    steps := [[0, "verifying credentials"], [360, "decrypting asset pool"]
+        , [800, "mounting avatar pool [" selN "]"]
+        , [1260, ldSay]
+        , [1720, "fetching community flags"]
+        , [2180, "syncing interface"]]
     ; `tgt` is gone. It held one bar position per caption, which is what made
     ; the bar move in five decelerating lurches; the captions are driven by the
     ; timings in `steps` and never needed it. See the pacing block in LRender.
@@ -31626,7 +34575,20 @@ LoadingScreen() {
     ; mid-load. Held fixed, the ratio below would go negative, clamp to zero, and
     ; park the bar at LD_BODY for the rest of the load.
     BootWarmStart()
-    ldPend0 := SPFPrefetchLeft() + BootWarmLeft() + 1     ; +1 for the flag database
+    ; ---- the community flags, from here on ----
+    ; They were fetched only when the panel opened, so the first open of a
+    ; session drew last session's sets and then swapped them out under the
+    ; cursor. The sync child is launched here with the rest of the boot work
+    ; and counted with it: `ui` and the WM_COPYDATA handler both exist by this
+    ; line, so its answer lands during the load exactly as it would in the hub,
+    ; and FFMCommSyncing is the pending test, with the 60 s escape it already
+    ; has. When it lands, FFMCommQueueGames puts every game it named into the
+    ; two queues this screen is already draining, so their details and artwork
+    ; load here too - ldPend0 is a high-water mark for exactly that reason.
+    ; LOAD_MAX_MS still caps the whole load, so a slow repository delays the
+    ; hub by at most that, and the panel picks up whatever is left.
+    FFMCommSync()
+    ldPend0 := SPFPrefetchLeft() + BootWarmLeft() + 1 + (FFMCommSyncing() ? 1 : 0)   ; +1 for the flag database
 
     bi := Buffer(40, 0)
     NumPut("uint", 40, bi, 0), NumPut("int", LWp, bi, 4), NumPut("int", -LHp, bi, 8)
@@ -31694,10 +34656,10 @@ LoadingScreen() {
         BootWarmTick()                           ; ... and decode what it draws with
         ; Everything the hub needs before it is worth showing: the lookup queue
         ; (names, icons, banners, stats for every id the player added AND for the
-        ; community game), the artwork every panel decodes on first draw, and the
-        ; fast-flag database. All three report progress, so the bar can track real
-        ; work instead of a stopwatch.
-        ldPend := SPFPrefetchLeft() + BootWarmLeft() + (FFM.loading ? 1 : 0)
+        ; community game), the artwork every panel decodes on first draw, the
+        ; fast-flag database, and the community sets. All four report progress,
+        ; so the bar can track real work instead of a stopwatch.
+        ldPend := SPFPrefetchLeft() + BootWarmLeft() + (FFM.loading ? 1 : 0) + (FFMCommSyncing() ? 1 : 0)
         if (ldPend > ldPend0)                    ; see the note at ldPend0
             ldPend0 := ldPend
         ldOpen := (ldPend = 0) || (el >= LOAD_MAX_MS)
@@ -32266,10 +35228,6 @@ HubGateDraw(now) {
     if !HubGateUp()
         return
     gKind := HubGateKind()             ; resolved once, read throughout
-    ; the update card is fed by child processes that report through files, and
-    ; it is the only thing that ever reads them - so it is the one that polls
-    if (gKind = 3 && !HL.gateOut)
-        UpdPoll(now)
     ; in on 420 ms, out on 300, both from one timestamp so a late frame cannot
     ; strand it half-drawn
     if HL.gateOut {
@@ -32286,8 +35244,16 @@ HubGateDraw(now) {
             ; Sequenced after the exit rather than fired from the click, so the
             ; card is seen to leave before the hub starts its own close. Firing
             ; both at the press ran the two animations over each other.
+            ; ---- a launch-check card that was waiting on this one ----
+            ; Same sequencing, for the same reason: it enters once the opening
+            ; gate has fully left, never over it - and not after the resolution
+            ; card, which is closing the hub.
             if (gKind = 2)
                 HubClose()
+            else if HL.updPend
+                UpdRaise()
+            else if (gKind = 1 && !TutSeen())
+                TutStart(1)                     ; the first run: the tour, once the welcome card has gone
             return
         }
     } else
@@ -32391,8 +35357,13 @@ HubGateDraw(now) {
     }
     Txt(gTtl, tx + (1 - l1)*10, ky + 78, tw, 24, HL.fV
       , FA(Alpha(Mix(0xFFE8EAF6, acc, 0.22), 248), f*l1), fmtL)
-    Txt(FFMElide(gL1, fHint, tw), tx + (1 - l2)*10, ky + 108, tw, 18, fHint, FA(0xBEC7CBE0, f*l2), fmtL)
-    Txt(FFMElide(gL2, fHint, tw), tx + (1 - l3)*10, ky + 128, tw, 18, fHint, FA(0xBEC7CBE0, f*l3), fmtL)
+    ; elided once per wording, not per frame: the two measures are cheap, but
+    ; the card animates at full rate and the words change a handful of times
+    gck := gKind "|" gTtl "|" gL1 "|" gL2
+    if (HL.gateCapKey != gck)
+        HL.gateCapKey := gck, HL.gateCap := [FFMElide(gL1, fHint, tw), FFMElide(gL2, fHint, tw)]
+    Txt(HL.gateCap[1], tx + (1 - l2)*10, ky + 108, tw, 18, fHint, FA(0xBEC7CBE0, f*l2), fmtL)
+    Txt(HL.gateCap[2], tx + (1 - l3)*10, ky + 128, tw, 18, fHint, FA(0xBEC7CBE0, f*l3), fmtL)
 
     ; ---- the buttons ----
     if (gKind = 3) {
@@ -32484,7 +35455,9 @@ HubGateBtnDraw(z, bx, by, bw, bh, label, acc, f, now, primary := 1) {
             b := SBrush(FA(Alpha(acc, Round(160*hv)), f))
             FillRR(x0 + bw/2 - uw/2, y0 + bh - 4, uw, 2, 1, b), DelB(b)
         }
-        tc := FA(Alpha(Mix(0xFFC7CBE0, 0xFFFFFFFF, hv), Round(200 + 55*hv)), f)
+        ; THMix, not Mix: TxtP draws what it is given, and a raw near-white is
+        ; invisible on the card once the light theme has turned it to paper
+        tc := FA(Alpha(THMix(0xFFC7CBE0, 0xFFFFFFFF, hv), Round(200 + 55*hv)), f)
     }
     TxtP(label, x0, y0 - 1 - (hubLowPerf ? 0 : 0.6*hv - 0.8*pr), bw, bh, fBadge, tc, fmtC)
     Pop(st)
@@ -33191,6 +36164,10 @@ HubOpen() {
     HL.m6h := 64          ; three lines, so it takes card 1's height and card
                           ; 1's rhythm rather than inventing a third one
     HL.m6y := HL.m5y + HL.mdh + HL.mdgap + HL.mdsep2
+    ; card 7 - LOGIN ITEMS, below DEVICE OPTIMIZATIONS: it starts and stops
+    ; other programs, which is the machine too
+    HL.m7h := HL.mdh
+    HL.m7y := HL.m6y + HL.m6h + HL.mdgap
     HL.ffrh := 26
     HL.ffrg := 40
     ; Client-settings rows carry a full sentence of description, which does not
@@ -33228,6 +36205,10 @@ HubOpen() {
     HL.doph  := DOP_SYSN*DOP_RG + 24
     HL.dopby := HL.aby + HL.doph + 12       ; the footer card
     HL.dopbh := 72
+    ; LOGIN ITEMS: four rows in view, the rest scroll; the footer card under it
+    HL.lgih  := LGI_TOP + LGI_VISN*LGI_RG + 10
+    HL.lgiby := HL.aby + HL.lgih + 12
+    HL.lgibh := 72
     HL.ffqy := HL.ffby + 34
     HL.ffly := HL.ffqy + 30
     HL.ffrows := 4
@@ -33290,6 +36271,7 @@ HubOpen() {
     ; dashboard chip and the hit test beside it.
     HL.vbw := Max(74, Round(MeasureW(ZVER, fBadge)) + 18)      ; fBadge badges (header, credits)
     HL.zvw := Max(52, Round(MeasureW(ZVER, HL.fS)) + 14)       ; the dashboard's small chip
+    HL.ubw := Round(MeasureW("CHECK FOR UPDATES", HL.fS)) + 24 ; the button beside it, same face
     HL.scr := [BuildScr("DASHBOARD", HL.fT), BuildScr("INTEGRATIONS", HL.fT), BuildScr("SCRIPT HUB", HL.fT)
         , BuildScr("SETTINGS", HL.fT), BuildScr("CREDITS", HL.fT), BuildScr("UPDATE LOGS", HL.fT)]
     HL.intro := A_TickCount, HL.closeAt := 0, HL.scrAt := A_TickCount
@@ -33310,7 +36292,10 @@ HubOpen() {
     ; self-update block for what each phase means
     HL.auT := hubAutoUpd ? 1.0 : 0.0, HL.auAt := 0
     HL.updPhase := 0, HL.updVer := "", HL.updMsg := "", HL.updTtl := "", HL.updAt := 0
-    HL.updFile := "", HL.updNew := "", HL.updPid := 0
+    HL.updFile := "", HL.updTmp := "", HL.updPid := 0
+    HL.updAuto := 0, HL.updPend := 0
+    HL.tileKey := "", HL.tileCap := []      ; the BEHAVIOUR captions, elided once per switch state
+    HL.gateCapKey := "", HL.gateCap := []   ; the gate card's two lines, likewise
     HL.pokeAt := A_TickCount
     HL.minT := 0.0, HL.minFrom := 0.0, HL.minTo := 0.0, HL.minStart := 0
     ; bx/by above centre the hub on the PRIMARY work area, which is normally
@@ -33468,6 +36453,25 @@ HubOpen() {
     ; AUTO UPDATE tile; the dashboard's CHECK FOR UPDATES; the update card's
     ; two buttons (primary UPDATE / CLOSE, secondary CANCEL)
     HL.hz.Push(58, 2001, 2002, 2003)
+    ; the DEVICE OPTIMIZATIONS card (405) was never registered here - the one
+    ; card in the rail with no hover - and the LOGIN ITEMS card is 406
+    HL.hz.Push(405, 406)
+    ; LOGIN ITEMS: eight rows, their two switches and their remove crosses,
+    ; the bar, the footer's three buttons and its master switch
+    loop 8
+        HL.hz.Push(2100 + A_Index, 2110 + A_Index, 2120 + A_Index, 2130 + A_Index)
+    HL.hz.Push(2140, 2141, 2142, 2143, 2144)
+    ; the flag rows' ON/OFF pips, the LOGS overlay's HISTORY chip, and the
+    ; RESTORE button on each of its visible rows
+    HL.hz.Push(511, 512, 513, 514, 515, 478)
+    loop FFM_HSROWS + 1
+        HL.hz.Push(619 + A_Index)
+    ; the community hero's click-to-skip, and each card's thumbnail's
+    HL.hz.Push(2010)
+    loop FFM_COMM_MAXC
+        HL.hz.Push(2020 + A_Index)
+    ; the tour's NEXT / BACK / SKIP, its spotlight, and the dashboard's TOUR button
+    HL.hz.Push(2200, 2201, 2202, 2204, 2207)
     HL.hz.Push(1600, 1601, 1602, 1603, 1604, 1606, 1607, 1699)
     ; one per visible database slot - a fixed band, see RSET_FXZDB
     loop RSET_DBSLOTS
@@ -33481,15 +36485,31 @@ HubOpen() {
     }
 
     OnMessage(0x84, HubHT), OnMessage(0x201, HubClick), OnMessage(0x202, HubBtnUp)
+    OnMessage(0x215, HubCapLost)               ; WM_CAPTURECHANGED: a drag cannot outlive its capture
     OnMessage(0x203, HubDblClick), OnMessage(0x204, HubRClick)
     OnMessage(0x200, HubMove), OnMessage(0x20, HubCursor), OnMessage(0x20A, HubWheel)
     hubLive := 1
     HubTim(TICK_A)
+    ; a compiled build's .old (see UpdReplace) is tried again here: at launch
+    ; the process that was renamed may not have finished exiting yet
+    if A_IsCompiled
+        try FileDelete(A_ScriptFullPath ".old")
+    ; AUTO UPDATE: the launch check, now that there is a hub for its card
+    if hubAutoUpd
+        UpdAutoStart()
 }
 HubNavY(i) => HL.sby + 6 + (i - 1)*HL.nvg
 HubZone(sx, sy) {
     if !hubLive || HL.closeAt
         return 0
+    if TUT.on {
+        ; the tour owns every zone but the window's own grip - see TutZone
+        k0 := HL.pw/HL.bw
+        tx := (sx - HL.px)/k0, ty := (sy - HL.py)/k0
+        if (tx >= HL.brx + 68 && tx <= HL.brx + 104 && ty >= HL.pd + 10 && ty <= HL.pd + 34)
+            return 2
+        return TutZone(tx, ty)
+    }
     k := HL.pw/HL.bw
     ux := (sx - HL.px)/k, uy := (sy - HL.py)/k
     ; ---- the opening gate, ahead of even the detail sheet ----
@@ -33615,10 +36635,14 @@ HubZone(sx, sy) {
     if (hubTab = 1 && ux >= x0 + HL.ctw - 182 && ux <= x0 + HL.ctw - 40
         && uy >= HL.cty - 3 && uy <= HL.cty + 21)
         return 205
+    ; TUTORIAL, beside it
+    if (hubTab = 1 && ux >= x0 + HL.ctw - 286 && ux <= x0 + HL.ctw - 190
+        && uy >= HL.cty - 3 && uy <= HL.cty + 21)
+        return 2207
     ; CHECK FOR UPDATES, in the header of the WHAT'S NEW card beside the
     ; version badge - the same rectangle the dashboard renderer draws it in
-    if (hubTab = 1 && ux >= x0 + (HL.ctw - 192) - 24 - HL.zvw - 150 && ux <= x0 + (HL.ctw - 192) - 24 - HL.zvw
-        && uy >= HL.ly + 10 && uy <= HL.ly + 30)
+    if (hubTab = 1 && ux >= x0 + (HL.ctw - 192) - 22 - HL.zvw - HL.ubw && ux <= x0 + (HL.ctw - 192) - 22 - HL.zvw
+        && uy >= HL.ly + 12 && uy <= HL.ly + 28)
         return 2001
     if hubTab = 2 {
         if FFM.view = "db" && FFM.viewT > 0.5
@@ -33636,6 +36660,11 @@ HubZone(sx, sy) {
             if zd
                 return zd
         }
+        if (hubMod = 7) {
+            zl := LGIZone(ux, uy)
+            if zl
+                return zl
+        }
         ; the rail scrolls, so the hit test reads the same offset the renderer
         ; folded into dy2 - and nothing outside the window is clickable
         msc := HL.mdscr
@@ -33652,6 +36681,8 @@ HubZone(sx, sy) {
             return 404
         if ux >= HL.mdx && ux <= HL.mdx + HL.mdw && uy >= HL.m6y - msc && uy <= HL.m6y - msc + HL.m6h
             return 405
+        if ux >= HL.mdx && ux <= HL.mdx + HL.mdw && uy >= HL.m7y - msc && uy <= HL.m7y - msc + HL.m7h
+            return 406
         }
         ; Fall through to the card catch-all (zone 8) on panel background.
         ; Returning FFMZone's 0 directly made those pixels HTTRANSPARENT, so
@@ -34082,13 +37113,23 @@ HubClick(wParam, lParam, msg, hwnd) {
         DOPClick(z)
         HubPoke()
     }
+    else if (z >= 2101 && z <= 2146) {
+        FFM.clickAt[z] := A_TickCount
+        LGIClick(z)
+        HubPoke()
+    }
+    else if (z >= 2200 && z <= 2207) {
+        FFM.clickAt[z] := A_TickCount
+        TutClick(z)
+        HubPoke()
+    }
     else if (z = 1220 || z = 1221) {
         FFM.clickAt[z] := A_TickCount
         HubCredWho(z = 1220 ? 1 : 2)
     }
     else if z = 11
         PuzToggleFromHub()
-    else if z >= 400 && z <= 405
+    else if z >= 400 && z <= 406
         ; card position -> hubMod id. The ids are NOT positional: FORSAKEN keeps
         ; id 2 so its systems panel, zones and toggles stay untouched by the
         ; CURSOR card being slotted in above it.
@@ -34206,11 +37247,20 @@ HubClick(wParam, lParam, msg, hwnd) {
     ; to reach them or they are hit-tested and hovered and then dropped.
     else if (z = 578) {
         if !FFMCommSyncing()
-            FFMCommSync()
+            FFMCommSync(1)
     }
+    ; the community reels' click-to-skip: the hero, then a card's thumbnail
+    else if (z = 2010)
+        FFMCommReelSkip()
+    else if (z >= 2021 && z <= 2020 + FFM_COMM_MAXC)
+        FFMCommThumbSkip(z - 2020)
+    ; 478 is the LOGS overlay's HISTORY chip and 620-630 its rows' RESTORE
+    ; buttons - both outside the ranges this gate used to pass through, which
+    ; is why the tab could be drawn and hovered but never opened
     else if (z >= 411 && z <= 440) || z = 446 || z = 447
-        || (z >= 450 && z <= 477) || (z >= 485 && z <= 498)
+        || (z >= 450 && z <= 478) || (z >= 485 && z <= 498)
         || (z >= 501 && z <= 545) || (z >= 601 && z <= 611)
+        || (z >= 620 && z <= 619 + FFM_HSROWS + 1)
         || (z > FFM_CMZ_INS && z <= FFM_CMZ_INS + FFM_COMM_MAXC*8)
         FFMClick(z)
     else if z >= 20 && z <= 25
@@ -34392,21 +37442,36 @@ HubClick(wParam, lParam, msg, hwnd) {
     HubPoke()
     return 0
 }
+; The capture went to another window (lParam) or nowhere: whatever was being
+; dragged is dropped where it is, through the same path a release takes.
+; Our own ReleaseCapture lands here too, with the state already cleared, and
+; falls straight out.
+HubCapLost(wParam, lParam, msg, hwnd) {
+    if (!hubLive || hwnd != HL.gui.Hwnd || lParam = HL.gui.Hwnd)
+        return
+    if (HL.drag || SH.msel || FFM.msel)
+        HubBtnUp(wParam, lParam, 0x202, hwnd)
+}
 HubBtnUp(wParam, lParam, msg, hwnd) {
     if !hubLive || (!HL.drag && !SH.msel && !FFM.msel)
         return
-    DllCall("ReleaseCapture")
+    ; The state is read and cleared BEFORE the capture is released:
+    ; ReleaseCapture posts WM_CAPTURECHANGED, HubCapLost answers it by coming
+    ; back here, and with the drag still armed that second pass would have run
+    ; the whole tail and stolen the click from the first.
     if FFM.msel
         FFM.msel := 0
     if SH.msel
         SH.msel := 0
     wasClick := (HL.drag = 1), z := HL.dragZone
     wasSlide := (HL.drag = 3 || HL.drag = 4)
-    if (HL.drag = 19)
-        try IniWrite(Round(PZ_SpeedT, 3), iniPath, "puzzle", "speed")
+    was19 := (HL.drag = 19)
     SPF.avDrag := 0
     HL.drag := 0, HL.dragZone := 0
     HL.dragOff := -1                             ; next drag samples a fresh grip
+    DllCall("ReleaseCapture")
+    if was19
+        try IniWrite(Round(PZ_SpeedT, 3), iniPath, "puzzle", "speed")
     if wasClick && z = 9
         HubMin(0.0)
     if wasSlide {
@@ -34478,6 +37543,17 @@ HubRClick(wParam, lParam, msg, hwnd) {
 HubMove(wParam, lParam, msg, hwnd) {
     if !hubLive || hwnd != HL.gui.Hwnd
         return
+    ; ---- a drag whose button is no longer down is over ----
+    ; The release is supposed to arrive as WM_LBUTTONUP through the capture.
+    ; Lose the capture - a window of this process activating, a system
+    ; cancel - and it never does: the drag stays armed, and the next move
+    ; over the window, seconds later and pixels away, throws the window to
+    ; the pointer. Both buttons checked, for a swapped-button mouse.
+    if ((HL.drag || SH.msel || FFM.msel)
+        && !GetKeyState("LButton", "P") && !GetKeyState("RButton", "P")) {
+        HubBtnUp(wParam, lParam, 0x202, hwnd)
+        return 0
+    }
     CursorXY(&x, &y)
     if SH.msel = 2 {
         if ScrFldIsLine() {
@@ -34501,6 +37577,11 @@ HubMove(wParam, lParam, msg, hwnd) {
         return 0
     }
     if !HL.drag {
+        ; motion over the card is pointer contact whether or not it is over a
+        ; zone - it keeps the hub off the deep tiers for HUB_DEEP_MS, so a
+        ; cursor drifting across blank card does not land on a 100 ms frame
+        if IsObject(HL)
+            HL.pokeAt := A_TickCount
         HubPoke()
         return
     }
@@ -34765,6 +37846,9 @@ HubWheel(wParam, lParam, msg, hwnd) {
             if (FFM.logTab = 2)
                 FFM.updScrT := Clamp(FFM.updScrT - (d/120)*3*FFM_UPRH, 0.0
                     , Max(0.0, FFM.upd.Length*FFM_UPRH - lhw))
+            else if (FFM.logTab = 3)
+                FFM.hsScrT := Clamp(FFM.hsScrT - (d/120)*3*FFM_HSRH, 0.0
+                    , Max(0.0, FFM.hist.Length*FFM_HSRH - lhw))
             else
                 FFM.logScrT := Clamp(FFM.logScrT - (d/120)*3*FFM_LGRH, 0.0
                     , Max(0.0, FFM.logs.Length*FFM_LGRH - lhw))
@@ -34784,6 +37868,11 @@ HubWheel(wParam, lParam, msg, hwnd) {
         if hubMod = 6 {
             DOP.scrT := Clamp(DOP.scrT - (d/120)*DOP_RG, 0.0
                 , Max(0.0, DOPTotal() - DOPVis()))
+            HubTim(TICK_A)
+            return 0
+        }
+        if hubMod = 7 {
+            LGI.scrT := Clamp(LGI.scrT - (d/120)*LGI_RG, 0.0, Max(0.0, LGITotal() - LGIVis()))
             HubTim(TICK_A)
             return 0
         }
@@ -35423,8 +38512,9 @@ HubTrueMinSet(v) {
         HL.tmAt := A_TickCount
     HubPoke()
 }
-; AUTO UPDATE. Nothing to apply live: the setting is read at the next launch,
-; and the tile's caption says so. The ring pulse is the acknowledgement.
+; AUTO UPDATE. Nothing to apply live: the check runs when the hub opens, so
+; the setting is read at the next launch, and the tile's caption says so. The
+; ring pulse is the acknowledgement.
 HubAutoUpdSet(v) {
     global hubAutoUpd
     hubAutoUpd := v ? 1 : 0
@@ -35616,6 +38706,9 @@ HubRender() {
     FFM.updScr += (FFM.updScrT - FFM.updScr)*EK(0.3)
     if Abs(FFM.updScr - FFM.updScrT) < 0.4
         FFM.updScr := FFM.updScrT
+    FFM.hsScr += (FFM.hsScrT - FFM.hsScr)*EK(0.3)
+    if Abs(FFM.hsScr - FFM.hsScrT) < 0.4
+        FFM.hsScr := FFM.hsScrT
     FFM.sysScr += (FFM.sysScrT - FFM.sysScr)*EK(0.3)
     if Abs(FFM.sysScr - FFM.sysScrT) < 0.4
         FFM.sysScr := FFM.sysScrT
@@ -35709,6 +38802,19 @@ HubRender() {
                 RSET.fxGone.Delete(gz)
                 RSetFxBump()
             }
+        }
+    }
+    ; a list scrolled to its end and then shortened - a delete, a row handed
+    ; back - was left holding a position past its new end, with the rows sat
+    ; high and empty space under them until the next wheel notch. Eased back
+    ; inside the range as the rows collapse, so the list heals in one motion.
+    if (RSET.fx && !RSET.db && RSET.fxScr > 0) {
+        fxMax := Max(0.0, RSetFxTotal() - RSetFxVis())
+        if (RSET.fxScr > fxMax) {
+            RSET.fxScr += (fxMax - RSET.fxScr)*EK(0.22)
+            if (RSET.fxScr - fxMax < 0.5)
+                RSET.fxScr := fxMax
+            RSET.fxScrT := RSET.fxScr
         }
     }
     ; And the placed-card pop / toggle flash. Those DO delete themselves - but
@@ -36908,6 +40014,11 @@ HubRender() {
     }
 
     FFMCtxDraw(now, hubCur)
+    ; the update check reports through files (see UpdPoll); read them here,
+    ; every frame, whether or not its card is up - the launch check has none
+    UpdPoll(now)
+    ; ---- the tour, over the interface and under the modal gate ----
+    TutDraw(now, hubCur)
     ; ---- the opening gate, over EVERYTHING ----
     ; After the context menu and the footer, because anything drawn later would
     ; sit on top of a sheet that is meant to be modal - the mistake the clash
@@ -37056,6 +40167,10 @@ HubRender() {
         || (credWhoAt && now - credWhoAt < FFM_TABMS + 60)
         || (DOP.busy != "") || (DOP.flashLast && now - DOP.flashLast < 600)
         || (hubTab = 2 && hubMod = 6 && (DOP.msgAt && now - DOP.msgAt < 6200))
+        || TUT.on
+        || (hubTab = 2 && hubMod = 7 && ((LGI.msgAt && now - LGI.msgAt < 6200)
+            || (LGI.animAt && now - LGI.animAt < 800) || Abs(LGI.scr - LGI.scrT) > 0.4
+            || LGI.pickPid || (LGI.actAt && now - LGI.actAt < 1200)))
         || (HL.profOpen ? HL.profT < 0.996 : HL.profT > 0.004) || (HL.bioOpen ? HL.bioT < 0.996 : HL.bioT > 0.004)
         || (SH.libOpen ? HL.libT < 0.996 : HL.libT > 0.004) || (SH.expOpen ? HL.expT < 0.996 : HL.expT > 0.004)
         || (hubTab = 3 && Abs(HL.tabU - SH.cur) > 0.01)
@@ -37115,8 +40230,8 @@ HubRender() {
     ; braces: a frame that somehow ran during a solve stops the timer itself.
     if PZ_solving
         HubTim(0)
-    else if (!busy && spfFps && WinActive("ahk_exe RobloxPlayerBeta.exe"))
-        HubTim(TICK_G)
+    else if (deep && spfFps && WinActive("ahk_exe RobloxPlayerBeta.exe"))
+        HubTim(TICK_G)                        ; see TICK_G: from deep idle only
     else
         HubTim(busy ? TICK_A : (deep ? TICK_Z : TICK_S))
     return
@@ -37165,6 +40280,7 @@ HubRender() {
         if (tab = 1) {
             rbxOn := FFM.rbx
             HubLaunchBtn(x0 + HL.ctw - 182, y0 - 3, 142, 24, f, now, hubCur, rbxOn)
+            HubTourBtn(x0 + HL.ctw - 182 - 8 - 96, y0 - 3, 96, 24, f, now, hubCur)
         }
         Txt("0" tab, x0 + HL.ctw - 30, y0 - 2, 30, 18, fBadge, FA(Alpha(hubCur, 80), f), fmtR)
         FadeLine(x0, x0 + HL.ctw, y0 + 26, 0x24FFFFFF, f)
@@ -37264,9 +40380,14 @@ HubRender() {
             ; Beside the version badge, in the header, because the badge is the
             ; thing it asks about - and because the footer could not hold it:
             ; seven changelog rows run to 21 px above the card's floor, and a
-            ; button there sat on the seventh. It answers on the gate card,
-            ; see UpdCheckStart. HubZone tests this same rectangle.
-            FFMBtn(2001, zvx - 12 - 150, ly + 10, 150, 20, "CHECK FOR UPDATES", hubCur, f, 0)
+            ; button there sat on the seventh. Chip-sized, on the chip's face,
+            ; on the chip's line: the header band is 33 px with its rule at
+            ; the foot, and a 20 px button in it sat 3 px off that rule and
+            ; outweighed everything else in the row. At the badge's height and
+            ; typeface it is one of two chips, and it keeps the badge's 5 px.
+            ; It answers on the gate card, see UpdCheckStart. HubZone tests
+            ; this same rectangle.
+            FFMBtn(2001, zvx - 10 - HL.ubw, ly + 12, HL.ubw, 16, "CHECK FOR UPDATES", hubCur, f, 0, HL.fS)
             FadeLine(x0 + 12, x0 + colw - 12, ly + 33, 0x16FFFFFF, f)
             nrows := Min(7, CHANGELOG.Length)
             loop nrows {
@@ -37354,6 +40475,10 @@ HubRender() {
                 SPFViewClose()
             if hubMod = 6 || (hubMod = 0 && FFM.lastMod = 6 && HL.modT > 0.003) {
                 DOPSystems(ax2, ay2, x0, y0, dx, dy2, f, now, hubCur)
+                return
+            }
+            if hubMod = 7 || (hubMod = 0 && FFM.lastMod = 7 && HL.modT > 0.003) {
+                LGISystems(ax2, ay2, x0, y0, dx, dy2, f, now, hubCur)
                 return
             }
             if hubMod = 5 || (hubMod = 0 && FFM.lastMod = 5 && HL.modT > 0.003) {
@@ -39008,7 +42133,16 @@ HubRender() {
                   , l2: hubTrueMin ? "reopen from the tray" : "a pill stays on screen"}
                  , {z: 58, t: "AUTO UPDATE", on: hubAutoUpd, e: HL.auT, at: HL.auAt
                   , l1: hubAutoUpd ? "checks at launch" : "manual only"
-                  , l2: hubAutoUpd ? "installs newer builds" : "dashboard check only"}]
+                  , l2: hubAutoUpd ? "asks before installing" : "dashboard check only"}]
+            ; The captions only change when a switch does, and FFMElide is a
+            ; text measure - eight of them a frame is small and pointless, so
+            ; they are rebuilt on a change of state and read back otherwise.
+            tk := hubLowPerf "|" hubTop "|" hubTrueMin "|" hubAutoUpd
+            if (HL.tileKey != tk) {
+                HL.tileKey := tk, HL.tileCap := []
+                for it7 in bT
+                    HL.tileCap.Push([FFMElide(it7.l1, HL.fXs, HL.setw - 28), FFMElide(it7.l2, HL.fXs, HL.setw - 28)])
+            }
             loop 4 {
                 k7 := A_Index
                 it7 := bT[k7]
@@ -39039,11 +42173,11 @@ HubRender() {
                 ; state and what it means - each line its own step down
                 Txt(it7.t, tx0 + 14, ty0 + 37, HL.setw - 28, 16, fBadge
                   , FA(Alpha(Mix(0xFFE8EAF6, hubCur, 0.18), 235), f), fmtL)
-                Txt(FFMElide(it7.l1, HL.fXs, HL.setw - 28), tx0 + 14, ty0 + 55
+                Txt(HL.tileCap[k7][1], tx0 + 14, ty0 + 55
                   , HL.setw - 28, 13, HL.fXs
                   , FA(Alpha(it7.on ? Mix(0xFFE8EAF6, C_ON, 0.35) : 0xFFC7CBE0
                            , it7.on ? 225 : 150), f), fmtL)
-                Txt(FFMElide(it7.l2, HL.fXs, HL.setw - 28), tx0 + 14, ty0 + 67
+                Txt(HL.tileCap[k7][2], tx0 + 14, ty0 + 67
                   , HL.setw - 28, 12, HL.fXs, FA(0x66C7CBE0, f), fmtL)
                 if (it7.at && now - it7.at < 620) {
                     e7 := Ease3((now - it7.at)/620.0)
@@ -41180,12 +44314,24 @@ ScrRetok() {
 }
 
 ; ================= password gate =================
-PasswordGate() {
-    global G
-    ; MOON is gone - keys come from the server now, see KeyOk. gPend holds a
-    ; submission made before the list arrived.
-    gPend := ""
-    gBuf := "", gPasteAt := 0
+; ---- the launch gate ----
+; The password gate's card - the hero, the reel, the grip, the clock, the
+; standby readout - with the well and everything that fed it taken out and
+; two buttons in its place: OPEN ROBLOX, which starts the client and then the
+; hub, and OPEN HUB, which starts the hub alone. It shows after the loading
+; screen, so by the time it is up there is nothing left to wait for. No
+; InputHook: nothing is typed, and Enter / Escape arrive as WM_KEYDOWN because
+; the card is an active window. Returns once the card has left; the choice is
+; in gateChoice.
+LaunchGate() {
+    global G, gateChoice
+    gateChoice := ""
+    gPressAt := 0, gPressZ := 0           ; which button was pressed, and when - the ring and the fade read them
+    gMvX := 0, gMvY := 0, gMvAt := 0       ; the last drag sample, for the jump check in GMove
+    gRbx := 0, gRbxAt := 0                ; 2 = client running, 1 = installed, 0 = not found; polled by GRender
+    gSets := 0
+    for ent in FFM_COMM
+        gSets += ent.sets.Length
 
     CW2 := 560, CH2 := 312, PD := 26
     BW2 := CW2 + PD*2, BH2 := CH2 + PD*2
@@ -41196,8 +44342,10 @@ PasswordGate() {
     hpx := cx + 24, hpy := cy + 24, hpw := 170, hph := CH2 - 48
     ; right column origin
     rx := cx + 208
-    ; password well
-    fx := rx, fy := cy + 148, fw := CW2 - 208 - 26, fh := 44
+    ; the two buttons, in the band the password well used to fill
+    fx := rx, fy := cy + 144, fw := CW2 - 208 - 26, fh := 40
+    fy2 := fy + fh + 8, fh2 := 34         ; the second row: OPEN HUB and ACCOUNTS, side by side
+    bw1 := (fw - 10)/2                    ; each of the two; 10 between them
     ; thumbnail carousel strip (bottom of right column)
     thR := 12, thGap := 30, thY := cy + CH2 - 34, thX0 := rx + thR
     ; The rotation, not the whole pool: pictures the user took out of the
@@ -41225,10 +44373,20 @@ PasswordGate() {
     fGateT := NewFont(22, 1)         ; big LOCKED / GRANTED
     fGateS := NewFont(9, 1)          ; hero name line / counter
     fGateC := NewFont(7.5, 1)        ; hero caption micro-line
-    scrLock := BuildScr("LOCKED", fGateT), scrGrant := BuildScr("GRANTED", fGateT)
+    scrReady := BuildScr("READY", fGateT)
+    scrRbx := BuildScr("LAUNCHING", fGateT), scrHub := BuildScr("OPENING", fGateT)
 
-    gw := Gui("-Caption +E0x80000 +E0x8000000 +AlwaysOnTop +ToolWindow -DPIScale", "YURIGATE")
+    ; ---- a window that can hold the keyboard ----
+    ; Not WS_EX_NOACTIVATE like the overlays: the gate is the thing on screen,
+    ; it takes real focus (WinActivate below), and Enter and Escape reach it as
+    ; ordinary key messages. There is no hook and nothing to type.
+    gw := Gui("-Caption +E0x80000 +AlwaysOnTop +ToolWindow -DPIScale", "YURIGATE")
+    ; an active window can be Alt+F4'd. A Gui's default answer to that is to
+    ; hide itself, which would leave the wait loop below spinning on a card
+    ; nobody can see - so it closes the gate the way Escape does
+    gw.OnEvent("Close", GCloseEv)
     gw.Show("NA x0 y0 w" GWp " h" GHp)
+    try WinActivate("ahk_id " gw.Hwnd)
     MonitorGetWorkArea(MonitorGetPrimary(), &mL, &mT, &mR, &mB)
     gbx := mL + ((mR - mL) - GWp)//2
     gby := mT + ((mB - mT) - GHp)//2
@@ -41236,12 +44394,11 @@ PasswordGate() {
 
     gIntro := A_TickCount
     gOkAt := 0, gCloseAt := 0, gDenyAt := 0, gShakeAt := 0, gKeyAt := 0
-    gPrevLen := 0, gDone := 0, gDrag := 0, gh2 := 0.0, ghE := 0.0, gTries := 0
+    gPrevLen := 0, gDone := 0, gDrag := 0, gh2 := 0.0, ghE := 0.0, gbE := 0.0, gaE := 0.0
     gHovAv := 0.0
     grX := 0, grY := 0, grBX := 0, grBY := 0
-    gFoc := 1, gFcE := 1.0, gFocusAt := 0, gLBPrev := 0
+    gLBPrev := 0
     gDragT := 0.0, gTilt := 0.0, gPrevGBX := gbx
-    gCapsPrev := 0, gCapsE := 0.0, gCapsAt := 0
     gHndE := 0.0
     ; NOTE: selCur/selNext/selFadeAt are LOCAL here. PasswordGate assigns them
     ; without a global declaration, and AHK v2 makes a name local throughout a
@@ -41259,26 +44416,9 @@ PasswordGate() {
     selQ := 0
     ringW := Map()
 
-    ; ---- the buffer is gBuf, not ih.Input ----
-    ; InputHook only ever sees KEYSTROKES, so Ctrl+V produced nothing to read -
-    ; there was no way to paste a key, which for a 32-character hex string is
-    ; the way anyone would actually enter it.
-    ;
-    ; Characters are collected through OnChar into a buffer this code owns, and
-    ; backspace is taken off the hook (BackspaceIsUndo) and handled here, so
-    ; typed text and pasted text live in the same place and behave the same.
-    ; L64 is gone with it: that ENDED the input at 64 characters, and the cap
-    ; belongs in GChar now, where it can apply to a paste as well.
-    ih := InputHook("", "{Enter}{NumpadEnter}{Escape}")
-    ih.BackspaceIsUndo := false
-    ih.OnChar := GChar
-    ih.OnKeyDown := GKey
-    ih.KeyOpt("{Backspace}{vk56}{vk2D}", "N")     ; V and Insert, for the paste chords
-    ih.OnEnd := GEnd
-    ih.Start()
-
     OnMessage(0x84, GHT), OnMessage(0x201, GClick), OnMessage(0x202, GUp)
-    OnMessage(0x200, GMove), OnMessage(0x20, GCur)
+    OnMessage(0x200, GMove), OnMessage(0x20, GCur), OnMessage(0x100, GKeyDown)
+    OnMessage(0x215, GCapLost)
     SetTimer(GRender, TICK_A)
     while !gDone
         Sleep 25
@@ -41289,10 +44429,16 @@ PasswordGate() {
         ux := (sx - gpx)/k, uy := (sy - gpy)/k
         if (ux - bcxU)**2 + (uy - btyU)**2 <= 81
             return 2
-        if ux >= fx + fw - 66 && ux <= fx + fw - 8 && uy >= fy + 8 && uy <= fy + 36 && gFoc && StrLen(gBuf) > 0
-            return 3
-        if ux >= fx && ux <= fx + fw && uy >= fy && uy <= fy + fh
-            return 7
+        if (!gOkAt && !gCloseAt) {
+            if (uy >= fy && uy <= fy + fh && ux >= fx && ux <= fx + fw)
+                return 7                            ; OPEN ROBLOX, the whole first row
+            if (uy >= fy2 && uy <= fy2 + fh2) {
+                if (ux >= fx && ux <= fx + bw1)
+                    return 3                        ; OPEN HUB
+                if (ux >= fx + bw1 + 10 && ux <= fx + fw)
+                    return 8                        ; ACCOUNTS
+            }
+        }
         if gN > 1 {
             loop thShow {
                 txc := thX0 + (A_Index - 1)*thGap
@@ -41319,29 +44465,174 @@ PasswordGate() {
         return GZone(x, y) ? 1 : -1
     }
     GClick(wParam, lParam, msg, hwnd) {
+        global gateDrag
         if hwnd != gw.Hwnd
             return
         CursorXY(&x, &y)
         z := GZone(x, y)
         if z = 2
             GClose()
-        else if z = 3
-            GSubmit()
         else if z = 7
-            GFocus()                                ; the type bar is the only focus target
-        else if z = 6 {
-            GBlur()
+            GGo("roblox", 7)
+        else if z = 3
+            GGo("hub", 3)
+        else if z = 8
+            GGo("acct", 8)
+        else if z = 6
             GSelSwitch(gBase + Mod(selCur - gBase, gN) + 1)   ; hero → next gate image
-        } else if z >= 10 {
-            GBlur()
+        else if z >= 10
             GSelSwitch(gBase + z - 9)               ; thumbnail → that gate image
-        } else if z = 5 {
-            GBlur()
-            gDrag := 1, grX := x, grY := y, grBX := gbx, grBY := gby
+        else if z = 5 {
+            gDrag := 1, gateDrag := 1, grX := x, grY := y, grBX := gbx, grBY := gby
+            gMvX := x, gMvY := y, gMvAt := A_TickCount
             DllCall("SetCapture", "ptr", gw.Hwnd)
-        } else if z = 4
-            GBlur()                                 ; blank card area → stop typing
+        }
         return 0
+    }
+    ; ---- the choice ----
+    ; Both buttons end the same way the right key used to: the card says what
+    ; it is doing, celebrates for half a second and folds away, and the caller
+    ; reads gateChoice. Nothing can be pressed twice - the zones close with
+    ; gOkAt.
+    GGo(which, z) {
+        global gateChoice
+        if gOkAt || gCloseAt || gDone
+            return
+        gateChoice := which
+        gPressAt := A_TickCount, gPressZ := z
+        gOkAt := A_TickCount
+    }
+    ; Enter is OPEN HUB - the quiet default - and Escape closes, as it always
+    ; did. The card holds the focus, so these are plain key messages.
+    GKeyDown(wParam, lParam, msg, hwnd) {
+        if hwnd != gw.Hwnd
+            return
+        if (wParam = 13)
+            GGo("hub", 3)
+        else if (wParam = 27)
+            GClose()
+        return 0
+    }
+    ; ---- the card's button ----
+    ; The hub gate card's button (HubGateBtnDraw), re-drawn here because that
+    ; one reads the hub's hover map and click clock and this card has its own.
+    ; primary = 1 is the accent-filled offer, 0 the ghost beside it.
+    GBtn(z, bx, by, bw, bh, label, primary, hv, pr, a, now, acc, glyph := "") {
+        lift := -2.0*hv + 2.4*pr
+        st := PushXform(bx + bw/2, by + bh/2 + lift, 1 - 0.025*pr, 0)
+        x0 := bx, y0 := by + lift
+        brth := (Sin(DecT(now)*0.0021) + 1)/2
+        if (pr > 0.01) {
+            ; the ring the press throws off - outward and fading
+            rp := 1 - pr
+            gr := 6 + 26*Ease3(rp)
+            pn := Pen(FA(Alpha(AccHi(acc, 0.45), Round(150*pr)), a), 1.6*pr + 0.4)
+            StrokeRR(x0 - gr, y0 - gr, bw + gr*2, bh + gr*2, 10 + gr, pn), DelP(pn)
+        }
+        if primary {
+            ; lit all the time, not only under the pointer: this is the offer
+            SoftGlow(x0 + bw/2, y0 + bh/2, bw*0.72, bh*1.25, acc, Round((70 + 30*brth + 60*hv)*a), 1.0, 6)
+            if (hv > 0.01) {
+                b := SBrush(FA(Alpha(AccHi(acc, 0.4), Round(34*hv)), a))
+                FillRR(x0 - 6, y0 - 5, bw + 12, bh + 10, 14, b), DelB(b)
+            }
+            ShadowDraw(x0, y0 + 2, bw, bh, 10, 4, 26, 14, a*(0.55 + 0.45*hv), 1.0)
+            b := VBrush(x0, y0, bw, bh, FA(Alpha(AccHi(acc, 0.5), Round(198 + 40*hv)), a)
+                                      , FA(Alpha(acc, Round(140 + 40*hv)), a))
+            FillRR(x0, y0, bw, bh, 10, b), DelB(b)
+            b := VBrush(x0 + 6, y0 + 1, bw - 12, bh*0.42, FA(Alpha(0xFFFFFF, Round(52 + 26*hv)), a)
+                                                        , FA(Alpha(0xFFFFFF, 0), a))
+            FillRR(x0 + 6, y0 + 1, bw - 12, bh*0.42, 8, b), DelB(b)
+            ; a sheen crosses on its own every few seconds, and rides the
+            ; pointer when there is one
+            shp := (hv > 0.02 && hv < 0.995) ? hv : Mod(DecT(now), 3400)/3400.0
+            shA := (hv > 0.02 && hv < 0.995) ? 46*Sin(hv*3.14159) : 26*Max(0.0, Sin(shp*3.14159))
+            if (shA > 0.5) {
+                sx2 := x0 - 30 + (bw + 60)*shp
+                pth := RRPath(x0, y0, bw, bh, 10)
+                stS := PushG()
+                DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pth, "int", 1)
+                b := HBrush(sx2 - 16, y0, 32, bh, FA(Alpha(0xFFFFFF, 0), a)
+                                                , FA(Alpha(0xFFFFFF, Round(shA)), a))
+                FillRR(sx2 - 16, y0, 32, bh, 0, b), DelB(b)
+                Pop(stS)
+                DllCall("gdiplus\GdipDeletePath", "ptr", pth)
+            }
+            pn := Pen(FA(Alpha(AccHi(acc, 0.6), Round(215 + 40*hv)), a), 1.3)
+            StrokeRR(x0, y0, bw, bh, 10, pn), DelP(pn)
+            tc := FA(0xFFFFFFFF, a)
+            gc := FA(0xFFFFFFFF, a)
+        } else {
+            ; the ghost, lit: an accent-tinted body and a border that can be
+            ; seen, so it reads as a second door and not a disabled one
+            if (hv > 0.01) {
+                b := SBrush(FA(Alpha(acc, Round(22*hv)), a))
+                FillRR(x0 - 4, y0 - 3, bw + 8, bh + 6, 12, b), DelB(b)
+            }
+            b := VBrush(x0, y0, bw, bh, FA(Alpha(acc, Round(40 + 26*hv)), a)
+                                      , FA(Alpha(acc, Round(16 + 14*hv)), a))
+            FillRR(x0, y0, bw, bh, 10, b), DelB(b)
+            b := VBrush(x0 + 6, y0 + 1, bw - 12, bh*0.4, FA(Alpha(0xFFFFFF, Round(16 + 14*hv)), a)
+                                                       , FA(Alpha(0xFFFFFF, 0), a))
+            FillRR(x0 + 6, y0 + 1, bw - 12, bh*0.4, 8, b), DelB(b)
+            pn := Pen(FA(Alpha(AccHi(acc, 0.3), Round(150 + 90*hv)), a), 1.2)
+            StrokeRR(x0, y0, bw, bh, 10, pn), DelP(pn)
+            if (hv > 0.02) {
+                uw := (bw - 24)*Ease3(hv)
+                b := SBrush(FA(Alpha(AccHi(acc, 0.5), Round(200*hv)), a))
+                FillRR(x0 + bw/2 - uw/2, y0 + bh - 4, uw, 2, 1, b), DelB(b)
+            }
+            tc := FA(Alpha(THMix(0xFFE8EAF6, 0xFFFFFFFF, hv), Round(225 + 30*hv)), a)
+            gc := FA(Alpha(AccHi(acc, 0.55), Round(230 + 25*hv)), a)
+        }
+        ; ---- glyph and label, centred as one ----
+        lw := MeasureW(label, fBadge)
+        gw2 := (glyph != "") ? 20 : 0
+        tx0 := x0 + (bw - lw - gw2)/2
+        gcx := tx0 + 7, gcy := y0 + bh/2 - (0.6*hv - 0.8*pr)
+        if (glyph = "dart") {
+            ; the launch dart the dashboard's LAUNCH wears, in flight on hover
+            HubDart(gcx + 1.5*hv, gcy, 6.2, gc)
+        } else if (glyph = "acct") {
+            ; two people: a head and shoulders, and a second behind - the
+            ; account manager's own mark
+            b := SBrush(gc)
+            FillEll(gcx - 5.5, gcy - 6.5, 6, 6, b)
+            FillRR(gcx - 8.5, gcy + 0.5, 12, 6, 3, b), DelB(b)
+            pn := Pen(gc, 1.3)
+            Ell(gcx + 2, gcy - 5.5, 5, 5, pn)
+            Arc(gcx - 1, gcy + 0.5, 11, 9, 200, 140, pn), DelP(pn)
+        } else if (glyph = "hub") {
+            ; the hub: four cells, the top-left lit - the dashboard tile
+            pn := Pen(gc, 1.5)
+            loop 4 {
+                k := A_Index - 1
+                qx := gcx - 6 + Mod(k, 2)*7, qy := gcy - 6 + (k // 2)*7
+                if (k = 0) {
+                    b := SBrush(gc)
+                    FillRR(qx, qy, 5, 5, 1.5, b), DelB(b)
+                } else
+                    StrokeRR(qx, qy, 5, 5, 1.5, pn)
+            }
+            DelP(pn)
+        }
+        TxtP(label, tx0 + gw2, y0 - 1 - (0.6*hv - 0.8*pr), lw + 6, bh, fBadge, tc, fmtL)
+        Pop(st)
+    }
+    ; ---- a chip in the readout row ----
+    ; value in the badge face, its label small beside it; returns the x it
+    ; ended at so the row lays itself out
+    GChip(x, y, val, label, col, a) {
+        vs := String(val)
+        vw2 := MeasureW(vs, fBadge), lw2 := MeasureW(label, fGateC)
+        cw := 10 + vw2 + 6 + lw2 + 10
+        b := VBrush(x, y, cw, 17, FA(Alpha(col, 46), a), FA(Alpha(col, 22), a))
+        FillRR(x, y, cw, 17, 8.5, b), DelB(b)
+        pn := Pen(FA(Alpha(col, 120), a), 1)
+        StrokeRR(x, y, cw, 17, 8.5, pn), DelP(pn)
+        Txt(vs, x + 10, y, vw2 + 4, 17, fBadge, FA(Alpha(AccHi(col, 0.35), 240), a), fmtL)
+        Txt(label, x + 10 + vw2 + 6, y + 1, lw2 + 4, 16, fGateC, FA(Alpha(0xFFC7CBE0, 170), a), fmtL)
+        return x + cw
     }
     GSelSwitch(idx) {
         selCycleAt := A_TickCount                   ; user touched it -> restart auto timer
@@ -41367,30 +44658,44 @@ PasswordGate() {
         selQ := 0
         selNext := idx, selFadeAt := A_TickCount
     }
-    GFocus() {
-        if gFoc || gOkAt || gCloseAt || gDone
-            return
-        gFoc := 1, gFocusAt := A_TickCount, gPrevLen := 0
-        gBuf := ""                                  ; fresh buffer on refocus
-        try ih.Start()
-    }
-    GBlur() {
-        if !gFoc || gOkAt || gCloseAt
-            return
-        gFoc := 0, gFocusAt := A_TickCount, gPrevLen := 0
-        try ih.Stop()                               ; release the keyboard to other apps
-    }
     GUp(wParam, lParam, msg, hwnd) {
+        global gateDrag
         if !gDrag
             return
+        gDrag := 0, gateDrag := 0                   ; cleared first - see HubBtnUp
         DllCall("ReleaseCapture")
-        gDrag := 0
         return 0
     }
+    GCapLost(wParam, lParam, msg, hwnd) {
+        global gateDrag
+        if (hwnd = gw.Hwnd && gDrag && lParam != gw.Hwnd)
+            gDrag := 0, gateDrag := 0               ; the capture left: the drag is over where it stands
+    }
     GMove(wParam, lParam, msg, hwnd) {
+        global gateDrag
         if hwnd != gw.Hwnd || !gDrag
             return
-        CursorXY(&x, &y)
+        ; a drag whose button is up is over - see HubMove
+        if (!GetKeyState("LButton", "P") && !GetKeyState("RButton", "P")) {
+            gDrag := 0, gateDrag := 0
+            DllCall("ReleaseCapture")
+            return 0
+        }
+        if !CursorXY(&x, &y)
+            return 0                                ; no read, no move - see CursorXY
+        ; ---- a jump no mouse makes ----
+        ; Between two consecutive move messages a pointer covers tens of
+        ; pixels, a few hundred at most; only a stalled queue draining makes a
+        ; large one, and a stall shows as a gap in time. A sample that would
+        ; throw the window most of a screen with no gap before it is not the
+        ; pointer - it is dropped and the anchor re-taken from the next one.
+        now_ := A_TickCount
+        if (gMvAt && Abs(x - gMvX) > 500 && now_ - gMvAt < 120) {
+            gMvAt := 0
+            grX := x, grY := y, grBX := gbx, grBY := gby
+            return 0
+        }
+        gMvX := x, gMvY := y, gMvAt := now_
         gbx := grBX + (x - grX), gby := grBY + (y - grY)
         ; The handle rule - see HandleBounds. The gate has no collapsed state, so
         ; there is only the one handle (zone 5, the 6-dot grip). It is also the
@@ -41413,88 +44718,17 @@ PasswordGate() {
         if gCloseAt || gOkAt
             return
         gCloseAt := A_TickCount
-        try ih.Stop()
     }
-    GSubmit() {
-        if gCloseAt || gOkAt || gDone || !gFoc
-            return
-        p := gBuf
-        if p = "" {
-            try ih.Start()
-            return
-        }
-        ; ---- do not reject what has not been checked ----
-        ; The list may still be in flight. Failing the key here would be a lie
-        ; and would burn a try, so the submission is HELD and GRender judges it
-        ; the moment an answer lands.
-        if (!KeyOk(p) && !KeyFetchPoll()) {
-            gPend := p
-            try ih.Stop()
-            return
-        }
-        GJudge(p)
-    }
-    GChar(hook, ch) {
-        ; Ctrl chords translate to control codes - Ctrl+V is 0x16 - and those
-        ; are not text. Enter and Backspace arrive here as 0x0D and 0x08 too.
-        if (Ord(ch) < 32)
-            return
-        if (StrLen(gBuf) < 64)
-            gBuf .= ch
-    }
-    GKey(hook, vk, sc) {
-        ctlG := GetKeyState("Control", "P")
-        shfG := GetKeyState("Shift", "P")
-        if (vk = 8) {
-            gBuf := ctlG ? "" : SubStr(gBuf, 1, -1)   ; ctrl+backspace clears it
-            return
-        }
-        ; Both chords, because half of Windows uses the other one.
-        if ((vk = 86 && ctlG) || (vk = 45 && shfG))
-            GPaste()
-    }
-    GPaste() {
-        c := ""
-        try c := A_Clipboard
-        ; A key copied out of a chat message, a file or a browser arrives with
-        ; its line break and usually some surrounding space. None of that is
-        ; part of the key, and leaving it in makes a correct paste fail.
-        c := RegExReplace(c, "[\r\n\t ]", "")
-        if (c = "")
-            return
-        gBuf := SubStr(gBuf . c, 1, 64)
-        gPasteAt := A_TickCount
-    }
-    GJudge(p) {
-        if KeyOk(p) {
-            gOkAt := A_TickCount
-            try ih.Stop()
-            return
-        }
-        gTries += 1
-        gShakeAt := A_TickCount, gDenyAt := gShakeAt, gPrevLen := 0
-        gBuf := ""
-        try ih.Stop()
-        ih.Start()
-    }
-    GEnd(hook) {
-        if gCloseAt || gOkAt || gDone
-            return
-        if hook.EndReason != "EndKey"
-            return
-        if hook.EndKey = "Escape" {
-            GClose()
-            return
-        }
-        GSubmit()
+    GCloseEv(*) {
+        GClose()
+        return 0                                    ; the card fades out on its own; do not hide it here
     }
     GFinish() {
         global G
         SetTimer(GRender, 0)
-        try ih.Stop()
         OnMessage(0x84, GHT, 0), OnMessage(0x201, GClick, 0)
         OnMessage(0x202, GUp, 0), OnMessage(0x200, GMove, 0)
-        OnMessage(0x20, GCur, 0)
+        OnMessage(0x20, GCur, 0), OnMessage(0x100, GKeyDown, 0), OnMessage(0x215, GCapLost, 0)
         DllCall("gdiplus\GdipDeleteFont", "ptr", fGateT)
         DllCall("gdiplus\GdipDeleteFont", "ptr", fGateS)
         DllCall("gdiplus\GdipDeleteFont", "ptr", fGateC)
@@ -41506,7 +44740,9 @@ PasswordGate() {
         gDone := 1
     }
     GRender() {
+        global gateDrag
         now := A_TickCount
+        BrushCacheTick(), PenCacheTick()          ; bounded, like every other renderer - this one never asked
         ThemeTick()
         it := Min((now - gIntro)/INTRO_MS, 1.0)
         ei := 1 - (1 - it)**3
@@ -41553,23 +44789,34 @@ PasswordGate() {
         if !gOkAt && !gCloseAt
             scl *= 1 + 0.004*Sin(DecT(now)*0.0012)      ; idle breathing
         scl *= 1 + 0.02*gDragT                    ; drag lift
-        lb := GetKeyState("LButton", "P")
-        if lb && !gLBPrev && !gDrag && !gOkAt && !gCloseAt && GZoneCursor() = 0
-            GBlur()                                 ; clicked outside the card → release keyboard
-        gLBPrev := lb
         gDragT += ((gDrag ? 1.0 : 0.0) - gDragT)*EK(0.2)
         if gDragT < 0.004 && !gDrag
             gDragT := 0.0
+        ; ---- the drag, from the loop ----
+        ; Moving the card used to depend on WM_MOUSEMOVE reaching this window,
+        ; and that delivery is not a given: a window that is not the
+        ; foreground gets only the mouse events whose hot spot is over its
+        ; visible pixels even after SetCapture, so a pointer that crosses a
+        ; transparent margin or outruns the card for a frame leaves the card
+        ; behind, and the next event that does arrive throws it to wherever the
+        ; pointer is by then. The hub never shows it because its window is
+        ; never activated and never asks; this one was activated once, on
+        ; creation, and lost the foreground at some point after. So the loop
+        ; reads the pointer itself, every frame, and places the card from the
+        ; anchors - the same sum GMove does - and ends the drag when no button
+        ; is down. Messages still arrive; they now agree with the loop.
+        if gDrag {
+            if (!GetKeyState("LButton", "P") && !GetKeyState("RButton", "P")) {
+                gDrag := 0, gateDrag := 0
+                DllCall("ReleaseCapture")
+            } else if CursorXY(&dxq, &dyq) {
+                gbx := grBX + (dxq - grX), gby := grBY + (dyq - grY)
+                HandleBounds(rx + 62, cy + 10, rx + 98, cy + 34, GWp/BW2, &lox, &hix, &loy, &hiy)
+                gbx := Clamp(gbx, lox, hix), gby := Clamp(gby, loy, hiy)
+            }
+        }
         velX := gbx - gPrevGBX, gPrevGBX := gbx
         gTilt += ((gDrag ? Clamp(velX*0.22, -3.0, 3.0) : 0.0) - gTilt)*EK(0.18)
-        gFcE += ((gFoc ? 1.0 : 0.0) - gFcE)*EK(0.15)
-        cpn := (!gOkAt && !gCloseAt && GetKeyState("CapsLock", "T")) ? 1 : 0
-        if cpn && !gCapsPrev
-            gCapsAt := now
-        gCapsPrev := cpn
-        gCapsE += (cpn - gCapsE)*EK(0.18)
-        if gCapsE < 0.004 && !cpn
-            gCapsE := 0.0
         hz := (gDrag || gCloseAt || gOkAt) ? 0 : GZoneCursor()
         hzT := hz >= 10 ? hz - 9 : 0
         gHndE += (((hz = 5) ? 1.0 : 0.0) - gHndE)*EK(0.2)
@@ -41581,12 +44828,12 @@ PasswordGate() {
         ghE += (((hz = 3) ? 1.0 : 0.0) - ghE)*EK(0.2)
         if ghE < 0.004 && hz != 3
             ghE := 0.0
-        len := gFoc ? StrLen(gBuf) : 0
-        if len != gPrevLen {
-            if len > gPrevLen
-                gKeyAt := now
-            gPrevLen := len
-        }
+        gaE += (((hz = 8) ? 1.0 : 0.0) - gaE)*EK(0.2)
+        if gaE < 0.004 && hz != 8
+            gaE := 0.0
+        gbE += (((hz = 7) ? 1.0 : 0.0) - gbE)*EK(0.2)
+        if gbE < 0.004 && hz != 7
+            gbE := 0.0
 
         ; --- selfie carousel: auto-advance when idle, honor manual switches ---
         if selFadeAt && now - selFadeAt >= SEL_FADE
@@ -41607,13 +44854,6 @@ PasswordGate() {
         if gHovAv < 0.004 && hz != 6
             gHovAv := 0.0
 
-        ; A submission made before the key list arrived is judged here, on the
-        ; frame the answer lands - see GSubmit.
-        KeyFetchRetry()
-        if (gPend != "" && KeyFetchPoll()) {
-            gp := gPend, gPend := ""
-            GJudge(gp)
-        }
         ims := now - gIntro
         stg := ims < 700
         s1 := stg ? Ease3((ims - 60)/340.0) : 1.0
@@ -41633,6 +44873,19 @@ PasswordGate() {
         p := RRPath(cx, cy, CW2, CH2, 16)
         DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", p, "int", 0)
         PanelBackdrop(cx, cy, CW2, CH2, hubAccent, s1, now, 0.95)
+        ; ---- the aurora ----
+        ; The plate was a navy sheet with the accent kept to hairlines, and it
+        ; read as grey. Two slow glows in the accent - one behind the readout,
+        ; one low behind the buttons - tint the card the colour of the theme
+        ; and give the flat glass somewhere to be lit from. They drift on
+        ; their own clocks so the light never holds still.
+        aur := (Sin(DecT(now)*0.00052) + 1)/2
+        SoftGlow(rx + 150 + 24*Sin(DecT(now)*0.00041), cy + 52 + 12*Cos(DecT(now)*0.00037)
+               , 250, 110, curG, Round((52 + 22*aur)*s1), 1.0, 7)
+        SoftGlow(rx + 90 + 30*Cos(DecT(now)*0.00033), cy + CH2 - 60 + 10*Sin(DecT(now)*0.00045)
+               , 210, 80, AccHi(curG, 0.4), Round((30 + 14*(1 - aur))*s1), 1.0, 6)
+        ; ... and a cooler pool low on the hero side, so the left is lit too
+        SoftGlow(cx + 60, cy + CH2 - 30, 160, 70, curG, Round(26*s1), 1.0, 5)
         rcD := Buffer(16), NumPut("float", cx - 1, "float", cy - 1, "float", CW2 + 2, "float", CH2 + 2, rcD)
         DllCall("gdiplus\GdipCreateLineBrushFromRect", "ptr", rcD, "uint", 0x0EFFFFFF, "uint", 0x00FFFFFF, "int", 2, "int", 3, "ptr*", &db := 0)
         DllCall("gdiplus\GdipFillRectangle", "ptr", G, "ptr", db, "float", cx, "float", cy, "float", CW2, "float", CH2), DelB(db)
@@ -41652,7 +44905,7 @@ PasswordGate() {
         swp := Mod(DecT(now), per)/per
         swx := cx - 26 + (CW2 + 52)*swp
         c0s := (gOkAt ? AccHi(curG, 0.3) : curG) & 0xFFFFFF
-        c1s := Alpha(c0s, 16 + 20*okT)
+        c1s := Alpha(c0s, 34 + 20*okT)
         rcS := Buffer(16), NumPut("float", swx - 25, "float", cy - 2, "float", 26, "float", CH2 + 4, rcS)
         DllCall("gdiplus\GdipCreateLineBrushFromRect", "ptr", rcS, "uint", c0s, "uint", c1s, "int", 0, "int", 3, "ptr*", &sbA := 0)
         DllCall("gdiplus\GdipFillRectangle", "ptr", G, "ptr", sbA, "float", swx - 24, "float", cy, "float", 24, "float", CH2), DelB(sbA)
@@ -41884,8 +45137,18 @@ PasswordGate() {
 
         ; ================= STATUS (scramble decode) =================
         sy := cy + 52 + mdy
-        scr := gOkAt ? scrGrant : scrLock
+        scr := gOkAt ? (gateChoice = "roblox" ? scrRbx : scrHub) : scrReady
         scrAt := gOkAt ? gOkAt : gIntro
+        ; the word sits in its own pool of light, and a rule under it breathes
+        ; with a highlight running its length - the card's pulse, next to the
+        ; standby card's heartbeat
+        SoftGlow(rx + scr.w/2, sy + 16, scr.w*0.85 + 30, 30, curG, Round(70*s2), 1.0, 6)
+        rlw := scr.w + 26
+        b := HBrush(rx, sy + 34, rlw, 2, FA(Alpha(curG, Round(200 + 40*embG)), s2), FA(Alpha(curG, 0), s2))
+        FillRR(rx, sy + 34, rlw, 2, 1, b), DelB(b)
+        rhx := rx + Mod(DecT(now)*0.09, rlw + 24) - 12
+        b := SBrush(FA(Alpha(AccHi(curG, 0.6), 220), s2))
+        FillRR(rhx, sy + 33.5, 14, 3, 1.5, b), DelB(b)
         if now < scrAt + 130 + scr.chs.Length*42 {
             loop scr.chs.Length {
                 i := A_Index
@@ -41899,23 +45162,8 @@ PasswordGate() {
                 Txt(ch, rx + scr.xs[i], sy, 46, 30, fGateT, FA(cc, s2), fmtL)
             }
         } else
-            Txt(gOkAt ? "GRANTED" : "LOCKED", rx, sy, 240, 30, fGateT, FA(Alpha(curG, 245), s2), fmtL)
-        ; ---- and say WHY, when the answer is not simply yes or no ----
-        ; With the key list coming off a server there are two states that are
-        ; neither granted nor denied: still asking, and could not ask. Without
-        ; this the gate silently refuses every key when the server is down, and
-        ; looks identical to a wrong key typed forty times.
-        if !gOkAt {
-            gMsg := (gPasteAt && now - gPasteAt < 1300) ? "pasted"
-                  : !KEYS_REMOTE     ? ""
-                  : (gPend != "")    ? "checking key..."
-                  : (KEYS_ERR != "") ? StrLower(KEYS_ERR)
-                  : !KEYS_IN         ? "contacting key server..."
-                  : ""
-            if (gMsg != "")
-                Txt(gMsg, rx, sy + 32, 260, 14, fGateC
-                    , FA(Alpha((KEYS_ERR != "") ? 0xFFFBBF24 : 0xC7CBE0, 205), s2), fmtL)
-        }
+            Txt(gOkAt ? (gateChoice = "roblox" ? "LAUNCHING" : "OPENING") : "READY"
+              , rx, sy, 240, 30, fGateT, FA(Alpha(curG, 245), s2), fmtL)
         stw := scr.w
         loop 3 {
             k := A_Index - 1
@@ -41930,7 +45178,7 @@ PasswordGate() {
         b := SBrush(FA(Alpha(0xFFFFFF, 8), s2))
         FillRR(vx, vy, vw, vh, 10, b), DelB(b)
         MiniBackdrop(vx, vy, vw, vh, 10, curG, s2, now, 0.7)
-        pn := Pen(FA(Alpha(curG, 60 + 30*emb2G), s2), 1)
+        pn := Pen(FA(Alpha(curG, 110 + 40*emb2G), s2), 1)
         StrokeRR(vx, vy, vw, vh, 10, pn), DelP(pn)
         vph := Mod(DecT(now), 1400)/1400.0
         vth := Max(0.0, Sin(vph*6.283))**8 + 0.55*Max(0.0, Sin(vph*6.283 - 1.05))**8
@@ -41941,7 +45189,7 @@ PasswordGate() {
         }
         vex0 := vx + 32, vex1 := vx + vw - 10, vey := vy + vh/2
         vpx := vex0 + 5 + Mod(DecT(now)*0.05, vex1 - vex0 - 10)
-        pn := Pen(FA(Alpha(curG, 90), s2), 1.1)
+        pn := Pen(FA(Alpha(AccHi(curG, 0.3), 170), s2), 1.2)
         if vpx > vex0 + 8 && vpx < vex1 - 8 {
             Line(vex0, vey, vpx - 7, vey, pn)
             Line(vpx - 7, vey, vpx - 3.5, vey - 6, pn)
@@ -41952,15 +45200,30 @@ PasswordGate() {
         } else
             Line(vex0, vey, vex1, vey, pn)
         DelP(pn)
-        Txt(gOkAt ? "WELCOME" : (gFoc ? "LISTENING" : "STANDBY"), vx + 30, vy + 2, vw - 38, 11, fGateC, FA(Alpha(Mix(curG, 0xFFC7CBE0, 0.5), 150), s2), fmtL)
-        ; The hint names the paste chord: a 32-character hex key is not something
-        ; anyone types, and an input that looks type-only reads as type-only.
-        htxt := dnT > 0 ? "access denied"
-              : gOkAt   ? "welcome back, zeal"
-              : gFoc    ? "enter password  ·  ctrl+v to paste"
-              :           "click card to type or paste"
-        hcol := dnT > 0 ? Alpha(C_BAD, Min(255, 150 + 105*dnT)) : (gOkAt ? Alpha(curG, 205) : 0x62C7CBE0)
-        Txt(htxt, rx, cy + 94 + mdy, 250, 16, fHint, FA(hcol, s2), fmtL)
+        Txt(gOkAt ? "WELCOME" : "LOADED", vx + 30, vy + 2, vw - 38, 11, fGateC, FA(Alpha(Mix(curG, 0xFFC7CBE0, 0.3), 215), s2), fmtL)
+        ; ---- what was loaded, as chips ----
+        ; "everything is loaded" was a dim sentence. The chips are the
+        ; evidence: how big the flag database came in, how many community
+        ; sets are cached, and whether Roblox is running, installed or not
+        ; found - the last one is the thing OPEN ROBLOX needs to know. Once a
+        ; button is pressed the row gives way to what the card is doing.
+        if (now - gRbxAt > 2000 && !gDrag) {      ; a process snapshot and a folder walk: not under a drag
+            gRbxAt := now
+            gRbx := FFMProcList().Length ? 2 : (RSetAppSettingsPaths().Length ? 1 : 0)
+        }
+        chy := cy + 90 + mdy
+        if !gOkAt {
+            chx := rx
+            chx := GChip(chx, chy, FFMNum(FFM.db.Length), "FLAGS", curG, s2)
+            chx := GChip(chx + 8, chy, gSets, "SETS", AccHi(curG, 0.3), s2)
+            GChip(chx + 8, chy, gRbx = 2 ? "RUNNING" : gRbx = 1 ? "INSTALLED" : "NOT FOUND", "ROBLOX"
+                , gRbx ? C_ON : AMBER, s2)
+        } else {
+            htxt := (gateChoice = "roblox") ? "starting roblox, then the hub"
+                  : (gateChoice = "acct")   ? "opening the hub, on your accounts"
+                  :                           "opening the hub"
+            Txt(htxt, rx, chy, 320, 16, fHint, FA(Alpha(curG, 215), s2), fmtL)
+        }
 
         ; --- cipher strip: sits centred in the gap between the separator
         ; (cy + 108) and the password well (cy + 148), and spans exactly the
@@ -41973,7 +45236,7 @@ PasswordGate() {
             cpx := rx + (ck - 1)*(cpw - 2)/25
             ph2 := now*0.0024 + ck*0.55
             hgt := 3 + 7*(Sin(ph2) + 1)/2
-            al2 := Round(28 + 66*(Sin(ph2*0.7 + 1.2) + 1)/2)
+            al2 := Round(56 + 120*(Sin(ph2*0.7 + 1.2) + 1)/2)
             if (dnT > 0)
                 al2 := Round(al2*(1 - dnT) + 150*dnT)
             b := SBrush(FA(Alpha(dnT > 0 ? C_BAD : curG, al2), s2))
@@ -41993,112 +45256,32 @@ PasswordGate() {
         Line(rx + cpw - 1, cpy + 3, rx + cpw - 1, cpy + 15, pn), DelP(pn)
         b := SBrush(FA(Alpha(curG, Round(120 + 90*Abs(Sin(DecT(now)*0.0026)))), s2))
         FillEll(rx + cpw - 3.5, cpy + 6.5, 5, 5, b), DelB(b)
-        if gCapsE > 0.01 {
-            ; ---- below the standby card, not on top of it ----
-            ; The badge sat at cy+80 while the standby card runs cy+46 to cy+84,
-            ; and its x range is entirely inside the card's - so it overlapped
-            ; the card's bottom-right corner by four pixels. cy+88 clears the
-            ; card by 4 and the divider at cy+108 by 5. The transform pivot has
-            ; to move with it or the pop-in scales about a point that is no
-            ; longer the badge's centre.
-            cbx := rx + fw - 42, cby := cy + 88 + mdy
-            cpe := 1 + 0.30*(1 - Ease3(Min((now - gCapsAt)/240.0, 1.0)))
-            stCp := PushXform(cbx + 20, cby + 7.5, cpe, 0)
-            ca_ := gCapsE*(0.75 + 0.25*Sin(DecT(now)*0.006))
-            b := SBrush(FA(Alpha(hubAccent, 14 + 40*ca_), s3))
-            FillRR(cbx, cby, 40, 15, 5, b), DelB(b)
-            pn := Pen(FA(Alpha(hubAccent, 170*ca_), s3), 1)
-            StrokeRR(cbx, cby, 40, 15, 5, pn), DelP(pn)
-            Txt("CAPS", cbx, cby - 1, 40, 15, fBadge
-              , FA(Alpha(AccHi(hubAccent, 0.45), 240*gCapsE), s3), fmtC)
-            Pop(stCp)
-        }
         FadeLine(rx, rx + fw, cy + 108, 0x24FFFFFF, s3)
 
-        ; ================= PASSWORD WELL =================
+        ; ================= THE TWO BUTTONS =================
+        ; In the band the password well filled. OPEN ROBLOX is the offer and
+        ; wears the primary face; OPEN HUB is the way in without the client and
+        ; wears the ghost. Once one is pressed it holds its press ring and the
+        ; other steps back, so the card shows which way it is going while it
+        ; folds. The faces are the hub's own gate card buttons, drawn here with
+        ; this card's own hover eases and press clock.
         fyy := fy + fdy2
-        wellp := RRPath(fx, fyy, fw, fh, 10)
-        b := SBrush(FA(0xFF171A30, s3))
-        DllCall("gdiplus\GdipFillPath", "ptr", G, "ptr", b, "ptr", wellp), DelB(b)
-        MiniBackdrop(fx, fyy, fw, fh, 10, curG, s3, now, 0.75)
-        DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", wellp, "int", 0)
-        b := SBrush(FA(Alpha(curG, ((len > 0 || gOkAt) ? 30 + 18*emb2G : 16 + 10*emb2G)*(0.35 + 0.65*gFcE)), s3))
-        FillEll(fx + 4, fyy + fh - 11, fw - 8, 22, b), DelB(b)
-        DllCall("gdiplus\GdipResetClip", "ptr", G)
-        DllCall("gdiplus\GdipDeletePath", "ptr", wellp)
-        pn := Pen(FA(Alpha(curG, Min(255, (90 + 40*emb2G + 130*fl + 80*okT)*(0.45 + 0.55*gFcE))), s3), 1.2)
-        StrokeRR(fx, fyy, fw, fh, 10, pn), DelP(pn)
-        if fl > 0 {
-            ex := (1 - fl)*10
-            pn := Pen(Alpha(curG, 170*fl), 2.2*fl + 0.3)
-            StrokeRR(fx - ex, fyy - ex*0.5, fw + ex*2, fh + ex, 10 + ex*0.4, pn), DelP(pn)
-        }
-        if gOkAt && okT < 1 {
-            ex := okT*16
-            pn := Pen(Alpha(curG, 160*(1 - okT)), 2.4*(1 - okT) + 0.4)
-            StrokeRR(fx - ex, fyy - ex*0.5, fw + ex*2, fh + ex, 10 + ex*0.4, pn), DelP(pn)
-        }
-        if gFocusAt && gFoc && now - gFocusAt < 320 {
-            fe := (now - gFocusAt)/320.0
-            ex := fe*12
-            pn := Pen(Alpha(curG, 150*(1 - fe)), 1.8*(1 - fe) + 0.3)
-            StrokeRR(fx - ex, fyy - ex*0.5, fw + ex*2, fh + ex, 10 + ex*0.4, pn), DelP(pn)
-        }
-        if gFcE < 0.85 && !gOkAt && !gCloseAt
-            Txt("CLICK TO TYPE", fx + 34, fyy, fw - 110, fh, fBadge, FA(Alpha(0x9AA8C0, 160*(1 - gFcE)), s3), fmtL)
-        ; leading key glyph inside the field
-        pn := Pen(FA(Alpha(curG, 150 + 40*emb2G), s3), 1.4)
-        Ell(fx + 15, fyy + fh/2 - 4, 6, 6, pn)
-        Line(fx + 20, fyy + fh/2 + 1, fx + 26, fyy + fh/2 + 5, pn)
-        Line(fx + 23.5, fyy + fh/2 + 3, fx + 22, fyy + fh/2 + 5.5, pn), DelP(pn)
-        if len > 0 && !gOkAt && !gCloseAt {
-            chx := fx + fw - 66, chy := fyy + 8
-            chs := 1 + 0.05*ghE
-            stC := PushXform(chx + 29, chy + 14, chs, 0)
-            b := VBrush(chx, chy, 58, 28, FA(Mix(0xFF31344C, 0xFF41466A, ghE), s3), FA(Mix(0xFF20223A, 0xFF262A45, ghE), s3))
-            FillRR(chx, chy, 58, 28, 7, b), DelB(b)
-            MicroBackdrop(chx, chy, 58, 28, 7, curG, s3, now, 0.9)
-            pn := Pen(FA(Alpha(curG, 110 + 60*emb2G + 80*ghE), s3), 1)
-            StrokeRR(chx, chy, 58, 28, 7, pn), DelP(pn)
-            Txt("ENTER", chx, chy, 58, 28, fBadge, FA(Alpha(curG, 220 + 35*ghE), s3), fmtC)
-            Pop(stC)
-        }
-        trunc := len > maxDots
-        nShow := Min(len, maxDots)
-        dx0 := trunc ? fx + 58 : fx + 34
-        if trunc {
-            b := SBrush(FA(Alpha(curG, 120), s3))
-            loop 3
-                FillEll(fx + 34 + (A_Index - 1)*6 - 1.3, fyy + fh/2 - 1.3, 2.6, 2.6, b)
-            DelB(b)
-        }
-        loop nShow {
-            r_ := 3.4
-            if A_Index = nShow && now - gKeyAt < 180
-                r_ := 3.4 + 2.0*(1 - (now - gKeyAt)/180.0)
-            b := SBrush(FA(Alpha(curG, 235), s3))
-            FillEll(dx0 + (A_Index - 1)*14 - r_, fyy + fh/2 - r_, r_*2, r_*2, b), DelB(b)
-        }
-        if nShow && now - gKeyAt < 260 {
-            ke := (now - gKeyAt)/260.0
-            pn := Pen(FA(Alpha(curG, 140*(1 - ke)), s3), 1.6*(1 - ke) + 0.3)
-            kr := 4 + ke*10
-            Ell(dx0 + (nShow - 1)*14 - kr, fyy + fh/2 - kr, kr*2, kr*2, pn), DelP(pn)
-        }
-        if gFoc && !gOkAt && !gCloseAt && Mod(DecT(now), 1100) < 560 {
-            cxr := nShow ? dx0 + (nShow - 1)*14 + 9 : fx + 32
-            pn := Pen(FA(Alpha(curG, 205), s3), 1.4)
-            Line(cxr, fyy + 11, cxr, fyy + fh - 11, pn), DelP(pn)
-        }
-        if gTries > 0 {
-            loop Min(gTries, 8) {
-                b := SBrush(FA(Alpha(C_BAD, 165), s3))
-                FillEll(fx + (A_Index - 1)*8, fyy + fh + 9, 3, 3, b), DelB(b)
-            }
-        }
+        pr := gPressAt ? Clamp(1 - (now - gPressAt)/320.0, 0.0, 1.0) : 0.0
+        oth := gOkAt ? Clamp(1 - (now - gOkAt)/260.0, 0.0, 1.0) : 1.0
+        ; The offer has the first row to itself; the two other doors - the hub
+        ; alone, and the hub opened on the saved accounts - share the second.
+        ; Whichever was pressed keeps its ring; the other two step back.
+        dim := 0.35 + 0.65*oth
+        GBtn(7, fx, fyy, fw, fh, "OPEN ROBLOX", 1, gbE, gPressZ = 7 ? pr : 0.0
+           , s3*((gPressZ && gPressZ != 7) ? dim : 1.0), now, curG, "dart")
+        fyy2 := fy2 + fdy2
+        GBtn(3, fx, fyy2, bw1, fh2, "OPEN HUB", 0, ghE, gPressZ = 3 ? pr : 0.0
+           , s3*((gPressZ && gPressZ != 3) ? dim : 1.0), now, curG, "hub")
+        GBtn(8, fx + bw1 + 10, fyy2, bw1, fh2, "ACCOUNTS", 0, gaE, gPressZ = 8 ? pr : 0.0
+           , s3*((gPressZ && gPressZ != 8) ? dim : 1.0), now, curG, "acct")
 
         ; ---- ambient doodles: circuit pulse (left) + mini equalizer (right) ----
-        cyD := cy + CH2 - 74
+        cyD := cy + CH2 - 64                    ; under the second row - see fy2
         pn := Pen(FA(Alpha(0xFFFFFF, 34), s3), 1)
         Line(fx + 2, cyD, fx + 46, cyD, pn)
         Line(fx + 46, cyD, fx + 46, cyD - 10, pn)
@@ -42134,7 +45317,7 @@ PasswordGate() {
         b := SBrush(FA(Alpha(curG, 130), s3))
         FillEll(oex + 8*Cos(-oaG*1.6) - 1.2, oey + 8*Sin(-oaG*1.6) - 1.2, 2.4, 2.4, b), DelB(b)
         MiniHeart(oex, oey + 1, 3.4 + 0.8*emb2G, FA(Alpha(AccHi(curG, 0.35), 200), s3))
-        eqx := fx + fw - 96, eqy := cy + CH2 - 60
+        eqx := fx + fw - 96, eqy := cy + CH2 - 50
         loop 14 {
             k := A_Index
             bh := 3.5 + 11*Abs(Sin(DecT(now)*0.0042 + k*0.93))*(0.5 + 0.5*Sin(DecT(now)*0.0016 + k*0.6)**2)
@@ -42242,10 +45425,22 @@ HitZoneAtCursor() {
     CursorXY(&x, &y)
     return HitZone(x, y)
 }
+; The buffer is zeroed and the call's result is returned: GetCursorPos can
+; fail - a secure desktop, a foreground window this process may not query -
+; and an unzeroed buffer then hands back whatever was in that memory as a
+; position. A drag that read one such sample put its window wherever the
+; garbage said, which is a window teleporting for no reason anyone can see.
+; On failure x and y keep the last good read.
 CursorXY(&x, &y) {
-    pt := Buffer(8)
-    DllCall("GetCursorPos", "ptr", pt)
+    static lx := 0, ly := 0
+    pt := Buffer(8, 0)
+    if !DllCall("GetCursorPos", "ptr", pt) {
+        x := lx, y := ly
+        return 0
+    }
     x := NumGet(pt, 0, "int"), y := NumGet(pt, 4, "int")
+    lx := x, ly := y
+    return 1
 }
 LpXY(lParam, &x, &y) {
     x := lParam & 0xFFFF, y := (lParam >> 16) & 0xFFFF
@@ -42279,9 +45474,9 @@ LUp(wParam, lParam, msg, hwnd) {
     global dragOn
     if !dragOn
         return
-    DllCall("ReleaseCapture")
     wasClick := (dragOn = 1), z := dragZone
-    dragOn := 0
+    dragOn := 0                                  ; cleared before the release - see HubBtnUp
+    DllCall("ReleaseCapture")
     if wasClick && z = 3
         StartMin(0.0)
     return 0
@@ -42293,6 +45488,11 @@ MMove(wParam, lParam, msg, hwnd) {
     if !dragOn {
         RendTim(TICK_S)
         return
+    }
+    ; a drag whose button is up is over - see HubMove
+    if (!GetKeyState("LButton", "P") && !GetKeyState("RButton", "P")) {
+        LUp(wParam, lParam, 0x202, hwnd)
+        return 0
     }
     CursorXY(&x, &y)
     if dragOn = 1 && (x - grabX)**2 + (y - grabY)**2 > 16
@@ -42386,6 +45586,7 @@ CopyData(wParam, lParam, msg, hwnd) {
         && magic != 0x5A1D && magic != 0x5A1E && magic != 0x5A1F
         && magic != 0x5A20 && magic != 0x5A21 && magic != 0x5A22 && magic != 0x5A23
         && magic != 0x5A24 && magic != 0x5A25 && magic != 0x5A26 && magic != 0x5A27
+        && magic != 0x5A31                       ; LOGIN ITEMS' picker
         return
     sel := StrGet(NumGet(lParam, A_PtrSize*2, "ptr"), "UTF-16")
     if sel = ""
@@ -42437,6 +45638,8 @@ CopyData(wParam, lParam, msg, hwnd) {
         else
             FFMExportFile(sel)
     }
+    else if magic = 0x5A31
+        LGIPicked(sel)
     else if magic = 0x5A13 {
         if (sel = "`f")
             FFMImportClip()
@@ -45106,8 +48309,16 @@ HubTim(p) {
     ; HubResNotice, HubFinish - asked for a stop and got a 40 ms timer instead.
     ; The renderer carried on against a hidden window, a window put away for a
     ; resolution change, and a hub that had already called ExitApp.
+    ; ---- LOW PERFORMANCE MODE: three rates, all slower, and a stop ----
+    ; Fast becomes 40 ms (25 fps) - enough for a drag to track and a switch
+    ; to travel. Idle becomes 250. And deep idle STOPS the timer outright: in
+    ; this mode nothing ambient is drawn, so a frame with no pointer on the
+    ; card and nothing in flight would be the last frame again. Every input
+    ; path pokes the loop back to TICK_A (HubPoke), and every background
+    ; result that lands calls HubPoke too, so a stopped loop is never a stuck
+    ; one - it is the hub costing nothing while it is left alone.
     if (hubLowPerf && p)
-        p := Max(p, (p <= TICK_A) ? 40 : (p <= TICK_S ? 220 : 300))
+        p := (p <= TICK_A) ? 40 : (p <= TICK_S) ? 250 : 0
     if p != hubP
         hubP := p, SetTimer(HubRender, p, -10)
 }
@@ -46196,6 +49407,8 @@ VBrush(x, y, w, h, c1, c2) {
     static rc := Buffer(16)
     NumPut("float", x, "float", y - 1, "float", w, "float", h + 2, rc)
     DllCall("gdiplus\GdipCreateLineBrushFromRect", "ptr", rc, "uint", c1, "uint", c2, "int", 1, "int", 3, "ptr*", &b := 0)
+    if b
+        brTemp[b] := 1
     return b
 }
 HBrush(x, y, w, h, c1, c2) {
@@ -46207,6 +49420,8 @@ HBrush(x, y, w, h, c1, c2) {
     static rc := Buffer(16)
     NumPut("float", x - 1, "float", y, "float", w + 2, "float", h, rc)
     DllCall("gdiplus\GdipCreateLineBrushFromRect", "ptr", rc, "uint", c1, "uint", c2, "int", 0, "int", 3, "ptr*", &b := 0)
+    if b
+        brTemp[b] := 1
     return b
 }
 ; ---- inner panel texture ----
@@ -46687,6 +49902,34 @@ PanelBackdropDark(x, y, w, h, acc, f, now, k) {
         , "float", x, "float", y + h - Min(90, h*0.22), "float", w, "float", Min(90, h*0.22)), DelB(b)
 }
 
+; ---- is anything being dragged? ----
+; The one class of work the UI thread cannot make cheap is the work that
+; blocks it for tens of milliseconds at a stretch: creating a child process
+; (CreateProcess of the interpreter, longer with real-time antivirus on it)
+; and decoding an image from disk (a 768x432 thumbnail is 10-40 ms; a slow
+; disk or a scanner doubles it). Under a drag every one of those is the card
+; stopping under the pointer and then leaping to wherever the pointer went -
+; the "teleport" that shows on the launch gate, because that is the window on
+; screen while the boot queues (place stats, icons, every game's thumbnail
+; reel) are still draining. The pumps ask this before each spawn or decode
+; and wait a tick when it says so; nothing they fetch is needed mid-drag.
+DragBusy() => gateDrag || (IsObject(HL) && HL.drag) || dragOn
+           || (IsObject(PZO) && PZO.HasOwnProp("dragOn") && PZO.dragOn)
+
+; ---- a soft radial glow ----
+; GDI+ path gradients are expensive to build every frame; n rings of the same
+; colour at a_total/n each, shrinking toward the centre, read as a radial
+; glow from arm's length and cost n ellipse fills. The centre reaches a_total.
+; LOW PERFORMANCE MODE: no glows - six fills a piece, pure decoration.
+SoftGlow(cx, cy, rx, ry, col, a_total, f := 1.0, n := 6) {
+    if hubLowPerf
+        return
+    loop n {
+        sc := 1 - (A_Index - 1)/n
+        b := SBrush(FA(Alpha(col, Round(a_total/n)), f))
+        FillEll(cx - rx*sc, cy - ry*sc, rx*sc*2, ry*sc*2, b), DelB(b)
+    }
+}
 BgV(x, y, w, h, c1, c2) {
     ; every card background goes through here - flat in low-perf like the rest
     if hubLowPerf
@@ -46725,6 +49968,8 @@ VBrushP(x, y, w, h, c1, c2) {
     static rc := Buffer(16)
     NumPut("float", x, "float", y - 1, "float", w, "float", h + 2, rc)
     DllCall("gdiplus\GdipCreateLineBrushFromRect", "ptr", rc, "uint", c1, "uint", c2, "int", 1, "int", 3, "ptr*", &b := 0)
+    if b
+        brTemp[b] := 1
     return b
 }
 HBrushP(x, y, w, h, c1, c2) {
@@ -46732,6 +49977,8 @@ HBrushP(x, y, w, h, c1, c2) {
     static rc := Buffer(16)
     NumPut("float", x - 1, "float", y, "float", w + 2, "float", h, rc)
     DllCall("gdiplus\GdipCreateLineBrushFromRect", "ptr", rc, "uint", c1, "uint", c2, "int", 0, "int", 3, "ptr*", &b := 0)
+    if b
+        brTemp[b] := 1
     return b
 }
 PenP(c, w) {
@@ -46765,6 +50012,11 @@ SBrushP(c) {
     if brCache.Has(k)
         return brCache[k]
     DllCall("gdiplus\GdipCreateSolidFill", "uint", k, "ptr*", &b := 0)
+    ; A creation that failed used to be cached as 0, and 0 is what every
+    ; later caller got for that colour - a colour that never drew again for
+    ; the life of the process. Not cached: the next caller tries again.
+    if !b
+        return 0
     brCache[k] := b, brOwn[b] := 1
     return b
 }
@@ -46773,18 +50025,33 @@ SBrushP(c) {
 ; at the top of a render pass: flushing mid-frame could free a handle a caller
 ; is still holding between its SBrush and its DelB.
 BrushCacheTick() {
-    global brCache, brOwn
+    global brCache, brOwn, brDead
     if brCache.Count < 4096
         return
-    for k, b in brCache
+    prevC := A_IsCritical
+    Critical "On"                      ; not interleaved with another window's frame - see brTemp
+    dead := Map()
+    for k, b in brCache {
         DllCall("gdiplus\GdipDeleteBrush", "ptr", b)
-    brCache := Map(), brOwn := Map()
+        dead[b] := 1
+    }
+    brCache := Map(), brOwn := Map(), brDead := dead
+    Critical prevC
 }
 ; Gradient brushes are still per-use and must still be freed; cached solid
 ; brushes must not be.
 DelB(b) {
-    global brOwn
-    if (b && !brOwn.Has(b))
+    global brTemp, brOwn, brDead
+    if !b
+        return
+    if brTemp.Has(b) {                 ; a registered gradient: the caller's to free
+        brTemp.Delete(b)
+        DllCall("gdiplus\GdipDeleteBrush", "ptr", b)
+        return
+    }
+    ; a gradient made directly at its site (the sweeps, the sheens): free it
+    ; unless it is a cached brush, or a handle the last flush already freed
+    if (!brOwn.Has(b) && !brDead.Has(b))
         DllCall("gdiplus\GdipDeleteBrush", "ptr", b)
 }
 Pen(c, w) => PenP(TH(c), w)
@@ -46923,12 +50190,28 @@ Line(x1, y1, x2, y2, pen) => pen ? DllCall("gdiplus\GdipDrawLine", "ptr", G, "pt
 ; glyph run at zero alpha still rasterises every glyph before discarding it.
 Txt(s, x, y, w, h, font, c, fmt) {
     static rc := Buffer(16)
+    global brCache, brOwn
     if (s = "")
         return
     if !(b := SBrush(c))
         return
     NumPut("float", x, "float", y, "float", w, "float", h, rc)
-    DllCall("gdiplus\GdipDrawString", "ptr", G, "wstr", s, "int", -1, "ptr", font, "ptr", rc, "ptr", fmt, "ptr", b)
+    st := DllCall("gdiplus\GdipDrawString", "ptr", G, "wstr", s, "int", -1, "ptr", font, "ptr", rc, "ptr", fmt, "ptr", b)
+    if (st) {
+        ; ---- the draw was refused ----
+        ; The one repairable cause is a cached brush handle that is no longer
+        ; a brush: the cache entry for this colour is dropped and the string
+        ; drawn once more with a fresh one.
+        k := ElA(TH(c))
+        if (brCache.Has(k) && brCache[k] = b) {
+            brCache.Delete(k)
+            if brOwn.Has(b)
+                brOwn.Delete(b)
+            if (b2 := SBrush(c))
+                DllCall("gdiplus\GdipDrawString", "ptr", G, "wstr", s, "int", -1, "ptr", font, "ptr", rc, "ptr", fmt, "ptr", b2)
+        }
+        return
+    }
     DelB(b)
 }
 
@@ -47889,9 +51172,9 @@ PuzOvLUp(wParam, lParam, msg, hwnd) {
     }
     if !PZO.dragOn
         return
-    DllCall("ReleaseCapture")
     wasClick := (PZO.dragOn = 1), z := PZO.dragZone
-    PZO.dragOn := 0
+    PZO.dragOn := 0                              ; cleared before the release - see HubBtnUp
+    DllCall("ReleaseCapture")
     if wasClick && z = 3
         PuzOvStartMin(0.0)
     return 0
@@ -47899,6 +51182,11 @@ PuzOvLUp(wParam, lParam, msg, hwnd) {
 PuzOvMMove(wParam, lParam, msg, hwnd) {
     if (PZO.gui = "" || hwnd != PZO.gui.Hwnd)
         return
+    ; a drag or a slide whose button is up is over - see HubMove
+    if ((PZO.sld || PZO.dragOn) && !GetKeyState("LButton", "P") && !GetKeyState("RButton", "P")) {
+        PuzOvLUp(wParam, lParam, 0x202, hwnd)
+        return 0
+    }
     ; Record the touch and let the render loop choose the rate. The block
     ; overlay calls RendTim(TICK_S) here, which fights the TICK_A the renderer
     ; picks a frame later whenever the pointer is over the card: the period
