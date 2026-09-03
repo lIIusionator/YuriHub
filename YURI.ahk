@@ -10,7 +10,7 @@
 ;@Ahk2Exe-SetDescription   YURI - Control Suite
 ;@Ahk2Exe-SetProductName   YURI
 ;@Ahk2Exe-SetCompanyName   YURI
-;@Ahk2Exe-SetVersion       1.0.0.0
+;@Ahk2Exe-SetVersion       1.0.1.0
 ;@Ahk2Exe-SetCopyright     YURI
 ;@Ahk2Exe-SetOrigFilename  YURI.exe
 ;;@Ahk2Exe-SetMainIcon     YURI.ico
@@ -24,8 +24,8 @@
 ; version; the compiled updater installs a downloaded YURI.exe only if that is
 ; higher than the running one. ZVER, lower down, is built from these two, so
 ; the badge the hub draws can never disagree with the number the updater uses.
-global APP_VERSION := "1.0.0"
-global APP_STAGE   := ""        ; follows the number on every badge; "" once it is not a beta
+global APP_VERSION := "1.0.1"
+global APP_STAGE   := "BETA"    ; follows the number on every badge; "" once it is not a beta
 ; -----------------------------------------------------------------------------
 
 ; ============================================================================
@@ -614,30 +614,73 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
     if (csTree = "")
         CommReply("ERR" csSEP "could not reach the repository")
     ; ---- 2. sort the paths into folders ----
-    ; Tolerant of spacing and key order: GitHub emits this compactly today, but
-    ; a mirror or a proxy in front of it need not.
+    ; One entry object at a time, then the keys out of it - so nothing here
+    ; depends on the order GitHub happens to emit them in (path, mode, type,
+    ; sha, size, url today), and a mirror or a proxy that reorders them is
+    ; still read. An entry is one { } with no nesting, which is what the
+    ; character class keys on.
+    ;
+    ; ---- the sha is the whole point ----
+    ; The tree names every blob by content hash. That hash changes exactly
+    ; when the file's bytes change, so it answers "has this set changed since
+    ; the last sync" with no download at all - and it goes into the raw URL as
+    ; a query string, which makes a changed set a NEW url to every cache on
+    ; the way. Before this the files were fetched by branch name alone, and
+    ; the raw CDN is allowed to serve a branch-name url from cache for minutes
+    ; after a push: a sync run in that window brought the old bytes back down,
+    ; wrote them over the identical old copy, and reported success. Deleting
+    ; the folder "fixed" it only because the wait to do so outlasted the
+    ; cache. Now a set is re-fetched when, and only when, its hash moved.
     csFolders := Map(), csOrder := [], csPos := 1
-    while (csPos := RegExMatch(csTree, '"path"\s*:\s*"([^"]*)"(?:(?!"path")[\s\S])*?"type"\s*:\s*"(\w+)"', &m, csPos)) {
+    while (csPos := RegExMatch(csTree, '\{[^{}]*\}', &m, csPos)) {
         csPos += m.Len
-        if (m[2] != "blob")
+        csObj := m[0]
+        if (!RegExMatch(csObj, '"path"\s*:\s*"([^"]*)"', &mp)
+                || !RegExMatch(csObj, '"type"\s*:\s*"(\w+)"', &mt))
             continue
-        csPath := m[1]
+        if (mt[1] != "blob")
+            continue
+        csSha  := RegExMatch(csObj, '"sha"\s*:\s*"([0-9a-fA-F]+)"', &ms) ? ms[1] : ""
+        csPath := mp[1]
         csSl   := InStr(csPath, "/")
         if (!csSl || InStr(csPath, "/", , csSl + 1))    ; top level only, one deep only
             continue
         csFold := SubStr(csPath, 1, csSl - 1)
         csName := SubStr(csPath, csSl + 1)
         if !csFolders.Has(csFold) {
-            csFolders[csFold] := {marked: 0, files: []}
+            csFolders[csFold] := {marked: 0, msha: "", files: []}
             csOrder.Push(csFold)
         }
         if (csName = "place-id.ini")
-            csFolders[csFold].marked := 1
+            csFolders[csFold].marked := 1, csFolders[csFold].msha := csSha
         else if RegExMatch(csName, "i)\.json$")
-            csFolders[csFold].files.Push(csName)
+            csFolders[csFold].files.Push({name: csName, sha: csSha})
+    }
+    ; ---- 2b. what the last sync left ----
+    ; The old index carries the hash of every set it wrote (field 7 of an S
+    ; line, field 5 of a C line for the place marker; indexes from before this
+    ; carry neither and simply re-fetch everything once). A set whose hash the
+    ; tree still reports, with its file still on disk, is kept as it is; the
+    ; author and the count come from the old line, so a kept set costs no
+    ; request at all.
+    csOldS := Map(), csOldC := Map()
+    csOldTxt := ""
+    try csOldTxt := FileRead(csRoot "\index.txt", "UTF-8")
+    csOldFold := "", csOldDir := ""
+    for csLn in StrSplit(csOldTxt, "`n", "`r") {
+        csFl := StrSplit(csLn, csSEP)
+        if (csFl.Length >= 3 && csFl[1] = "C") {
+            csOldFold := csFl[2]
+            csOldDir  := (csFl.Length >= 4 && csFl[4] != "") ? csFl[4] : csFl[2]
+            csOldC[csOldFold] := {place: csFl[3], msha: (csFl.Length >= 5) ? csFl[5] : ""}
+        } else if (csFl.Length >= 5 && csFl[1] = "S" && csOldFold != "") {
+            csOldS[csOldFold "/" csFl[3]] := {who: csFl[4], cnt: csFl[5]
+                , disk: (csFl.Length >= 6 && csFl[6] != "") ? csFl[6] : csFl[3]
+                , sha: (csFl.Length >= 7) ? csFl[7] : "", dir: csOldDir}
+        }
     }
     ; ---- 3. mirror the qualifying files ----
-    csGen := "", csGame := "", csN := 0
+    csGen := "", csGame := "", csN := 0, csNew := 0, csSame := 0
     for csFold in csOrder {
         csRec   := csFolders[csFold]
         csIsGen := (StrLower(csFold) = "general")
@@ -645,9 +688,17 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
             continue
         csPlace := ""
         if !csIsGen {
-            csRaw := CommGet("https://raw.githubusercontent.com/" csRepo "/HEAD/" csFold "/place-id.ini")
-            if RegExMatch(csRaw, "(\d{6,})", &mi)       ; a bare id, however it is padded
-                csPlace := mi[1]
+            ; the marker is a file like any other: unchanged hash, known id,
+            ; no request
+            csPrevC := csOldC.Has(csFold) ? csOldC[csFold] : 0
+            if (csPrevC && csRec.msha != "" && csPrevC.msha = csRec.msha && csPrevC.place != "")
+                csPlace := csPrevC.place
+            else {
+                csRaw := CommGet("https://raw.githubusercontent.com/" csRepo "/HEAD/" csFold "/place-id.ini"
+                               . (csRec.msha != "" ? "?sha=" csRec.msha : ""))
+                if RegExMatch(csRaw, "(\d{6,})", &mi)   ; a bare id, however it is padded
+                    csPlace := mi[1]
+            }
             if (csPlace = "")
                 continue                                ; unusable marker - skip it
         }
@@ -660,10 +711,29 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
         if !DirExist(csDir)
             continue
         csKept := ""
-        for csF in csRec.files {
-            csBody := CommGet("https://raw.githubusercontent.com/" csRepo "/HEAD/" csFold "/" csF)
-            if (csBody = "")
+        for csFE in csRec.files {
+            csF := csFE.name, csSha := csFE.sha
+            csKey  := csFold "/" csF
+            csPrev := csOldS.Has(csKey) ? csOldS[csKey] : 0
+            ; unchanged on the repository and still on disk: kept as it is
+            if (csPrev && csSha != "" && csPrev.sha = csSha && FileExist(csDir "\" csPrev.disk)) {
+                csKept .= "S" csSEP csFold csSEP csF csSEP csPrev.who csSEP csPrev.cnt csSEP csPrev.disk csSEP csSha "`n"
+                csN++, csSame++
                 continue
+            }
+            csBody := CommGet("https://raw.githubusercontent.com/" csRepo "/HEAD/" csFold "/" csF
+                            . (csSha != "" ? "?sha=" csSha : ""))
+            if (csBody = "") {
+                ; A fetch that failed is a fetch that failed, not a set that
+                ; went away: the last good copy stays listed under its OLD hash,
+                ; so the next sync tries it again rather than the row vanishing
+                ; for the length of a bad connection.
+                if (csPrev && FileExist(csDir "\" csPrev.disk)) {
+                    csKept .= "S" csSEP csFold csSEP csF csSEP csPrev.who csSEP csPrev.cnt csSEP csPrev.disk csSEP csPrev.sha "`n"
+                    csN++
+                }
+                continue
+            }
             csWho := "UNKNOWN"
             if RegExMatch(csBody, "m)^[ \t]*//[ \t]*#[ \t]*(\S.*?)[ \t]*$", &mc)
                 csWho := mc[1]
@@ -684,22 +754,23 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
             ; without this the index records intentions rather than files.
             if !FileExist(csDir "\" csSafe)
                 continue
-            csKept .= "S" csSEP csFold csSEP csF csSEP csWho csSEP csCnt csSEP csSafe "`n"
-            csN++
+            csKept .= "S" csSEP csFold csSEP csF csSEP csWho csSEP csCnt csSEP csSafe csSEP csSha "`n"
+            csN++, csNew++
         }
         if (csKept = "")
             continue
         ; GENERAL first, whatever order the tree arrived in
         if csIsGen
-            csGen .= "C" csSEP csFold csSEP csPlace csSEP csDirN "`n" csKept
+            csGen .= "C" csSEP csFold csSEP csPlace csSEP csDirN csSEP csRec.msha "`n" csKept
         else
-            csGame .= "C" csSEP csFold csSEP csPlace csSEP csDirN "`n" csKept
+            csGame .= "C" csSEP csFold csSEP csPlace csSEP csDirN csSEP csRec.msha "`n" csKept
     }
     if (csN = 0)
         CommReply("ERR" csSEP "the repository has no usable sets")
     try FileDelete(csRoot "\index.txt")
     try FileAppend(csGen csGame, csRoot "\index.txt", "UTF-8")
-    CommReply("OK" csSEP csN)
+    ; total, fetched fresh, kept unchanged - the parent says so after a REFRESH
+    CommReply("OK" csSEP csN csSEP csNew csSEP csSame)
 }
 
 if A_Args.Length >= 3 && A_Args[1] = "rbxstats" {
@@ -1872,6 +1943,12 @@ global TOG_MS := 650, TICK_A := 16, TICK_S := 33, TICK_D := 33, TICK_Z := 50
 ; frames a second is the floor for something that is on screen.
 global TICK_G := 100
 global HUB_DEEP_MS := 4000
+; LOW PERFORMANCE MODE's one idle rate: the frame asks for it by name when a
+; flourish still has to land - a flash fading, a message expiring - and for
+; nothing else. Every other idle tier is a STOP in that mode; see HubTim.
+global TICK_LP := 250
+; the hover watcher's period - a hit test, no drawing - see HubWatch
+global HUB_WATCH_MS := 50
 global C_ON := 0xFF34D399, C_OFF := 0xFFFB7185
 ; Sentinel meaning "paint this in the current accent". Stored message colours
 ; are resolved at draw time, so changing the accent recolours a message that is
@@ -5302,7 +5379,8 @@ global FFM_COMM_SYNC := 0        ; 1 while a sync child is running
 global FFM_COMM_SYNCAT := 0      ; when it was launched - see FFMCommSyncing
 global FFM_COMM_MSG  := ""       ; what to say when there is nothing to show
 global FFM_COMM_OKAT := 0        ; when a sync last landed OK - see FFMCommSync
-global FFM_COMM_FRESH_MS := 600000   ; ten minutes: a sync younger than this is not repeated
+global FFM_COMM_FRESH_MS := 180000   ; three minutes: an automatic sync younger than this is not repeated
+global FFM_COMM_FORCED := 0      ; 1 while the running sync was asked for (REFRESH, a missing file)
 global commSyncPid   := 0
 
 ; Whatever is on disk, in the order the child wrote it (GENERAL first). Reading
@@ -5339,8 +5417,12 @@ FFMCommIndexLoad() {
             ; knowable when the panel opened.
             disk := (f.Length >= 6 && f[6] != "") ? f[6] : f[3]
             pth  := YURI_COMM "\" cur.dir "\" disk
+            ; sha is the content hash the sync child keys its fetches on; it
+            ; is carried here so a hand-inspected index reads whole, and it is
+            ; empty for an index written before the child recorded it
             cur.sets.Push({file: f[3], author: (f[4] = "") ? "UNKNOWN" : f[4]
-                         , n: cnt, disk: disk, have: FileExist(pth) ? 1 : 0})
+                         , n: cnt, disk: disk, have: FileExist(pth) ? 1 : 0
+                         , sha: (f.Length >= 7) ? f[7] : ""})
         }
     }
     FFM_COMM := out
@@ -5355,19 +5437,22 @@ FFMCommIndexLoad() {
 ; session that outlives a push picks it up - but not if the last sync landed
 ; within FFM_COMM_FRESH_MS: the tree call behind it is metered at 60 an hour,
 ; and a launch followed by a few panel opens would spend a fair share of that
-; on answers already in hand. `force` is the SYNC button and the re-sync a
-; missing file triggers, which are both asking for exactly that round trip.
-; The existing cache stays on screen throughout - a sync never blanks the
-; panel, it only replaces what is there once it has something better.
+; on answers already in hand. Three minutes now, not ten: since the child
+; re-fetches only sets whose hash moved, a sync that finds nothing new costs
+; the one tree call and nothing else, so the panel can afford to look more
+; often. `force` is the REFRESH button and the re-sync a missing file
+; triggers, which are both asking for exactly that round trip and skip the
+; gate. The existing cache stays on screen throughout - a sync never blanks
+; the panel, it only replaces what is there once it has something better.
 FFMCommSync(force := 0) {
-    global commSyncPid, FFM_COMM_SYNC, FFM_COMM_SYNCAT, FFM_COMM_MSG
+    global commSyncPid, FFM_COMM_SYNC, FFM_COMM_SYNCAT, FFM_COMM_MSG, FFM_COMM_FORCED
     if (FFM_COMM_SYNC && commSyncPid && ProcessExist(commSyncPid))
         return
     if (!force && FFM_COMM_OKAT && A_TickCount - FFM_COMM_OKAT < FFM_COMM_FRESH_MS)
         return
     if !DirExist(YURI_COMM)
         try DirCreate(YURI_COMM)
-    FFM_COMM_SYNC := 1, FFM_COMM_SYNCAT := A_TickCount
+    FFM_COMM_SYNC := 1, FFM_COMM_SYNCAT := A_TickCount, FFM_COMM_FORCED := force ? 1 : 0
     ; The args are built first so each branch of the ternary fits on ONE line.
     ; A continuation line has to START with an operator - the third line here
     ; began with a string literal, which AHK reads as a new statement and
@@ -5408,8 +5493,10 @@ FFMCommSyncing() {
     return 1
 }
 FFMCommSynced(payload) {
-    global FFM_COMM_SYNC, FFM_COMM_MSG, FFM_COMM_OKAT
+    global FFM_COMM_SYNC, FFM_COMM_MSG, FFM_COMM_OKAT, FFM_COMM_FORCED
     FFM_COMM_SYNC := 0
+    forced := FFM_COMM_FORCED
+    FFM_COMM_FORCED := 0
     f := StrSplit(payload, Chr(1))
     if (f.Length >= 1 && f[1] = "OK") {
         FFMCommIndexLoad()
@@ -5417,10 +5504,21 @@ FFMCommSynced(payload) {
         FFM_COMM_MSG := ""
         FFM_COMM_OKAT := A_TickCount
         FFMCommClampAll()
+        ; A REFRESH the user pressed gets an answer in words: how many sets
+        ; the repository has, and how many of them came down changed. An
+        ; automatic sync stays quiet - it was not asked for.
+        if forced {
+            tot  := (f.Length >= 2) ? f[2] : "?"
+            nNew := (f.Length >= 3) ? f[3] : "?"
+            FFMSay("COMMUNITY REFRESHED - " tot " SET" (tot = 1 ? "" : "S")
+                 . "  ·  " (nNew = 0 ? "NOTHING CHANGED" : (nNew " UPDATED")), 0xFF34D399)
+        }
     } else {
         ; The cache is still whatever the last good sync left, so a failure is
         ; only ever a stale panel - say so and keep drawing it.
         FFM_COMM_MSG := (f.Length >= 2 && f[2] != "") ? f[2] : "sync failed"
+        if forced
+            FFMSay("COMMUNITY REFRESH FAILED - " StrUpper(FFM_COMM_MSG), C_ACC)
     }
     HubPoke()
 }
@@ -5522,6 +5620,7 @@ FFMSay(msg, col := 0) {
     FFM.msgCol := col ? col : 0xFF34D399
     FFM.msgAt := A_TickCount
     HubPoke()
+    HubPokeLater(5300)                 ; LOW PERFORMANCE MODE: the frame that lands the settled look
 }
 
 ; Prepend a log entry (method · flag · status). Capped at 120 to prevent unbounded growth.
@@ -5567,9 +5666,12 @@ FFMReApplyBurst() {
 }
 
 ; ---- which clients RE-APPLY is responsible for ----
-; The active tab whenever it has a staged set, plus every OTHER client that has
-; actually been injected. A tab nobody has applied anything to has nothing to
-; hold, so it is not visited.
+; Every client that has actually been injected - the active tab included, and
+; on the same test. It used to be enough for the active tab to have a staged
+; set, which was the other half of RE-APPLY injecting on its own: a client
+; nobody had applied anything to was visited, found every staged flag "drifted"
+; from a value it had never held, and wrote the lot. A tab with nothing
+; injected has nothing to hold, so it is not visited.
 ; ---- is ANYTHING of ours in ANY client? ----
 ; The UNINJECT button used to light off FFM.orig alone, which was right while
 ; it only undid the active tab. Now that it undoes all of them, that test would
@@ -5589,7 +5691,7 @@ FFMReApplyTargets() {
     out := []
     for pid in FFM.inst {
         if (pid = FFM.pid) {
-            if (FFM.flags.Length || FFM.orig.Count)
+            if FFM.orig.Count
                 out.Push(pid)
         } else if (FFM.ps.Has(pid) && FFM.ps[pid].orig && FFM.ps[pid].orig.Count)
             out.Push(pid)
@@ -5618,7 +5720,11 @@ FFMReApplyTick() {
     if !ffReApply
         return
     tg := FFMReApplyTargets()
-    if (tg.Length > 1) {
+    ; Any target, not two or more: now that the active tab is a target only
+    ; when it has been injected, the one client holding something can be a
+    ; tab other than the one on screen, and a rotation that only started at
+    ; two would never have gone to it.
+    if (tg.Length) {
         FFM.raRot := Mod(FFM.raRot, tg.Length) + 1
         want := tg[FFM.raRot]
         if (want != FFM.pid) {
@@ -5644,7 +5750,11 @@ FFMReApplyTick() {
     }
     FFMReApplyRun()
 }
-; Re-apply timer — silently re-injects any flag whose live value has drifted.
+; Re-apply timer - silently re-asserts any INJECTED flag whose live value has
+; drifted. Injected: in FFM.orig, which only INJECT and AUTO INJECT add to. It
+; never puts a flag in on its own. Switch RE-APPLY on with nothing injected and
+; it waits; open a client with it on and the client keeps Roblox's values until
+; you press INJECT - and from then on, this holds what you pressed.
 FFMReApplyRun() {
     global ffReApply, ffUseSingleton
     ; Every early return below still has to re-arm, or holding stops dead the
@@ -5653,6 +5763,14 @@ FFMReApplyRun() {
     if (!ffReApply)
         return
     if (!FFM.pid || !MemIO.hProcess || FFM.flags.Length = 0) {
+        FFMReApplyArm(FFM_RA_IDLE)
+        return
+    }
+    ; Nothing injected in this client: nothing to hold. Before the header
+    ; work, so a client that has never been injected costs this tick one Map
+    ; count - not a table read, and never the structural sweep Header() can
+    ; fall through to while a client is still starting.
+    if (!FFM.orig.Count) {
         FFMReApplyArm(FFM_RA_IDLE)
         return
     }
@@ -5713,6 +5831,8 @@ FFMReApplyRun() {
             nm   := fl["name"]
             if !FFMOn(fl)
                 continue                        ; switched off: not re-asserted
+            if !FFM.orig.Has(nm)
+                continue                        ; never injected: not this tick's to write
             ; Backing off. Costs one Map lookup instead of a read, a write and
             ; a read-back, and the countdown means a flag that becomes writable
             ; again is retried within a second or two rather than never.
@@ -5724,9 +5844,9 @@ FFMReApplyRun() {
             dv   := FFlags.Coerce(fl["value"])
             if (dv = "")
                 continue                        ; string flag - nothing writable
-            ; an owned flag is re-asserted where INJECT wrote it (FFM.origAt);
-            ; only one not yet owned is resolved here, through the index, and
-            ; cached while the table identity holds - see FFM.raVP
+            ; re-asserted where INJECT wrote it (FFM.origAt); an owned flag
+            ; whose record predates origAt is resolved here, through the index,
+            ; and cached while the table identity holds - see FFM.raVP
             if FFM.origAt.Has(nm)
                 vp := FFM.origAt[nm]
             else if FFM.raVP.Has(nm)
@@ -5739,7 +5859,8 @@ FFMReApplyRun() {
             }
             if (!vp)
                 continue
-            cur := MemIO.ReadI32Chk(vp)
+            w   := FFMWidthOf(nm)
+            cur := MemIO.ReadChk(vp, w)
             if (cur = "")
                 continue                        ; unreadable - do not guess at it
             if (cur = dv) {
@@ -5754,35 +5875,19 @@ FFMReApplyRun() {
                     FFM.raStuck.Delete(nm)
                 continue                        ; already at the wanted value
             }
-            ; Snapshot the pre-injection value here as well. Re-apply runs on its own
-            ; timer and can fire BEFORE any manual inject, so without this a flag it
-            ; wrote had no original recorded and UNINJECT could not put it back.
-            ;
-            ; AFTER the cur = dv test, never before it. A flag already sitting at
-            ; our target is the one case where the current value tells us nothing:
-            ; it is either Roblox's own value or the one we wrote earlier, and
-            ; there is no way to tell from here. Recording it as the "original"
-            ; when it was ours makes UNINJECT write our value back and call it a
-            ; restore - the flag stays injected and nothing reports a problem.
-            ;
-            ; That is reachable exactly the way it was described: inject on the
-            ; app screen, where a flag can be written before its value is
-            ; readable and so gets no original; join a game; re-apply finds it at
-            ; our value and adopts that as the original. Losing the snapshot in
-            ; this branch costs nothing - a flag already at the target needs no
-            ; write to "restore" it either.
-            ; and committed only once the write is VERIFIED below, for the same
-            ; reason the inject passes do it that way: a snapshot taken here and
-            ; a write that is then refused leaves UNINJECT willing to write an
-            ; "original" over a flag this module never managed to change.
-            hadR := FFM.orig.Has(nm)
-            if (FFlags.SetAt(vp, fl["value"])) {
+            ; No snapshot here, and no ownership taken: every flag that reaches
+            ; this line is already in FFM.orig with the original INJECT read
+            ; before its first write. The tick only puts back what that press
+            ; put in. (Re-apply used to record originals of its own for flags
+            ; it wrote first - the flip side of writing flags nobody had
+            ; injected, and gone with it.)
+            if (FFlags.SetAtW(vp, fl["value"], w)) {
                 ; SetVia returning true means the WRITE call succeeded, not that
                 ; the value stuck. Reading it straight back is what tells the
                 ; difference between holding a flag and only appearing to: a
                 ; page that silently discards writes, a stale pointer, or Roblox
                 ; rewriting it immediately all report success and change nothing.
-                back := MemIO.ReadI32Chk(vp)
+                back := MemIO.ReadChk(vp, w)
                 if (back = "" || back != dv) {
                     n := (FFM.raStuck.Has(nm) ? FFM.raStuck[nm] : 0) + 1
                     FFM.raStuck[nm] := n
@@ -5807,8 +5912,6 @@ FFMReApplyRun() {
                              . (back = "" ? "unreadable" : back) ")")
                 } else {
                     restored++
-                    if !hadR
-                        FFM.orig[nm] := cur, FFM.origAt[nm] := vp   ; the write took: now it is ours to undo
                     if FFM.raStuck.Has(nm)
                         FFM.raStuck.Delete(nm)
                     ; it took - clear the backoff so the next failure starts over
@@ -5882,6 +5985,24 @@ FFMKindOf(fl) {
     if (p != "")
         return InStr(p, "String") ? "string" : InStr(p, "Flag") ? "bool" : "int"
     return (fl["type"] = "string") ? "string" : (fl["type"] = "bool") ? "bool" : "int"
+}
+; ---- how wide a flag's storage is ----
+; 1 for a bool flag (FFlag, DFFlag, SFFlag), 4 for an int (FInt, DFInt, FLog and
+; the rest). Every read and write on a value address goes through this, so a
+; bool is touched as the single byte it is - see FFlags.SetAtW for what four
+; bytes did to it. The prefix is Roblox's own declaration and decides; a bare
+; name falls back to what its staged row says it is, and to four after that.
+FFMWidthOf(nm) {
+    p := FFMPfxOf(nm)
+    if (p != "")
+        return InStr(p, "Flag") ? 1 : 4
+    key := StrLower(nm)
+    if (FFM.map.Has(key)) {
+        i := FFM.map[key]
+        if (i >= 1 && i <= FFM.flags.Length && FFM.flags[i]["type"] = "bool")
+            return 1
+    }
+    return 4
 }
 ; ---- staged, and switched on ----
 ; A flag can sit in the list switched OFF: kept, searchable, exported nowhere
@@ -6091,6 +6212,11 @@ class MemIO {
     ; over a default that was never 0, and makes a flag look "held by Roblox"
     ; when nothing was actually read.
     static ReadI32Chk(addr) => (b := this.Read(addr, 4)) ? NumGet(b, 0, "Int") : ""
+    ; the same, one byte wide - a bool flag's whole storage
+    static ReadU8Chk(addr)  => (b := this.Read(addr, 1)) ? NumGet(b, 0, "UChar") : ""
+    ; the read every flag site goes through: the width the flag actually has,
+    ; from FFMWidthOf, so a bool is never read with its neighbours attached
+    static ReadChk(addr, w) => (w = 1) ? this.ReadU8Chk(addr) : this.ReadI32Chk(addr)
 
     static ReadStr(addr, sz) {
         sz := Min(sz, 8192)
@@ -6893,6 +7019,31 @@ class FFlags {
         rv := this.Coerce(value)
         if (rv = "" || !this._Ptr(vp))
             return false
+        buf := Buffer(4)
+        NumPut("Int", rv, buf)
+        return MemIO.Write(vp, buf, 4)
+    }
+    ; ---- as SetAt, at the flag's own width ----
+    ; A bool flag is ONE byte in the client - a plain bool, or the atomic bool
+    ; a DFFlag is - and only an int flag is four. Four bytes into a bool put
+    ; three of them on whatever sits next in memory, which in a client built
+    ; from flag macros is usually the next flag: injecting one bool silently
+    ; zeroed up to three others, and the four-byte read-backs then compared a
+    ; bool against its neighbours as well as itself. That is what "some flags
+    ; do not uninject" was - the byte was restored, the neighbours had moved,
+    ; and the compare said HELD BY ROBLOX. `w` is 1 or 4, from FFMWidthOf; a
+    ; value that does not fit the width is refused rather than truncated.
+    static SetAtW(vp, value, w) {
+        rv := this.Coerce(value)
+        if (rv = "" || !this._Ptr(vp))
+            return false
+        if (w = 1) {
+            if (rv < 0 || rv > 255)
+                return false
+            buf := Buffer(1)
+            NumPut("UChar", rv, buf)
+            return MemIO.Write(vp, buf, 1)
+        }
         buf := Buffer(4)
         NumPut("Int", rv, buf)
         return MemIO.Write(vp, buf, 4)
@@ -7769,9 +7920,10 @@ FFMApplyLive(isAuto := false, silent := false) {
                 miss.Push(fl)                    ; retried against the index below
                 continue
             }
+            w1  := FFMWidthOf(fl["name"])
             cur := ""
             if !had {
-                cur := MemIO.ReadI32Chk(vp1)
+                cur := MemIO.ReadChk(vp1, w1)
                 if (cur = "" || !IsInteger(cur)) {
                     ; Unreadable here does not mean unwritable, and that is the
                     ; trap: the write can land while the read failed, leaving a
@@ -7782,7 +7934,7 @@ FFMApplyLive(isAuto := false, silent := false) {
                     continue
                 }
             }
-            if (FFlags.SetAt(vp1, fl["value"])) {
+            if (FFlags.SetAtW(vp1, fl["value"], w1)) {
                 if !had
                     FFM.orig[fl["name"]] := cur, FFM.origAt[fl["name"]] := vp1
                 succ++
@@ -7867,9 +8019,10 @@ FFMApplyLive(isAuto := false, silent := false) {
                 vpr := idx[bare]
                 had0 := FFM.orig.Has(nm)
                 vp0  := (had0 && FFM.origAt.Has(nm)) ? FFM.origAt[nm] : MemIO.ReadU64(vpr + 0xC0)
+                w0   := FFMWidthOf(nm)
                 cur0 := ""
                 if !had0 {
-                    cur0 := vp0 ? MemIO.ReadI32Chk(vp0) : ""
+                    cur0 := vp0 ? MemIO.ReadChk(vp0, w0) : ""
                     if (cur0 = "") {
                         ; Refused, not written. A flag whose pre-injection value
                         ; could not be read is one UNINJECT can never put back,
@@ -7882,7 +8035,7 @@ FFMApplyLive(isAuto := false, silent := false) {
                         continue
                     }
                 }
-                if (FFlags.SetAt(vp0, fl["value"])) {
+                if (FFlags.SetAtW(vp0, fl["value"], w0)) {
                     if !had0
                         FFM.orig[nm] := cur0, FFM.origAt[nm] := vp0   ; committed only now - see pass one
                     succ++
@@ -8012,8 +8165,11 @@ FFMUninject(silent := false) {
                 so := wrote ? FFlags.StrObj(vp) : ""
                 back := (so != "") ? ("str:" so.hex) : ""
             } else {
-                wrote := FFlags._Ptr(vp) ? FFlags.SetAt(vp, val) : false
-                back  := wrote ? MemIO.ReadI32Chk(vp) : ""
+                ; at the flag's own width, the same width the original was
+                ; read at - see FFlags.SetAtW
+                wu := FFMWidthOf(nm)
+                wrote := FFlags._Ptr(vp) ? FFlags.SetAtW(vp, val, wu) : false
+                back  := wrote ? MemIO.ReadChk(vp, wu) : ""
             }
             if (!wrote) {
                 bad++
@@ -8461,6 +8617,10 @@ FFMExport() {
     }
     if pickerPid && ProcessExist(pickerPid)
         return
+    ; a plain export, whatever was left behind: a CLEAN whose dialog was
+    ; cancelled used to leave its scan here, and the next EXPORT wrote the
+    ; cleaned set while announcing it had
+    FFM.exportMode := "all", FFM.cleanScan := 0
     cmd := A_IsCompiled ? '"' A_ScriptFullPath '" ffexport ' HL.gui.Hwnd
                         : '"' A_AhkPath '" "' A_ScriptFullPath '" ffexport ' HL.gui.Hwnd
     try Run(cmd, , , &pickerPid)
@@ -8468,90 +8628,59 @@ FFMExport() {
     FFMSay("CHOOSE A PATH - CANCEL COPIES TO CLIPBOARD", 0xFFFBBF24)
 }
 
-; ---------------- CLEAN: which flags to drop, and why ----------------
-; Five independent signals. Four drop a flag; the fifth repairs one.
+; ---------------- CLEAN: which flags to keep, and why ----------------
+; One rule: the flags the last injection wrote. FFM.orig is the set this module
+; changed in the attached client and can change back - every name in it went
+; in and stayed in - and FFM.failed is every name the injector refused, with
+; its reason in the INJECTION log. A staged name in neither was never tried:
+; added since the last INJECT, or switched off when it ran. CLEAN keeps the
+; first set, drops the other two, and logs a reason for each drop. Nothing
+; else is judged here - a value the client would not take is on the failed list
+; already, and so is a name this build's table does not have.
 ;
-; `forFile` separates the two things CLEAN is asked to be. An export bound for
-; ClientAppSettings.json and a memory-injection audit disagree about string
-; flags: the settings file takes them happily, MemIO cannot write them at all.
-; The old CLEAN read FFM.failed without that distinction, so a valid FString
-; the injector skipped was thrown out of a JSON file it would have worked in.
+; The older scan judged the FILE instead of the injection - live-list
+; membership, type sigils, duplicates - and left the failed list out on the
+; argument that a memory write says nothing about a settings file. True, and
+; not what the row promises: the hint, the sheet and the tour all say "without
+; the failed ones", and a CLEAN that kept them while its badge counted them was
+; the bug. The file rules live on in FFMTypeFault, which the staging field
+; still uses on the way in.
 ;
-; ---- and it disagrees about two more things, which is why the FILE now sees
-;      only two of the four drop signals ----
-; An injection failure is not a verdict on the flag. The reasons the injector
-; records are "not in this build's table", "table unreadable", "original
-; unreadable", "page locked by the anti-cheat" and "too long to write live" -
-; every one of them a fact about writing process memory, and the last two are
-; precisely the flags the settings file exists to carry. Only a bad VALUE says
-; anything about the file, and signal 3 catches that on its own. So signal 1
-; is the audit's (PRUNE), never the file's.
-; Two staged names sharing a bare name are one flag to the injector, because
-; the client's table has no prefixes - but they are two keys in the settings
-; file, and FFlagX and DFFlagX are both real. So signal 4 is the audit's too.
-; The client ignores a key it does not know; it cannot un-ignore one CLEAN
-; threw away. When in doubt the file keeps the flag.
+; Without an injection there is nothing to judge against, and FFMClean says so
+; rather than exporting the whole set under a name that promises otherwise.
+;
+; The one thing kept from the older scan is a repair, not a drop: a bare name
+; injects fine and is dead in a settings file, where Roblox matches the full
+; prefixed key. When the live list knows the prefixed form, the FILE gets that
+; and the staged name stays exactly as typed. `forFile` is that switch, and
+; nothing else now.
 FFMCleanScan(forFile := true) {
-    scan := { drop: Map(), fix: Map(), why: Map() }
-    seenBare := Map()
+    scan := { drop: Map(), fix: Map(), why: Map(), kept: 0 }
     haveLive := (FFM.liveAt && FFM.live.Count)
-
     for fl in FFM.flags {
-        nm  := fl["name"]
-        k   := StrLower(nm)
-        val := Trim(String(fl["value"]))
-        pfx := FFMPfxOf(nm)
-        bk  := StrLower(FFMBareOf(nm))
-
-        ; 1. the memory write was refused - the audit's signal, not the file's
-        if (!forFile && FFM.failed.Has(nm)) {
-            scan.drop[k] := true, scan.why[k] := "injection refused"
+        nm := fl["name"]
+        k  := StrLower(nm)
+        if !FFMOn(fl)
+            continue                           ; switched off: written nowhere, exported nowhere
+        if FFM.failed.Has(nm) {
+            scan.drop[k] := true, scan.why[k] := "injection refused - see the INJECTION log"
             continue
         }
-
-        ; 2. retired outright. Only asked once UPDATE has actually run, so a
-        ;    user who has never pressed it gets the old behaviour rather than a
-        ;    CLEAN that drops everything against an empty index - and only on
-        ;    a list that came back whole (FFM.livePartial): a name missing from
-        ;    a list missing a source is missing from nothing.
-        if (haveLive && !FFM.livePartial && !FFM.live.Has(nm) && !FFM.bare.Has(bk)) {
-            scan.drop[k] := true, scan.why[k] := "not in the live flag list"
+        if !FFM.orig.Has(nm) {
+            scan.drop[k] := true, scan.why[k] := "not injected - added since the last INJECT, or off when it ran"
             continue
         }
-
-        ; 3. the value does not fit the type sigil. A bare name carries no sigil
-        ;    of its own, so borrow the live one - that is what makes this catch
-        ;    UPDATE's own bad renames, which arrive bare.
-        chk := pfx
-        if (chk = "" && haveLive && FFM.bare.Has(bk))
-            chk := FFMPfxOf(FFM.bare[bk])
-        if (chk != "" && (f := FFMTypeFault(chk, val)) != "") {
-            scan.drop[k] := true, scan.why[k] := f
-            continue
-        }
-
-        ; 4. injection strips prefixes, so two staged names sharing a bare name
-        ;    are ONE flag to the writer and the later one silently wins. Keep
-        ;    the first, drop the rest. FFMJson's seen-map does not catch this:
-        ;    it dedupes on the full name, and FFlagX / DFFlagX differ there -
-        ;    which is exactly why the FILE keeps both: there they are two keys.
-        if (!forFile && seenBare.Has(bk)) {
-            scan.drop[k] := true, scan.why[k] := "duplicate of " seenBare[bk]
-            continue
-        }
-        seenBare[bk] := nm
-
-        ; 5. not a drop, a repair. A bare name is correct for injection and dead
-        ;    in a settings file - Roblox matches the full prefixed key and
-        ;    ignores anything else. Write the live form to the FILE and leave
-        ;    the staged name exactly as the user typed it.
-        if (forFile && haveLive && pfx = "" && FFM.bareAll.Has(bk)) {
-            ; pick the live form whose sigil can hold this value, not whichever
-            ; one happened to come first in the source file
-            for c in FFM.bareAll[bk] {
-                if FFMSigilFits(FFMPfxOf(c), fl["type"]) {
-                    scan.fix[k] := c
-                    break
+        scan.kept++
+        if (forFile && haveLive && FFMPfxOf(nm) = "") {
+            bk := StrLower(FFMBareOf(nm))
+            if FFM.bareAll.Has(bk) {
+                ; pick the live form whose sigil can hold this value, not
+                ; whichever one happened to come first in the source file
+                for c in FFM.bareAll[bk] {
+                    if FFMSigilFits(FFMPfxOf(c), fl["type"]) {
+                        scan.fix[k] := c
+                        break
+                    }
                 }
             }
         }
@@ -8606,7 +8735,7 @@ FFMPrune() {
         FFMSay("NOTHING STAGED", C_ACC)
         return
     }
-    scan := FFMCleanScan(false)                ; memory rules, not file rules
+    scan := FFMCleanScan(false)                ; no repair: staged names stay as typed
     if !scan.drop.Count {
         FFMSay("NOTHING TO PRUNE", 0xFF34D399)
         return
@@ -8632,19 +8761,24 @@ FFMPrune() {
     HubPoke()
 }
 
-; ---------------- CLEAN: export staged flags minus the ones that failed ----------------
+; ---------------- CLEAN: export the flags that injected, minus the ones that failed ----------------
+; The gate is back, and it is the right way round now that the scan judges the
+; injection: with no injection there is nothing to keep by. FFM.orig and
+; FFM.failed are both emptied by UNINJECT and by the client closing, so CLEAN
+; is a thing to do right after an INJECT, while its verdict is on the panel.
 FFMClean() {
     global pickerPid
     if (FFM.flags.Length = 0) {
         FFMSay("NOTHING STAGED", C_ACC)
         return
     }
-    ; The old `if (!FFM.failed.Count)` gate is gone. It made CLEAN unreachable
-    ; until an injection had run, which is backwards: the point of a clean pass
-    ; is to fix the set BEFORE handing it to the injector.
+    if (!FFM.orig.Count && !FFM.failed.Count) {
+        FFMSay("INJECT FIRST - CLEAN KEEPS THE FLAGS THAT INJECTED", C_ACC)
+        return
+    }
     scan := FFMCleanScan(true)
-    if (!scan.drop.Count && !scan.fix.Count) {
-        FFMSay("NOTHING TO CLEAN - " FFM.flags.Length " FLAG(S) VALID", 0xFF34D399)
+    if (scan.kept = 0) {
+        FFMSay("NOTHING INJECTED CLEANLY - NOTHING TO EXPORT", C_ACC)
         return
     }
     if pickerPid && ProcessExist(pickerPid)
@@ -8660,9 +8794,9 @@ FFMClean() {
                         : '"' A_AhkPath '" "' A_ScriptFullPath '" ffexport ' HL.gui.Hwnd
     try Run(cmd, , , &pickerPid)
     HubPickWatch(pickerPid)   ; raise the hub again when the dialog closes
-    FFMSay("CHOOSE A PATH  " (FFM.flags.Length - scan.drop.Count) " KEPT  "
-         . scan.drop.Count " DROPPED"
-         . (scan.fix.Count ? "  " scan.fix.Count " PREFIXED" : ""), 0xFFFBBF24)
+    FFMSay("CHOOSE A PATH  " scan.kept " KEPT  " scan.drop.Count " DROPPED"
+         . (scan.fix.Count ? "  " scan.fix.Count " PREFIXED" : "")
+         . " - CANCEL COPIES TO CLIPBOARD", 0xFFFBBF24)
 }
 
 ; ---------------- presets: replace the staged set ----------------
@@ -8715,7 +8849,7 @@ FFMCommInsert(ci, slot) {
         ; no button when the file is missing - so if it fires, the file went
         ; away while the panel was open. Re-sync rather than just complaining.
         st.have := 0
-        FFMSay(StrUpper(st.file) " IS MISSING FROM THE CACHE - RESYNCING", C_ACC)
+        FFMSay(StrUpper(st.file) " IS MISSING FROM THE CACHE - REFRESHING", C_ACC)
         FFMCommSync(1)
         return
     }
@@ -8751,7 +8885,7 @@ FFMExportFile(path) {
     FFM.exportMode := "all"
     if clean {
         body := FFMJsonClean(FFM.cleanScan)
-        kept := FFM.flags.Length - FFM.cleanScan.drop.Count
+        kept := FFM.cleanScan.kept             ; counted by the scan: on, and injected
         FFM.cleanScan := 0                     ; one scan, one write
     } else {
         body := FFMJson(false)
@@ -8771,6 +8905,17 @@ FFMExportFile(path) {
 FFMExportClip() {
     if (FFM.flags.Length = 0) {
         FFMSay("NOTHING STAGED", C_ACC)
+        return
+    }
+    ; the cancel path of the CLEAN dialog lands here too - and copies the
+    ; cleaned set, the way the status line promised, not the whole one
+    clean := (FFM.exportMode = "clean") && IsObject(FFM.cleanScan)
+    FFM.exportMode := "all"
+    if clean {
+        A_Clipboard := FFMJsonClean(FFM.cleanScan)
+        kept := FFM.cleanScan.kept
+        FFM.cleanScan := 0
+        FFMSay("CLEANED - COPIED " kept " TO CLIPBOARD", 0xFF34D399)
         return
     }
     A_Clipboard := FFMJson()
@@ -11734,7 +11879,7 @@ FFMSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
                 ? ("write flags into CLIENT " FFMInstIdx(FFM.pid) "  -  pid " FFM.pid)
                 : "write flags into Roblox memory"
             , "find the flag table by code signature"
-            , "re-inject every 2 s to hold flags"
+            , "hold what you injected - rewrite it every 2 s"
             , "inject 4 s after Roblox is detected"
             , "export your flags without the failed ones"
             , "rename outdated flags to their current names"
@@ -11828,11 +11973,15 @@ FFMSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
                 FFMBtn(469, axs + HL.abw - 92, ry + 5, 76, 26
                     , "UNINJECT", acc, fb, FFMAnyInjected() ? 1 : 0)
             } else if (i = 5) {
+                ; the badge is the failures; the button lights on any injection
+                ; verdict at all, because a clean pass with nothing failed is
+                ; still the injected set and still worth a file
                 nfail := FFM.failed.Count
                 if (nfail)
                     Txt(nfail " failed", axs + HL.abw - 176, ry + 11, 62, 14, HL.fXs
                         , FA(Alpha(acc, 200), fb), fmtR)
-                FFMBtn(485, axs + HL.abw - 108, ry + 5, 92, 26, "CLEAN", acc, fb, nfail ? 1 : 0)
+                FFMBtn(485, axs + HL.abw - 108, ry + 5, 92, 26, "CLEAN", acc, fb
+                    , (nfail || FFM.orig.Count) ? 1 : 0)
             } else if (i = 6) {
                 ; UPDATE FLAGS: reconcile staged names against the live list.
                 ; Shows UPDATING while the fetch child is out.
@@ -12327,17 +12476,19 @@ FFMCommView(ff, now, acc, dx := 0, dy2 := 0) {
     ; The subtitle carries the sync state. A spinner or a progress bar would be a
     ; second thing to watch for something that is usually over before it is
     ; noticed - the panel is already fully drawn from the cache while it runs.
-    hdr := FFMCommSyncing() ? "checking for updates..."
+    hdr := FFMCommSyncing() ? "refreshing from the repository..."
          : (FFM_COMM_MSG != "") ? ("offline - " FFM_COMM_MSG)
          : "sets shared by other players"
     Txt(hdr, x + 176, y + 12, 260, 16, HL.fS
         , FA((FFM_COMM_MSG != "" && !FFMCommSyncing()) ? 0x80FBBF24 : 0x66C7CBE0, fo), fmtL)
 
-    ; ---- SYNC ----
+    ; ---- REFRESH ----
     ; The panel told people to sync and gave them nothing to press: the only way
     ; to retry was to close the view and open it again, which is a thing you have
     ; to be told. It also disables itself while one is running, so the state is
-    ; readable without watching the subtitle.
+    ; readable without watching the subtitle. REFRESH, not SYNC: it is the word
+    ; for "go and look again", and it always goes - the freshness gate the
+    ; automatic syncs sit behind does not apply to a press.
     hvS := HL.h.Get(578, 0.0)
     sbx := x + w - 116, sby := y + 6      ; 116, not 108: at 108 its right edge
                                          ; ran under the close cross's zone, which
@@ -12346,7 +12497,7 @@ FFMCommView(ff, now, acc, dx := 0, dy2 := 0) {
     FillRR(sbx, sby, 76, 22, 7, b), DelB(b)
     pn := Pen(FA(Alpha(acc, FFMCommSyncing() ? 60 : Round(90 + 90*hvS)), fo), 1)
     StrokeRR(sbx, sby, 76, 22, 7, pn), DelP(pn)
-    Txt(FFMCommSyncing() ? "SYNCING" : "SYNC", sbx, sby + 3, 76, 16, HL.fXs
+    Txt(FFMCommSyncing() ? "REFRESHING" : "REFRESH", sbx, sby + 3, 76, 16, HL.fXs
         , FA(Alpha(FFMCommSyncing() ? 0xFFC7CBE0 : AccHi(acc, 0.4)
                  , FFMCommSyncing() ? 120 : Round(200 + 55*hvS)), fo), fmtC)
 
@@ -13107,7 +13258,7 @@ global DOP_SYSN  := 5
 ; Sized against HubFtrY(), not against the card bottom. The hub reserves the
 ; last HUB_FTRH pixels for its own version band, and two cards at the old
 ; 46/58 ran 16px into it - which is what put the buttons on top of the
-; YURI - V1.0 release stamp.
+; YURI - V1.0 BETA stamp.
 global DOP_RH    := 42, DOP_RG := 52
 global DOP_JOBMS := 600000           ; backstop only - see DOPPoll, which
                                      ; watches the launcher process instead
@@ -13557,6 +13708,7 @@ DOPSay(msg, col := 0) {
     DOP.msgCol := col ? col : 0xFF34D399
     DOP.msgAt := A_TickCount
     HubPoke()
+    HubPokeLater(6300)                 ; LOW PERFORMANCE MODE: the frame that lands the settled look
 }
 
 ; ---- PowerShell literal quoting --------------------------------------------
@@ -14921,6 +15073,7 @@ LGIVis()    => LGI_VISN*LGI_RG
 LGISay(msg, col := 0) {
     LGI.msg := msg, LGI.msgCol := col ? col : C_ON, LGI.msgAt := A_TickCount
     HubPoke()
+    HubPokeLater(6300)                 ; LOW PERFORMANCE MODE: the frame that lands the settled look
 }
 
 ; ---- persistence ----
@@ -15736,10 +15889,12 @@ LGIFooter(px, py, pw, ff, now, acc, mt) {
 ; A guided sequence over the live interface: a scrim dims everything but a
 ; spotlight cut around the control being described, a card beside it says
 ; what it is and what it does, a ghost cursor shows the click, and NEXT walks
-; on. The tour drives the hub itself - it changes tabs and opens modules so
-; every step is looking at the real thing, not a picture of it. It runs once,
-; after the opening card has left, and is marked seen in the ini; the
-; dashboard's TOUR button plays it again on demand.
+; on. The tour drives the hub itself - it changes tabs, opens modules, scrolls
+; their lists to the row in question and raises the overlays and sheets their
+; buttons would - so every step is looking at the real thing, not a picture
+; of it, and nothing it opens is ever applied, injected or launched. It runs
+; once, after the opening card has left, and is marked seen in the ini; the
+; dashboard's TUTORIAL button plays it again on demand.
 ;
 ; Everything here is drawn by the hub's own primitives inside HubRender, after
 ; every panel and before the modal gate card, so it sits over the interface
@@ -15755,34 +15910,63 @@ global TUT_IN_MS := 420, TUT_OUT_MS := 360, TUT_STEP_MS := 260, TUT_CUR_MS := 11
 
 ; ---- the steps ----
 ; Each: which tab to be on, which module to open (0 none, -1 leave as is), a
-; title, the body as pre-wrapped lines (the card is 372 wide in base units and
-; the small face carries ~63 characters), the anchor - a function returning
-; [x, y, w, h] of the thing to light, or 0 for a centred card with no hole -
-; and whether the ghost cursor should travel to it.
+; title, the body as lines (a blank entry is a paragraph break; the rest is
+; re-wrapped to whatever width the card ends up at), the anchor - a function
+; returning [x, y, w, h] of the thing to light, or 0 for a centred card with
+; no hole - and whether the ghost cursor should travel to it. A step may also
+; ask for:
+;   kick   the line above the title, when the default for its tab is not right
+;   prof   the EDIT PROFILE sheet, open
+;   view   an overlay, opened the way its own button opens it - "db", "log"
+;          and "comm" on the flag manager, "acct" on SPECIAL - and closed
+;          again the moment the tour moves on
+;   det    a function that opens a detail sheet, closed the same way
+;   ffs, crs, rss, sps
+;          where the flag, cursor, client-settings and SPECIAL lists are
+;          scrolled to for the step, as a function of the layout; every other
+;          step puts them back at the top
+;   rail   1 to scroll the module rail to its foot, for the cards below the
+;          fold
+;   card   "top" or "bot" to pin the card to that edge of the window - for a
+;          light that fills the whole content column, where no side has room
+;          and the card would otherwise land on the thing it describes
 TutBuild() {
     global TUT_STEPS
     st := []
+    ; ================= the hub itself =================
     st.Push({tab: 1, mod: -1, ttl: "WELCOME TO YURI", cur: 0, glyph: "brand", anchor: 0
         , body: ["This is a hub of tools for Roblox: fast flags, cursors, client"
-               , "settings, saved places, device tweaks and a few automations."
+               , "settings, saved places and accounts, device tweaks and a"
+               , "script runner."
                , ""
-               , "This tour walks through every part of it. It takes about two"
-               , "minutes, points at real controls, and never presses anything"
-               , "you did not ask for. NEXT to begin; SKIP at any time."]})
-    st.Push({tab: 1, mod: -1, ttl: "THE SIDEBAR", cur: 1, glyph: "nav"
-        , anchor: () => [HL.sbx, HubNavY(1) - 4, HL.sbw, HL.nvg*6]
+               , "This tour walks through every part of it, control by control."
+               , "It takes about ten minutes, opens panels and sheets so each"
+               , "step is looking at the real thing, and never applies, injects"
+               , "or launches anything. NEXT walks on, BACK returns, SKIP leaves"
+               , "at any time - and a click on the lit control counts as NEXT."]})
+    st.Push({tab: 1, mod: -1, ttl: "THE SIDEBAR", cur: 1, glyph: "nav", kick: "SIDEBAR"
+        , anchor: () => [HL.sbx, HubNavY(1) - 4, HL.sbw, HubNavY(6) + HL.nvh - HubNavY(1) + 4]
         , body: ["The six entries down the left are the hub's tabs. DASHBOARD is"
                , "the overview; INTEGRATIONS holds the modules - the tools"
-               , "themselves; SCRIPT HUB runs your own scripts; SETTINGS is how"
-               , "the hub behaves and looks; CREDITS and UPDATE LOGS are what"
-               , "they say. Click an entry to switch; the page slides across."]})
+               , "themselves; SCRIPT HUB writes, checks and runs AutoHotkey"
+               , "scripts of your own; SETTINGS is how the hub looks and behaves;"
+               , "CREDITS and UPDATE LOGS are what they say. Click an entry to"
+               , "switch; the page slides across."]})
+    st.Push({tab: 1, mod: -1, ttl: "THE HEART", cur: 1, glyph: "brand", kick: "SIDEBAR"
+        , anchor: () => [HL.sbx + 6, HubNavY(6) + HL.nvh + 13, HL.sbw - 2, 82]
+        , body: ["The heart under the list is a seventh page. Press it and the"
+               , "hub opens TOWN: three small pixel towns, picked from the chips"
+               , "in the title row - a skyline on its own two-minute day, a city"
+               , "street, a village from above - each of them alive, none of"
+               , "them for anything but looking at. Press the heart again, or"
+               , "any entry above it, to come back."]})
     st.Push({tab: 1, mod: -1, ttl: "WINDOW CONTROLS", cur: 0, glyph: "grip"
         , anchor: () => [HL.brx + 60, HL.pd + 6, HL.bcx - HL.brx - 46, 32]
         , body: ["The six-dot grip is the only place the hub can be dragged from -"
                , "everything else is a control. The dash minimises the hub to a"
-               , "small pill you can park anywhere; the cross closes it. The hub"
-               , "never takes focus from a game, so it can sit over Roblox while"
-               , "you play."]})
+               , "small pill you can park anywhere, or hides it to the tray if"
+               , "SETTINGS says so; the cross closes it. The hub never takes"
+               , "focus from a game, so it can sit over Roblox while you play."]})
     st.Push({tab: 1, mod: -1, ttl: "YOUR PROFILE", cur: 1, glyph: "people", kick: "SIDEBAR"
         , anchor: () => [HL.sbx, HL.avcy - 30, HL.sbw, 60]
         , body: ["The picture and the name at the foot of the sidebar are yours."
@@ -15799,137 +15983,471 @@ TutBuild() {
                , "The four RING styles beside it decide how the portrait is"
                , "framed - the ring follows it everywhere the hub draws you,"
                , "the sidebar and the launch gate included."]})
-    st.Push({tab: 1, mod: -1, ttl: "EDIT PROFILE: NAME AND BIO", cur: 0, glyph: "list", kick: "SIDEBAR  ·  EDIT PROFILE", prof: 1
+    ; pinned to the top with a short body: the two fields sit mid-window,
+    ; where a card of any size lands on one of them, and this one clears
+    ; the NAME field by a hair
+    st.Push({tab: 1, mod: -1, ttl: "EDIT PROFILE: NAME AND BIO", cur: 0, glyph: "list", kick: "SIDEBAR  ·  EDIT PROFILE", prof: 1, card: "top"
         , anchor: () => [HL.pd + HL.cw/2 - 174, HL.pd + HL.ch/2 - 47, 348, 100]
-        , body: ["NAME is what the sidebar shows under the picture, and what the"
-               , "gate greets you by. BIO is the line that appears when you click"
-               , "the name - anything you like. Click either field to type into"
-               , "it; the caret goes straight in."]})
+        , body: ["NAME is what the sidebar shows under the picture and what the"
+               , "gate greets you by; BIO is the line a click on the name reveals"
+               , "- anything you like. Click either to type; the caret goes in."]})
     st.Push({tab: 1, mod: -1, ttl: "EDIT PROFILE: FONT, AND SAVE", cur: 0, glyph: "palette", kick: "SIDEBAR  ·  EDIT PROFILE", prof: 1
         , anchor: () => [HL.pd + HL.cw/2 - 174, HL.pd + HL.ch/2 + 51, 348, 118]
         , body: ["HUB FONT picks the face the hub writes in - eight choices, from"
                , "the plain to the loud; the change applies everywhere at once."
                , "SAVE keeps the whole sheet; the cross at the top right closes"
                , "it without saving, and so does a click anywhere outside it."]})
-    st.Push({tab: 1, mod: -1, ttl: "DASHBOARD: AT A GLANCE", cur: 0, glyph: "gauge"
-        , anchor: () => [HL.ctx, HL.sty, HL.ctw, HL.sth + 16 + HL.gh]
-        , body: ["The tiles and the graph are the hub's own vital signs - what is"
-               , "armed, what is running, how the session is going. They are"
-               , "informational; nothing here needs pressing."]})
-    st.Push({tab: 1, mod: -1, ttl: "OPEN ROBLOX FROM HERE", cur: 1, glyph: "dart"
-        , anchor: () => [HL.ctx + HL.ctw - 190, HL.cty - 9, 158, 36]
-        , body: ["This launches the Roblox client the way its own shortcut does."
+    ; ================= the dashboard =================
+    st.Push({tab: 1, mod: -1, ttl: "DASHBOARD: THE THREE TILES", cur: 0, glyph: "gauge"
+        , anchor: () => [HL.ctx, HL.sty, HL.ctw, HL.sth]
+        , body: ["SESSION is how long this run of the hub has been open. TOTAL"
+               , "TIME is every session added together, and DAILY AVG is that"
+               , "total spread over the days the hub has seen - screen time per"
+               , "day. They count whenever the hub is running, game or no game,"
+               , "and nothing here needs pressing."]})
+    st.Push({tab: 1, mod: -1, ttl: "SCREEN TIME", cur: 0, glyph: "clock"
+        , anchor: () => [HL.ctx, HL.gy, HL.ctw, HL.gh - 12]
+        , body: ["One bar per hour of today: the accent is time the hub was open,"
+               , "amber over it is time a system was armed as well. The current"
+               , "hour is lit, with its figure at the right."]})
+    st.Push({tab: 1, mod: -1, ttl: "WHAT'S NEW, AND UPDATES", cur: 0, glyph: "news"
+        , anchor: () => [HL.ctx, HL.ly, HL.ctw - 192, Max(120, HL.pd + HL.ch - 34 - HL.ly)]
+        , body: ["The last seven changes to this build, under the version badge -"
+               , "the full list is the UPDATE LOGS tab. CHECK FOR UPDATES asks the"
+               , "repository whether a newer build exists and offers to install"
+               , "it - the hub restarts into the new version by itself. AUTO"
+               , "UPDATE, in SETTINGS, runs that check at launch."]})
+    st.Push({tab: 1, mod: -1, ttl: "SYSTEMS AND SCRIPTS", cur: 0, glyph: "bolt"
+        , anchor: () => [HL.ctx + HL.ctw - 178, HL.ly, 178, HL.pd + HL.ch - 34 - HL.ly]
+        , body: ["Two counters. SYSTEMS is how many of the hub's systems are"
+               , "armed right now, and a line says which: injected flags, an"
+               , "applied cursor, client settings, live scripts. SCRIPTS is how"
+               , "many scripts the SCRIPT HUB has placed, and how many of them"
+               , "are running. Both turn green when something is live."]})
+    st.Push({tab: 1, mod: -1, ttl: "OPEN ROBLOX, AND THIS TOUR", cur: 1, glyph: "dart"
+        , anchor: () => [HL.ctx + HL.ctw - 294, HL.cty - 9, 262, 36]
+        , body: ["OPEN ROBLOX launches the client the way its own shortcut does;"
+               , "the lamp at its right end is green while a client is running."
                , "With AUTO INJECT armed in the flag manager, staged flags are"
                , "written into the client a few seconds after it starts. The"
-               , "launch gate you saw at start-up has the same button."]})
-    st.Push({tab: 1, mod: -1, ttl: "WHAT'S NEW, AND UPDATES", cur: 0, glyph: "news"
-        , anchor: () => [HL.ctx, HL.ly, HL.ctw - 192, Max(120, HL.pd + HL.ch - 24 - HL.ly)]
-        , body: ["The change list for this build lives here, with the version"
-               , "badge. CHECK FOR UPDATES asks the repository whether a newer"
-               , "build exists and offers to install it - the hub restarts into"
-               , "the new version by itself. SETTINGS can make that automatic."]})
+               , "launch gate you saw at start-up has the same button, beside OPEN"
+               , "HUB and ACCOUNTS. TUTORIAL plays this tour again, from the top."]})
+    ; ================= the modules =================
     st.Push({tab: 2, mod: 0, ttl: "INTEGRATIONS: THE MODULE RAIL", cur: 1, glyph: "rail"
         , anchor: () => [HL.mdx - 6, MdRailTop(), HL.mdw + 12, MdRailVis()]
         , body: ["Each card in this rail is a module. Click one and its systems"
                , "open in the panel to the right; click it again to close. The"
-               , "rail scrolls when it is taller than the window. The dot on a"
-               , "card is its state: lit when the module is armed or applied."]})
+               , "cards that write Roblox's own files come first - FAST FLAG"
+               , "MANAGER, CURSOR, CLIENT SETTINGS, SPECIAL - and the two that"
+               , "touch the machine itself, DEVICE OPTIMIZATIONS and LOGIN ITEMS,"
+               , "sit at the foot. The rail scrolls when it is taller than the"
+               , "window, and the dot on a card is its state: lit when the module"
+               , "is armed or applied."]})
+    ; ---- FAST FLAG MANAGER ----
     st.Push({tab: 2, mod: 1, ttl: "FAST FLAG MANAGER", cur: 0, glyph: "flag"
         , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
         , body: ["The most used module. Fast flags are Roblox's own switches -"
                , "graphics, physics, debug views - and this manager stages a"
-               , "list of them and delivers it two ways: written into the running"
-               , "client's memory (INJECT), or into the client settings file that"
-               , "Roblox reads at launch (the CLIENT SETTINGS module does that)."]})
+               , "list of them and delivers it two ways: written straight into"
+               , "the running client's memory from this panel, or into the"
+               , "settings file Roblox reads at launch, which the CLIENT"
+               , "SETTINGS module does. The systems card comes first; the search"
+               , "field and the staged list sit under it."]})
+    st.Push({tab: 2, mod: 1, ttl: "INJECT AND UNINJECT", cur: 0, glyph: "bolt"
+        , anchor: () => TutFFRows(1, 1)
+        , body: ["INJECT writes every staged value into the running client's"
+               , "memory. Nothing touches the disk, so the set lasts until the"
+               , "client closes, and a flag this client does not carry is"
+               , "reported as failed rather than dropped. UNINJECT puts every"
+               , "original value back. The button reads NO RBX until a client is"
+               , "running; CLOSE RBX, in the header above, ends the client. With"
+               , "several clients open, a strip of tabs over the panel says which"
+               , "one INJECT is pointed at - ALL runs the set into every client."]})
+    st.Push({tab: 2, mod: 1, ttl: "SINGLETON, RE-APPLY, AUTO INJECT", cur: 0, glyph: "sliders"
+        , anchor: () => TutFFRows(2, 4)
+        , body: ["Three switches. SINGLETON is how the flag table is found: on,"
+               , "by a code signature, fast and the right default; off, by a"
+               , "slower sweep that survives an update that moved the code -"
+               , "turn it off if injection starts failing after one. RE-APPLY"
+               , "holds what you injected: every two seconds it rewrites any"
+               , "injected flag Roblox has reset - it never injects on its own."
+               , "AUTO INJECT is the one that does: it waits four seconds after"
+               , "a client appears, then injects for you."]})
+    st.Push({tab: 2, mod: 1, ttl: "CLEAN, AND UPDATE FLAGS", cur: 0, glyph: "tick"
+        , ffs: () => FFMSysRowY(5) - 12
+        , anchor: () => TutFFRows(5, 6)
+        , body: ["Two housekeeping actions. CLEAN drops every flag the last"
+               , "injection could not find, leaving a set this client actually"
+               , "accepts - do it before exporting. UPDATE fetches Roblox's live"
+               , "flag list and renames any staged flag that has been retired to"
+               , "its closest current name; names still valid are left alone,"
+               , "and every rename is written to the UPDATES log."]})
+    st.Push({tab: 2, mod: 1, ttl: "PRESETS, AND COMMUNITY FLAGS", cur: 0, glyph: "folder"
+        , ffs: () => FFMSysTotal()
+        , anchor: () => TutFFRows(7, 9)
+        , body: ["The PRESETS group. INSERT HITBOX replaces the staged set with"
+               , "the built-in HITBOX preset - replication and input flags aimed"
+               , "at making hits register closer to what you see. INSERT 30HZ"
+               , "HITBOX is the same idea tuned around interpolation and a lower"
+               , "replication rate. Both replace rather than merge - HISTORY"
+               , "keeps a snapshot first. COMMUNITY FLAGS is the browser of sets"
+               , "shared by other players; BROWSE opens it, and so does NEXT."]})
+    st.Push({tab: 2, mod: 1, ttl: "COMMUNITY FLAGS: THE BROWSER", cur: 0, glyph: "people"
+        , kick: "INTEGRATIONS  ·  FAST FLAG MANAGER  ·  COMMUNITY FLAGS", view: "comm", card: "bot"
+        , anchor: () => TutSheetHead()
+        , body: ["This is the panel BROWSE opens. It is drawn from a cache on"
+               , "disk the moment it opens, then checks the repository in the"
+               , "background and swaps in anything that changed; REFRESH does"
+               , "that on demand. Under the banner sits one card per game,"
+               , "each with folders of flag sets and the name of whoever shared"
+               , "them. INSERT on a set replaces the staged list with it, after a"
+               , "HISTORY snapshot, and closes the browser so you land on the"
+               , "result."]})
+    st.Push({tab: 2, mod: 1, ttl: "DATABASE, IMPORT, EXPORT, CLEAR, LOGS", cur: 0, glyph: "folder"
+        , anchor: () => [HL.abx - 4, HL.ffby - 6, 410, 38]
+        , body: ["DATABASE searches every flag the hub knows. IMPORT takes a JSON"
+               , "file - or whatever is on the clipboard, if you cancel the"
+               , "picker; EXPORT writes the staged list out the same way. CLEAR"
+               , "empties it. LOGS opens the record of what every injection,"
+               , "update and clear did, and HISTORY inside it keeps a snapshot"
+               , "before every clear, import, preset and community insert, so"
+               , "nothing is lost for good."]})
+    st.Push({tab: 2, mod: 1, ttl: "THE FLAG DATABASE", cur: 0, glyph: "search"
+        , kick: "INTEGRATIONS  ·  FAST FLAG MANAGER  ·  DATABASE", view: "db", card: "bot"
+        , anchor: () => TutSheetHead()
+        , body: ["The FLAG DATABASE, as DATABASE opens it: every name the hub"
+               , "knows, tens of thousands of them, with a filter field at the"
+               , "top. Type to narrow the list; ENTER stages the first match, a"
+               , "click stages any row, and rows already in your list say so."
+               , "The cross, or ESC, closes it. A value is checked as it goes"
+               , "in - one that does not fit the flag's type is refused."]})
     st.Push({tab: 2, mod: 1, ttl: "STAGING FLAGS", cur: 0, glyph: "list"
         , anchor: () => [HL.abx + 8, HL.ffqy - 6, HL.abw - 16, HL.fflh + 44]
-        , body: ["Type a flag name in the field, or open DATABASE and pick from"
-               , "the thirty thousand it knows. Each staged row has its value -"
-               , "click it to edit, click a bool to flip it - a type pill, and a"
-               , "pip on the left that is the row's own ON/OFF: a flag switched"
-               , "off stays in the list but is never applied. Values that do not"
-               , "fit the name are refused on the way in."]})
-    st.Push({tab: 2, mod: 1, ttl: "DATABASE, IMPORT, EXPORT, LOGS", cur: 0, glyph: "folder"
-        , anchor: () => [HL.abx - 4, HL.ffby - 6, 410, 38]
-        , body: ["DATABASE searches every known flag. IMPORT takes a JSON file"
-               , "or whatever is on the clipboard; EXPORT writes the list out."
-               , "CLEAR empties it - HISTORY, on the LOGS overlay, keeps a"
-               , "snapshot before every clear, import and preset, so nothing is"
-               , "lost for good. LOGS also shows what each injection did."]})
-    st.Push({tab: 2, mod: 1, ttl: "INJECT, RE-APPLY, AUTO", cur: 0, glyph: "bolt"
-        , anchor: () => [HL.abx, HL.aby, HL.abw, HL.ffh]
-        , body: ["INJECT LIVE writes the staged values into a running client;"
-               , "UNINJECT puts every original value back. RE-APPLY keeps"
-               , "re-asserting values the server keeps resetting. AUTO INJECT"
-               , "does the injection by itself whenever a client appears."
-               , "UPDATE FLAGS renames flags that Roblox renamed; COMMUNITY"
-               , "FLAGS holds curated sets per game that INSERT into the list."]})
-    st.Push({tab: 2, mod: 3, ttl: "CURSORS", cur: 0, glyph: "pointer"
-        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
-        , body: ["Replace the client's cursor textures - the arrow, the far"
-               , "arrow, the text caret - with your own PNGs. The module finds"
-               , "every installed client, including Bloxstrap, Fishstrap and"
-               , "Voidstrap, and writes into their mod stores so the cursors"
-               , "survive updates. REVERT restores the originals."]})
+        , body: ["Type a flag name in the field and the plus beside it stages"
+               , "it; type anything else and the list is filtered by it. Each"
+               , "staged row has its value - click it to edit, click a bool to"
+               , "flip it - a type pill, and a pip on the left that is the row's"
+               , "own ON/OFF: a flag switched off stays in the list but is never"
+               , "applied. A right-click on a field gives cut, copy and paste."
+               , "Values that do not fit the name are refused on the way in."]})
+    st.Push({tab: 2, mod: 1, ttl: "LOGS: INJECTION, UPDATES, HISTORY", cur: 0, glyph: "list"
+        , kick: "INTEGRATIONS  ·  FAST FLAG MANAGER  ·  LOGS", view: "log", card: "bot"
+        , anchor: () => TutSheetHead()
+        , body: ["LOGS has three tabs. INJECTION lists what the last injections"
+               , "did, flag by flag - written, failed, restored. UPDATES is the"
+               , "record UPDATE FLAGS leaves: every rename, and every name it"
+               , "could not place, with UNDO. HISTORY is the snapshots: one is"
+               , "taken before CLEAR, an import, a preset, a community set,"
+               , "UPDATE and a delete, and RESTORE puts any of them back."]})
+    ; ---- CURSOR ----
+    st.Push({tab: 2, mod: 3, ttl: "CURSOR: FOUR IMAGE SLOTS", cur: 0, glyph: "pointer"
+        , anchor: () => TutCurRows(1, 4)
+        , body: ["Roblox draws four cursors from four PNG files, and each row"
+               , "here is one of them: ARROW, the pointer you see almost all the"
+               , "time; SHIFT LOCK, the reticle while shift lock is held; CAMERA"
+               , "TOGGLE, the crosshair for camera toggle; and TEXT, the caret"
+               , "over chat and text boxes. BROWSE picks an image for a slot -"
+               , "square, around 64 pixels, holds up best - and staging it"
+               , "changes nothing until APPLY."]})
+    st.Push({tab: 2, mod: 3, ttl: "APPLY, RESTORE, FAR CURSOR, AUTO RE-APPLY", cur: 0, glyph: "bolt"
+        , crs: () => CurSysTotal()
+        , anchor: () => TutCurRows(5, 8)
+        , body: ["APPLY copies every staged slot over the files of every Roblox"
+               , "install it can find - and into the Modifications store of"
+               , "Bloxstrap, Fishstrap or Voidstrap, which the launcher lays over"
+               , "the client at every start - backing up whatever was there"
+               , "first. RESTORE puts those backups back; it can only undo what"
+               , "this hub wrote, and says so when a slot has no original. FAR"
+               , "CURSOR also replaces the smaller pointer Roblox draws for"
+               , "distant things, from the arrow's image. AUTO RE-APPLY watches"
+               , "for a Roblox update, which puts the default files back, and"
+               , "rewrites your set afterwards."]})
+    st.Push({tab: 2, mod: 3, ttl: "THE PREVIEW CARD", cur: 0, glyph: "news"
+        , anchor: () => [HL.abx, HL.ffby, HL.abw, CURCH]
+        , body: ["The card under the list is the state of the module. One tile"
+               , "per slot shows the image that is staged - or, when nothing is,"
+               , "whatever is on disk right now, captioned to say whether that"
+               , "is Roblox's own file, a Bloxstrap mod, or a backup this hub"
+               , "took. Under the tiles: which installs will be written, how"
+               , "many backups are held, and the last thing the module said."
+               , "OPEN FOLDER goes to the cursor files themselves."]})
+    st.Push({tab: 2, mod: 3, ttl: "EVERY ROW HAS A STORY", cur: 0, glyph: "list"
+        , kick: "INTEGRATIONS  ·  CURSOR  ·  DETAIL SHEET", det: () => CurDetail(6)
+        , anchor: () => TutDetHead()
+        , body: ["Every row in every module opens one of these. Click a row's"
+               , "name or its description - not its button - and a sheet arrives"
+               , "with the whole story: what the control does, what it touches,"
+               , "and what to do when it goes wrong. This one is RESTORE DEFAULT's."
+               , "Long ones scroll, and the round cross is the only thing that"
+               , "closes it, so a stray click cannot take away what you opened."]})
+    ; ---- CLIENT SETTINGS ----
     st.Push({tab: 2, mod: 4, ttl: "CLIENT SETTINGS", cur: 0, glyph: "sliders"
-        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
-        , body: ["The client's own files. Rows for the frame-rate cap, graphics"
-               , "quality and rendering choices; a page to edit fast flags that"
-               , "go through the settings file; custom fonts and a custom logo."
-               , "APPLY writes it all; REVERT removes every name this module"
-               , "ever wrote, in every client folder it can find."]})
-    st.Push({tab: 2, mod: 5, ttl: "SAVED PLACES AND ACCOUNTS", cur: 0, glyph: "pin"
-        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
-        , body: ["Places you save here launch in one click, with live player"
-               , "counts, ratings and a picture reel. The ACCOUNTS view keeps"
-               , "your Roblox accounts and can launch a place signed in as any"
-               , "of them. The dashboard banner cycles through the saved places"
-               , "- click it to skip to the next."]})
-    st.Push({tab: 2, mod: 6, ttl: "DEVICE OPTIMIZATIONS", cur: 0, glyph: "chip"
-        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
-        , body: ["Windows-side tweaks that help a game run: power plan, game"
-               , "mode, network settings and the like. Every change is recorded"
-               , "and SNAPSHOTS lets you see and undo each one. REVERT ALL puts"
-               , "the machine back exactly as it was found."]})
-    st.Push({tab: 2, mod: 7, ttl: "LOGIN ITEMS", cur: 0, glyph: "power"
-        , anchor: () => [HL.abx, HL.aby, HL.abw, TutPanelH()]
-        , body: ["Programs that come and go with Roblox. ADD APP picks anything"
-               , "- a program, a shortcut, a document. Each gets two switches:"
-               , "OPENS starts it when a client appears, CLOSES shuts it when the"
+        , anchor: () => [HL.abx, HL.cty + 28, HL.abw, HL.aby + RSetRowY(3) + HL.rsrh + 2 - (HL.cty + 28)]
+        , body: ["The client's own files, written on disk rather than in memory."
+               , "The rows come in four groups, with one APPLY in the header for"
+               , "all of them - it reads REVERT once the module is live. ACTIONS"
+               , "come first: APPLY SETTINGS and REVERT SETTINGS, which puts"
+               , "every row back to the Roblox default, and QUALITY PRESET,"
+               , "which sets every graphics row at once - HIGH, MEDIUM or LOW."
+               , "Roblox has to be closed for a write; the file is only writable"
+               , "then."]})
+    st.Push({tab: 2, mod: 4, ttl: "CLIENT FILES", cur: 0, glyph: "sliders"
+        , rss: () => RSetRowY(TutRSIdx("render")) - 12
+        , anchor: () => TutRSRows(TutRSIdx("render"), TutRSIdx("render") + 2)
+        , body: ["The CLIENT FILES group is the settings Roblox keeps in its own"
+               , "files. RENDERING MODE, which graphics api the client asks for;"
+               , "LIGHTING TECHNOLOGY; FRM, TEXTURE and MESH QUALITY;"
+               , "ANTI-ALIASING; FRAMERATE CAP; DISPLAY SCALING; SHADOWS and"
+               , "SHADOW DETAIL; POST-PROCESSING. Then three that swap files"
+               , "rather than values - ROBLOX FONT, ROBLOX LOGO and ROBLOX STUDIO"
+               , "LOGO take a file of your own - and RESTORE LOGOS puts the"
+               , "originals back. A row left at its first choice - AUTO, KEEP or"
+               , "DEFAULT - is not written at all."]})
+    st.Push({tab: 2, mod: 4, ttl: "THE CLIENT SETTINGS FILE", cur: 0, glyph: "sliders"
+        , rss: () => RSetRowY(TutRSIdx("gfx")) - 12
+        , anchor: () => TutRSRows(TutRSIdx("gfx"), TutRSIdx("gfx") + 2)
+        , body: ["The CLIENT SETTINGS FILE group writes the XML file Roblox keeps"
+               , "its in-game menu choices in - the list scrolls. Graphics first:"
+               , "GRAPHICS QUALITY, the in-client slider or AUTO; MAX QUALITY,"
+               , "the slider's top as a switch - the two follow each other; and"
+               , "GRAPHICS MODE, what it optimises for. Then MASTER VOLUME,"
+               , "MOUSE SENSITIVITY, SHIFT LOCK SWITCH, CAMERA MODE, MOVEMENT"
+               , "MODE, FULL SCREEN, START MAXIMIZED, REDUCED MOTION and UI"
+               , "TRANSPARENCY - each reading the value the file holds now."
+               , "KEEP leaves a value alone; REVERT removes what this module"
+               , "wrote, so Roblox supplies its own defaults again."]})
+    st.Push({tab: 2, mod: 4, ttl: "FAST FLAGS, FROM HERE", cur: 0, glyph: "flag"
+        , rss: () => RSetTotal()
+        , anchor: () => TutRSRows(TutRSIdx("fxedit"), TutRSIdx("src"))
+        , body: ["The FAST FLAGS group is the second way flags reach the client:"
+               , "through the settings file, read at launch, rather than memory."
+               , "EDIT FAST FLAGS opens a page of its own - a list you add names"
+               , "and values to, with the same DATABASE search behind it. FLAG"
+               , "SOURCE decides which half of this module reaches the file:"
+               , "MIX, the systems rows only, or the edited flags only."]})
+    st.Push({tab: 2, mod: 4, ttl: "THE STATE CARD", cur: 0, glyph: "gauge"
+        , anchor: () => [HL.abx, HL.ffby, HL.abw, RSETCH]
+        , body: ["The STATE card is the module's readout. The dial counts the"
+               , "rows that are set and fills once they are applied; FLAGS,"
+               , "FILE, BACKUP and WRITES say what will be written where, and"
+               , "whether the original file is held. ALL AUTO puts every row"
+               , "back to its first choice without touching the disk; OPEN FILE"
+               , "opens the client settings file itself."]})
+    ; ---- SPECIAL FEATURES ----
+    st.Push({tab: 2, mod: 5, ttl: "SPECIAL FEATURES: SIX SWITCHES", cur: 0, glyph: "pin"
+        , anchor: () => TutSPFRows(1, 3)
+        , body: ["Six switches, three at a time - the list scrolls. DISCORD"
+               , "ACTIVITY shows the game you are in on your Discord profile,"
+               , "with chips for your account, a join link and whether Roblox is"
+               , "the focused window. SHOW SERVER REGION reads the server out of"
+               , "the client log and looks up where it is hosted. AUTO-REGION"
+               , "FINDER rejoins - up to fifteen times - until the server is"
+               , "close to you; it is the one switch that restarts Roblox on you."]})
+    st.Push({tab: 2, mod: 5, ttl: "MATCHMAKING, INSTANCES, FPS", cur: 0, glyph: "pin"
+        , sps: () => SPFSysTotal()
+        , anchor: () => TutSPFRows(4, 6)
+        , body: ["BETTER MATCHMAKING, marked experimental, never rejoins anyone:"
+               , "each join teaches it how far one server is, and later joins"
+               , "ask for one it already measured as close. MULTI-ROBLOX"
+               , "INSTANCES lets several clients run at once, one per account -"
+               , "launch them from the website, not the shortcut. FPS BOOST"
+               , "buys frames without touching a graphics setting, and its row"
+               , "reports what it managed and where the bottleneck sits."]})
+    st.Push({tab: 2, mod: 5, ttl: "ACCOUNTS, PLACES, AND THE LINK FIELDS", cur: 0, glyph: "folder"
+        , anchor: () => [HL.abx, HL.aby + 134, HL.abw, HL.spfh - 134]
+        , body: ["Under the switches, two libraries and two link fields."
+               , "ACCOUNTS keeps Roblox accounts and can launch a client already"
+               , "signed in as any of them; SAVED PLACES keeps places and"
+               , "private servers, with live player counts, ratings and a"
+               , "picture reel, and launches them in a click. GAME LINK and"
+               , "PRIVATE SERVER LINK take a link or a place id; the button"
+               , "beside each reads JOIN, or HUNT when AUTO-REGION FINDER is on,"
+               , "and rerolls that place until the server is close."]})
+    st.Push({tab: 2, mod: 5, ttl: "ACCOUNTS", cur: 0, glyph: "people"
+        , kick: "INTEGRATIONS  ·  SPECIAL FEATURES  ·  ACCOUNTS", view: "acct", card: "bot"
+        , anchor: () => TutSheetHead()
+        , body: ["The account manager, as ACCOUNTS opens it - and as the launch"
+               , "gate's ACCOUNTS button does. BROWSER LOGIN opens a clean,"
+               , "signed-out browser window to sign in on and picks the session"
+               , "up; ADD FROM CLIPBOARD takes a .ROBLOSECURITY cookie by hand."
+               , "Each saved account gets a LAUNCH TARGET - a place id, a game"
+               , "link, a private server link - and a LAUNCH button that opens a"
+               , "client already signed in as it, one per account with MULTI-"
+               , "ROBLOX INSTANCES on. A saved cookie signs in with no password:"
+               , "keep this machine yours."]})
+    st.Push({tab: 2, mod: 5, ttl: "LIVE", cur: 0, glyph: "gauge"
+        , anchor: () => [HL.abx, HL.aby + HL.spfh + 12, HL.abw, 96]
+        , body: ["The LIVE strip is what the switches are seeing right now: the"
+               , "GAME you are in and its place id; the REGION the server is"
+               , "hosted in and how far away it is; HOME, the region the finder"
+               , "and the matchmaker measure against; and DISCORD, whether the"
+               , "presence is linked. The dot breathes green in a game, amber"
+               , "armed and waiting, grey when the features are off."]})
+    ; ---- DEVICE OPTIMIZATIONS ----
+    st.Push({tab: 2, mod: 6, ttl: "DEVICE OPTIMIZATIONS", cur: 0, glyph: "chip", rail: 1
+        , anchor: () => TutDOPRows(1, DOP_SYSN)
+        , body: ["Windows-side tweaks that help a game run, in five groups, each"
+               , "its own switch: INPUT LATENCY - 1:1 pointer, no acceleration,"
+               , "shorter input queues; SYSTEM TIMERS; NETWORK STACK - throttling"
+               , "and Nagle off, adapter offloads off; POWER & USB - power"
+               , "throttling and selective suspend off, the high performance"
+               , "plan; GPU & SCHEDULING. Every switch asks for administrator"
+               , "rights, and the rows marked RESTART need one before they show."]})
+    st.Push({tab: 2, mod: 6, ttl: "SNAPSHOTS, RE-APPLY, REVERT ALL", cur: 0, glyph: "chip", rail: 1
+        , anchor: () => [HL.abx, HL.dopby, HL.abw, HL.dopbh]
+        , body: ["The card under the rows is the module's ledger. The tally is"
+               , "one segment per group, lit as it is applied. The machine was"
+               , "captured exactly as it was found before the first change, so"
+               , "REVERT ALL puts it back to that, not to one click ago."
+               , "SNAPSHOTS shows each recorded change and can undo it on its"
+               , "own; RE-APPLY lights only when a setting has drifted back."]})
+    ; ---- LOGIN ITEMS ----
+    st.Push({tab: 2, mod: 7, ttl: "LOGIN ITEMS", cur: 0, glyph: "power", rail: 1
+        , anchor: () => [HL.abx, HL.aby, HL.abw, HL.lgih]
+        , body: ["Programs that come and go with Roblox. The strip at the top is"
+               , "the lifeline: ROBLOX at one end, and every app you add strung"
+               , "along it, lit as it runs. ADD APP takes anything - a program, a"
+               , "shortcut, a script, a document - and each gets two switches:"
+               , "OPENS starts it when a client appears, CLOSES shuts it once the"
                , "last one is gone. A change has to hold a few seconds first, so"
                , "a client restarting mid-update never closes anything."]})
-    st.Push({tab: 4, mod: -1, ttl: "SETTINGS: APPEARANCE", cur: 0, glyph: "palette"
-        , anchor: () => [HL.ctx, HL.setr - 4, HL.ctw, 4*(HL.rh + HL.rgap) + 4]
-        , body: ["The accent colour runs through every control in the suite;"
-               , "pick one, or set your own. The theme switch flips the whole"
-               , "hub between dark and paper. Opacity makes the window see-"
-               , "through so a game stays visible behind it."]})
+    st.Push({tab: 2, mod: 7, ttl: "ARMED, ADD APP, OPEN ALL, CLOSE ALL", cur: 0, glyph: "power", rail: 1
+        , anchor: () => [HL.abx, HL.lgiby, HL.abw, HL.lgibh]
+        , body: ["ARMED is the master switch: with it off nothing is started or"
+               , "stopped, whatever the rows say. ADD APP adds an entry - up to"
+               , "eight; OPEN ALL and CLOSE ALL do by hand what the switches do"
+               , "on their own. The line at the left is what the watcher last"
+               , "did, and the segments beside it are the entries, lit when"
+               , "they are set to open or close."]})
+    ; ================= the script hub =================
+    st.Push({tab: 3, mod: -1, ttl: "SCRIPT HUB", cur: 0, glyph: "code"
+        , anchor: () => [HL.ctx, HL.tby, HL.ctw, HL.tbh]
+        , body: ["A place to write, check and run AutoHotkey scripts of your"
+               , "own. The toolbar: NEW clears the editor; PASTE drops in the"
+               , "clipboard; FILE loads an .ahk from disk; CHECK validates the"
+               , "script against the AutoHotkey you have installed - v2 first,"
+               , "then v1 - and reports on the OUTPUT line; SAVE writes it into"
+               , "the hub's scripts folder; EXPORT writes an .AHK or .TXT"
+               , "anywhere; SAVED opens that folder; CLEAR empties everything."
+               , "PLACE, at the right, checks it and adds it to the cards below."]})
+    st.Push({tab: 3, mod: -1, ttl: "TABS, NAME AND DESCRIPTION", cur: 0, glyph: "code"
+        , anchor: () => [HL.ctx, HL.tabY + ScrShiftAll(), HL.ctw, HL.fdy + HL.fdh - HL.tabY]
+        , body: ["The editor has tabs - the plus opens another, the cross on a"
+               , "tab closes it, and IN MAIN copies a side tab's script into the"
+               , "first one. Under them, two fields: the name the placed card"
+               , "will carry, and a line of description for it. Click either to"
+               , "type; the caret goes straight in."]})
+    st.Push({tab: 3, mod: -1, ttl: "THE EDITOR", cur: 0, glyph: "code"
+        , anchor: () => [HL.ctx, ScrEdY(), HL.ctw, 54]
+        , body: ["Click in the editor and type, or ctrl+V to paste. Comments,"
+               , "strings, numbers and commands each get a colour, the gutter"
+               , "counts lines, and ESC leaves the field."]})
+    st.Push({tab: 3, mod: -1, ttl: "OUTPUT, AND THE PLACED CARDS", cur: 0, glyph: "bolt"
+        , anchor: () => [HL.ctx, HL.edy + HL.edh + 8, HL.ctw, HL.lsy + HL.lsh - (HL.edy + HL.edh + 8)]
+        , body: ["OUTPUT is CHECK's verdict, with the version it validated"
+               , "against. PLACED is every script you have placed, a card each:"
+               , "a picture you can change, ENABLE to run it and STOP while it"
+               , "runs, EDIT to load it back into the editor - where PLACE"
+               , "becomes UPDATE - and a cross to remove it. The band scrolls."]})
+    ; ================= settings =================
+    st.Push({tab: 4, mod: -1, ttl: "SETTINGS: ACCENT", cur: 0, glyph: "palette"
+        , anchor: () => [HL.ctx, HL.setr, HL.ctw, HL.rh]
+        , body: ["The accent colour runs through every control in the suite -"
+               , "six to pick from, and the ring shows which is live. Nothing"
+               , "else changes with it: the theme, the opacities and the font"
+               , "are their own settings."]})
+    st.Push({tab: 4, mod: -1, ttl: "BACKDROP AND ELEMENTS", cur: 0, glyph: "palette"
+        , anchor: () => [HL.ctx, HL.setr + (HL.rh + HL.rgap), HL.ctw, 2*HL.rh + HL.rgap]
+        , body: ["Two opacities. BACKDROP fades the window's plate; ELEMENTS"
+               , "fades the controls drawn on it. Slide either down and a game"
+               , "stays visible behind the hub. The swatch further down the page"
+               , "previews the pair."]})
+    st.Push({tab: 4, mod: -1, ttl: "THEME, AND ARMED TINT", cur: 0, glyph: "palette"
+        , anchor: () => [HL.ctx, HL.setr + 3*(HL.rh + HL.rgap), HL.ctw, HL.rh]
+        , body: ["DARK and LIGHT swap the base the hub is drawn on. ARMED TINT"
+               , "recolours it whenever a system is armed."]})
     st.Push({tab: 4, mod: -1, ttl: "SETTINGS: BEHAVIOUR", cur: 0, glyph: "cog"
-        , anchor: () => [HL.ctx, HL.sett - 24, HL.ctw, HL.seth + 30]
-        , body: ["PERFORMANCE MODE turns every decoration off and lets the hub"
-               , "idle at nothing; use it on a weak machine. ON TOP keeps the"
-               , "hub above the game. MINIMIZE decides whether the dash hides"
-               , "the hub or shrinks it to the pill. AUTO UPDATE checks the"
-               , "repository at launch and asks before installing."]})
+        , anchor: () => [HL.ctx, HL.sett, HL.ctw, HL.seth]
+        , body: ["Four switches. PERFORMANCE turns every effect off and lets the"
+               , "hub idle at nothing - use it on a weak machine. ON TOP keeps"
+               , "the hub above other windows. MINIMIZE decides whether the dash"
+               , "shrinks the hub to the pill or hides it to the tray. AUTO"
+               , "UPDATE checks the repository at launch and asks before it"
+               , "installs anything."]})
+    st.Push({tab: 4, mod: -1, ttl: "THE GALLERY, AND RESET", cur: 0, glyph: "palette"
+        , anchor: () => [HL.ctx, HL.setp, HL.ctw, Min(HL.setp + 48, HubFtrY() - 46) + 46 - HL.setp]
+        , body: ["GALLERY is the set of pictures the hub rotates through - on"
+               , "the launch gate, under UPDATE LOGS, and on the minimised pill;"
+               , "MANAGE opens the grid to add and remove them. LIVE PREVIEW is"
+               , "the two opacities and the theme in miniature. RESET APPEARANCE"
+               , "puts accent, opacities and theme back to factory: rose,"
+               , "100 / 100, dark."]})
+    ; ================= credits =================
     st.Push({tab: 5, mod: -1, ttl: "CREDITS", cur: 0, glyph: "people"
-        , anchor: () => [HL.ctx, HL.cty + 34, HL.ctw, HL.lky + HL.lkh - (HL.cty + 34)]
-        , body: ["Who made it. The card shows a maker's avatar, name and role; the"
-               , "two chips under it switch between ZEAL, who designed, built and"
-               , "animated the hub, and LUNARIS, who wrote its functions and the"
-               , "fast-flag work. The cards below are their links: ROBLOX opens the"
-               , "profile, YOUTUBE the channel, and the DISCORD card copies the tag"
-               , "to your clipboard, ready to paste into a search."]})
+        , anchor: () => [HL.ctx, HL.cty + 34, HL.ctw, 128]
+        , body: ["Who made it. The card shows a maker's avatar, name and role,"
+               , "and the two chips on the rule below switch between ZEAL, who"
+               , "designed, built and animated the hub, and LUNARIS, who wrote"
+               , "its functions and the fast-flag work."]})
+    st.Push({tab: 5, mod: -1, ttl: "FIND THEM", cur: 0, glyph: "people"
+        , anchor: () => [HL.ctx, HL.lky - 28, HL.ctw, HL.lkh + 28]
+        , body: ["Their links, for whichever maker the chips have picked. ROBLOX"
+               , "opens the profile, YOUTUBE the channel, and the DISCORD card"
+               , "copies the tag to your clipboard, ready to paste into a search"
+               , "- and flashes to say it has."]})
+    ; ================= update logs =================
+    st.Push({tab: 6, mod: -1, ttl: "UPDATE LOGS", cur: 0, glyph: "news"
+        , anchor: () => [HL.ctx, HL.cty + 36, HL.ctw - 232, 122]
+        , body: ["Everything the hub has shipped, the first release at the top,"
+               , "with the build and channel this copy came in. A plus is"
+               , "something added; an amber mark is something changed or fixed."
+               , "The list scrolls; the dashboard shows only its last seven."]})
+    st.Push({tab: 6, mod: -1, ttl: "THE GALLERY REEL", cur: 0, glyph: "news"
+        , anchor: () => [HL.ctx + HL.ctw - 224, HL.cty + 40, 212, HL.pd + HL.ch - HL.cty - 96]
+        , body: ["The reel on the right is the gallery, one picture at a time,"
+               , "with a counter and a bar filling towards the next. It is the"
+               , "same set the launch gate and the minimised pill show; MANAGE,"
+               , "in SETTINGS, adds to it and takes pictures out of rotation."]})
+    ; ================= the end =================
     st.Push({tab: 1, mod: -1, ttl: "THAT'S THE TOUR", cur: 0, glyph: "tick", anchor: 0
         , body: ["Everything you saw is live: the flags stage, the modules apply,"
-               , "the client launches. Two things worth remembering:"
+               , "the client launches. Three things worth remembering:"
                , ""
-               , "  REVERT and UNINJECT always exist. Nothing here is one-way."
-               , "  The TUTORIAL button on the dashboard plays this again."
+               , "REVERT, RESTORE and UNINJECT always exist - nothing here is"
+               , "one-way, and HISTORY and SNAPSHOTS keep what came before."
+               , "Any row's name opens a sheet with its full story."
+               , "The TUTORIAL button on the dashboard plays this again."
                , ""
                , "FINISH returns you to the dashboard."]})
     TUT_STEPS := st
 }
 TutPanelH() => Max(160, HL.pd + HL.ch - 34 - HL.aby)
+; ---- rows in the scrolled lists ----
+; A row's place is its pitch minus the list's scroll TARGET, never the eased
+; value: the light eases on its own, and easing towards a moving target makes
+; it trail the row it is meant to be over. Each covers rows a through b, at
+; the row's own hover plate (six in from the panel edge) plus two of air.
+TutFFRows(a, b)  => [HL.abx + 6, HL.aby + FFMSysRowY(a) - FFM.sysScrT - 2, HL.abw - 12, FFMSysRowY(b) - FFMSysRowY(a) + 40]
+TutCurRows(a, b) => [HL.abx + 6, HL.aby + 12 + (a - 1)*HL.ffrg - CSR.scrT - 2, HL.abw - 12, (b - a)*HL.ffrg + 40]
+TutRSRows(a, b)  => [HL.abx + 6, HL.aby + RSetRowY(a) - RSET.scrT - 2, HL.abw - 12, RSetRowY(b) - RSetRowY(a) + HL.rsrh + 4]
+TutSPFRows(a, b) => [HL.abx + 6, HL.aby + SPFSysRowY(a) - SPF.sysScrT - 2, HL.abw - 12, SPFSysRowY(b) - SPFSysRowY(a) + HL.spfrh + 4]
+TutDOPRows(a, b) => [HL.abx + 6, HL.aby + DOPRowY(a) - 2, HL.abw - 12, DOPRowY(b) - DOPRowY(a) + DOP_RH + 4]
+; a CLIENT SETTINGS row by its key, so a row added above one does not move
+; the light off it
+TutRSIdx(key) {
+    for i, o in RSET_OPTS
+        if (o.k = key)
+            return i
+    return 1
+}
+; the header band of the sheets that take the whole content column - the
+; title or the tabs, the count, the close cross
+TutSheetHead() => [HL.ctx, HL.cty + 34, HL.ctw, 30]
+; the header of the detail sheet, wherever its text has put it
+TutDetHead() {
+    DetailGeom(&dx, &dy, &dw, &dh)
+    return [dx, dy, dw, 96]
+}
 ; ---- a small drawing per step, in the card's header ----
 ; Line work in the accent, sixteen pixels across, the way the module cards and
 ; the settings tiles draw theirs - so the card belongs to the hub it explains.
@@ -16023,6 +16541,18 @@ TutGlyph(kind, cx, cy, acc, f) {
         Ell(cx - 5, cy - 5, 10, 10, pn), FillEll(cx - 1.8, cy - 1.8, 3.6, 3.6, b)
     } else if (kind = "tick") {
         Line(cx - 7, cy, cx - 2, cy + 5, pn), Line(cx - 2, cy + 5, cx + 8, cy - 6, pn)
+    } else if (kind = "search") {
+        Ell(cx - 8, cy - 8, 12, 12, pn), Line(cx + 3, cy + 3, cx + 8, cy + 8, pn)
+    } else if (kind = "code") {
+        Line(cx - 3, cy - 7, cx - 8, cy, pn), Line(cx - 8, cy, cx - 3, cy + 7, pn)
+        Line(cx + 3, cy - 7, cx + 8, cy, pn), Line(cx + 8, cy, cx + 3, cy + 7, pn)
+    } else if (kind = "key") {
+        StrokeRR(cx - 9, cy - 5, 18, 11, 3, pn)
+        loop 3
+            FillRR(cx - 5.5 + (A_Index - 1)*4.5, cy - 2, 2, 2, 1, b)
+        FillRR(cx - 4, cy + 1.5, 8, 1.6, 0.8, b)
+    } else if (kind = "clock") {
+        Ell(cx - 8, cy - 8, 16, 16, pn), Line(cx, cy - 4.5, cx, cy, pn), Line(cx, cy, cx + 3.5, cy + 2, pn)
     } else if (kind = "people") {
         ; two figures: a head and shoulders, and a second behind
         FillEll(cx - 7, cy - 8, 6.5, 6.5, b)
@@ -16078,7 +16608,8 @@ TutKicker(st) {
              : st.mod = 4 ? "INTEGRATIONS  ·  CLIENT SETTINGS" : st.mod = 5 ? "INTEGRATIONS  ·  SPECIAL FEATURES"
              : st.mod = 6 ? "INTEGRATIONS  ·  DEVICE OPTIMIZATIONS" : st.mod = 7 ? "INTEGRATIONS  ·  LOGIN ITEMS"
              : "INTEGRATIONS"
-    return st.tab = 4 ? "SETTINGS" : st.tab = 5 ? "CREDITS" : st.tab = 1 ? (st.anchor ? "DASHBOARD" : "YURI") : "HUB"
+    return st.tab = 3 ? "SCRIPT HUB" : st.tab = 4 ? "SETTINGS" : st.tab = 5 ? "CREDITS" : st.tab = 6 ? "UPDATE LOGS" : st.tab = 7 ? "TOWN"
+         : st.tab = 1 ? (st.anchor ? "DASHBOARD" : "YURI") : "HUB"
 }
 
 ; ---- lifecycle ----
@@ -16103,14 +16634,35 @@ TutEnd() {
     TUT.outAt := A_TickCount
     TUT.seen := 1
     try IniWrite(1, iniPath, "hub", "tourseen")
-    ; home: the dashboard, no module open, no sheet, the way the hub greets you
+    ; home: the dashboard, no module open, no sheet, no overlay, every list
+    ; back at its top - the way the hub greets you
     if HL.profOpen
         TutProfClose()
+    TutPutAway()
     if (hubTab != 1)
         HubTabSet(1)
     if hubMod
         HubModSel(hubMod)
     HubPoke()
+}
+; ---- what a step opens, closed again ----
+; Overlays, the detail sheet and the client-settings flag page all leave
+; through their own close paths, so a field one of them owned is blurred and
+; nothing typed into it is left dangling; the lists go back to the top the
+; way the wheel would put them there. Called on every step change and at the
+; end, so the hub is never left somewhere the user did not take it.
+TutPutAway() {
+    if (FFM.view != "")
+        FFMCloseView()
+    if (SPF.view != "")
+        SPFViewClose()
+    if DET.on
+        DetailClose()
+    RSetFxClose()
+    RSetDDClose()
+    SH.libOpen := 0
+    FFM.sysScrT := 0.0, CSR.scrT := 0.0, RSET.scrT := 0.0, SPF.sysScrT := 0.0
+    HL.mdscrT := 0.0
 }
 TutFinish() {
     TUT.on := 0, TUT.outAt := 0, TUT.step := 0
@@ -16122,10 +16674,7 @@ TutGo(i) {
     st := TUT_STEPS[i]
     TUT.prev := TUT.step, TUT.dir := (i >= TUT.step) ? 1 : -1
     TUT.step := i, TUT.stepAt := A_TickCount, TUT.curAt := 0, TUT.clickAt := 0
-    if (FFM.view != "")
-        FFMCloseView()
-    if (SPF.view != "")
-        SPFViewClose()
+    TutPutAway()
     if (st.tab != hubTab)
         HubTabSet(st.tab)
     if (st.mod >= 0 && st.mod != hubMod) {
@@ -16142,6 +16691,38 @@ TutGo(i) {
         HL.profOpen := 1, HL.bioOpen := 0
     else if (!wantProf && HL.profOpen)
         TutProfClose()
+    ; ---- where the lists are scrolled to ----
+    ; A step that points at a row a panel has scrolled away from sets that
+    ; panel's scroll target, clamped the way the wheel clamps it; TutPutAway
+    ; has already put every other list back at the top. The rail is the same
+    ; case: the two machine modules sit below its fold, so their steps bring
+    ; them up.
+    if st.HasOwnProp("ffs")
+        FFM.sysScrT := Clamp(st.ffs.Call(), 0.0, Max(0.0, FFMSysTotal() - (HL.ffh - 20)))
+    if st.HasOwnProp("crs")
+        CSR.scrT := Clamp(st.crs.Call(), 0.0, Max(0.0, CurSysTotal() - (HL.ffh - 20)))
+    if st.HasOwnProp("rss")
+        RSET.scrT := Clamp(st.rss.Call(), 0.0, Max(0.0, RSetTotal() - (HL.ffh - 20)))
+    if st.HasOwnProp("sps")
+        SPF.sysScrT := Clamp(st.sps.Call(), 0.0, Max(0.0, SPFSysTotal() - SPFSysVis()))
+    if (st.HasOwnProp("rail") && st.rail)
+        HL.mdscrT := MdRailMax()
+    ; ---- the overlay or sheet the step looks at ----
+    ; Opened after the module it belongs to, through the same call its own
+    ; button makes. The flag database opens with its search field live, which
+    ; arms the keyboard hook - blurred straight away, so a key pressed during
+    ; the tour goes nowhere; the panel stays up without it.
+    if (st.HasOwnProp("view") && st.view != "") {
+        if (st.mod = 5)
+            SPFViewOpen(st.view)
+        else {
+            FFMOpenView(st.view)
+            if (st.view = "db")
+                FFMEndEdit(false)
+        }
+    }
+    if st.HasOwnProp("det")
+        st.det.Call()
     if st.cur
         TUT.curAt := A_TickCount + 520            ; the cursor sets off once the card has landed
     HubPoke()
@@ -16293,7 +16874,14 @@ TutDraw(now, acc) {
     ; the rail, which are not the subject) down to 300 px, and only when even
     ; that will not fit does it take the other half of the window.
     cw := TUT.cw
-    if hasHole {
+    ; A step can pin its card to the top or the foot of the window instead.
+    ; For the sheets that take the whole content column: no side has room
+    ; there, the rule below would put the card on the half of the window
+    ; the light's centre is not in - and that is the sheet - so the step
+    ; lights the sheet's header and pins the card under it, leaving the
+    ; header and the upper part of the sheet in view.
+    pin := st.HasOwnProp("card") ? st.card : ""
+    if (hasHole && pin = "") {
         below := hy + hh + 16 + (96 + 6*17 + 76) <= py + ph - 12
         above := hy - 16 - (96 + 6*17 + 76) >= py + 12
         rightR := hx + hw + 16 + cw <= px + pw - 12
@@ -16306,7 +16894,11 @@ TutDraw(now, acc) {
     ch := 96 + lines.Length*17 + 76
     if hasHole {
         cxT := Clamp(hx + hw/2 - cw/2, px + 12, px + pw - cw - 12)
-        if (hy + hh + 16 + ch <= py + ph - 12)
+        if (pin = "bot")
+            cyT := py + ph - ch - 12
+        else if (pin = "top")
+            cyT := py + 12
+        else if (hy + hh + 16 + ch <= py + ph - 12)
             cyT := hy + hh + 16
         else if (hy - 16 - ch >= py + 12)
             cyT := hy - 16 - ch
@@ -16383,7 +16975,11 @@ TutDraw(now, acc) {
     FillRR(skx, sky, skw, 22, 11, b), DelB(b)
     pn := Pen(FA(Alpha(acc, Round(70 + 120*hvS)), cf), 1)
     StrokeRR(skx, sky, skw, 22, 11, pn), DelP(pn)
-    Txt("SKIP", skx + 10, sky + 4, 34, 14, HL.fXs, FA(Alpha(THMix(0xFFC7CBE0, 0xFFFFFFFF, hvS), Round(180 + 75*hvS)), cf), fmtL)
+    ; TxtP, not Txt: THMix hands back an ALREADY themed colour, and Txt would
+    ; run it through the theme again - which in light mode reads the dark ink
+    ; as a dark-mode source and turns it back to near-white. That was SKIP
+    ; drawn white-on-paper, and unreadable.
+    TxtP("SKIP", skx + 10, sky + 4, 34, 14, HL.fXs, FA(Alpha(THMix(0xFFC7CBE0, 0xFFFFFFFF, hvS), Round(180 + 75*hvS)), cf), fmtL)
     pn := Pen(FA(Alpha(AccHi(acc, 0.4), Round(180 + 60*hvS)), cf), 1.4)
     chx := skx + skw - 20 + 2*hvS, chy := sky + 11
     loop 2 {
@@ -16451,14 +17047,18 @@ TutDraw(now, acc) {
     if hasHole
         Txt(FFMElide("click the lit control, or NEXT", HL.fXs, cw - 196), cx + 18, by + 6, cw - 196, 14, HL.fXs, FA(0x6EC7CBE0, cf), fmtL)
     n := TUT_STEPS.Length
+    ; the dots' pitch gives way before their count does: at three of ink and
+    ; three of air a long tour overruns a narrowed card, so they drop to two
+    ; and two, and the whole row still fits inside the card's margins
+    dp := (n*6 + 12 <= cw - 36) ? 3 : 2
     dx := cx + 18, dy := cy + ch - 18
     loop n {
         i := A_Index
         on := i = TUT.step
-        w2 := on ? 3 + 9*sf : (i = TUT.prev && TUT.prev != TUT.step ? 3 + 9*(1 - sf) : 3)
+        w2 := on ? dp + 9*sf : (i = TUT.prev && TUT.prev != TUT.step ? dp + 9*(1 - sf) : dp)
         b := SBrush(FA(Alpha(on ? AccHi(acc, 0.4) : (i < TUT.step ? acc : 0xFFC7CBE0), on ? 235 : (i < TUT.step ? 150 : 60)), cf))
         FillRR(dx, dy, w2, 3, 1.5, b), DelB(b)
-        dx += w2 + 3
+        dx += w2 + dp
     }
     if (TUT.step > 1)
         FFMBtn(2201, cx + cw - 172, by, 68, 26, "BACK", acc, cf, 0, HL.fS)
@@ -17167,6 +17767,7 @@ CurSay(msg, col := 0) {
     CSR.msgCol := col ? col : C_ON
     CSR.msgAt := A_TickCount
     HubPoke()
+    HubPokeLater(5300)                 ; LOW PERFORMANCE MODE: the frame that lands the settled look
 }
 
 ; ---------------- target discovery ----------------
@@ -17914,7 +18515,7 @@ FFMDetail(i) {
           , "INSERT HITBOX", "INSERT 30HZ HITBOX", "COMMUNITY FLAGS"]
     hnt := ["write flags into Roblox memory"
           , "find the flag table by code signature"
-          , "re-inject every 2 s to hold flags"
+          , "hold what you injected - rewrite it every 2 s"
           , "inject 4 s after Roblox is detected"
           , "export your flags without the failed ones"
           , "rename outdated flags to their current names"
@@ -17933,16 +18534,28 @@ FFMDetail(i) {
         . "out of it - slower, but it survives a Roblox update that moved the "
         . "code. Turn it off if injection starts failing after an update."
     b3 := "Roblox rewrites some flags back to their defaults while you play. "
-        . "This re-injects the whole staged set every two seconds so those "
-        . "values stay where you put them. Costs a little CPU for as long as "
-        . "it is on."
+        . "This checks every two seconds - faster for a few seconds after a "
+        . "teleport rebuilds the table - and rewrites any flag YOU INJECTED "
+        . "that has drifted, so those values stay where you put them. It "
+        . "never injects on its own: a client you have not pressed INJECT on "
+        . "keeps Roblox's values with this switched on, and a flag added to "
+        . "the list after the last INJECT is not touched until you inject "
+        . "again. AUTO INJECT is the switch that injects for you; this one "
+        . "only holds. Costs a little CPU for as long as it is on."
     b4 := "Waits four seconds after the client appears, then injects on its "
         . "own. The delay is deliberate - injecting before the flag table is "
         . "built is what produces a run of failures."
-    b5 := "Drops every flag the last injection could not find, leaving a set "
-        . "that this client actually accepts. Useful before exporting: it is "
-        . "the difference between a set that works and one full of names from "
-        . "an older version."
+    b5 := "Exports the staged set as the last injection left it: every flag "
+        . "that went in and stayed in is kept, every flag the injector refused "
+        . "is dropped, and a flag it never tried - added since that INJECT, or "
+        . "switched off when it ran - is dropped too, each with its reason in "
+        . "the INJECTION log. The staged list itself is not touched. It needs "
+        . "an injection to judge by, and UNINJECT or a closed client clears "
+        . "that verdict, so press it while the panel still shows the result. "
+        . "Cancelling the save dialog copies the same cleaned set to the "
+        . "clipboard. A bare name that injected is written to the file in its "
+        . "prefixed live form, because that is the only form the settings "
+        . "file reads."
     b6 := "Fetches the current live flag list and renames any staged flag "
         . "whose name Roblox has retired to its closest current name. "
         . "Non-destructive: valid names are left alone and names with no match "
@@ -17953,9 +18566,14 @@ FFMDetail(i) {
     b8 := "The same idea tuned around interpolation and a lower effective "
         . "replication rate. It shares most of its entries with HITBOX and "
         . "adds the interpolation group. Also replaces the staged set."
-    b9 := "Opens the community browser. Nothing is published yet, so this is "
-        . "the frame and an empty shelf - sets shared by other players will "
-        . "appear here once publishing opens."
+    b9 := "Opens the community browser: the flag sets published to the "
+        . "community repository, one card per game plus GENERAL, drawn from a "
+        . "cache in the YURI folder so it opens instantly and works offline. "
+        . "The cache is checked against the repository when the panel opens "
+        . "and at launch, and REFRESH checks it right now; a set is fetched "
+        . "again only when its content hash on the repository has changed, so "
+        . "an edit to a published set arrives on the next refresh. INSERT "
+        . "replaces the staged list with a set, after a HISTORY snapshot."
     bdy := [b1, b2, b3, b4, b5, b6, b7, b8, b9]
     if (i < 1 || i > bdy.Length)
         return
@@ -18202,9 +18820,12 @@ RSetDetail(i) {
     if (i < 1 || i > RSET_OPTS.Length)
         return
     o := RSET_OPTS[i]
-    if (o.ui = "slider")
-        w := "Moves the slider to pick a value."
-    else if (o.k = "logorst") {
+    ; Keyed rows first, the generic slider text LAST. The slider test used to
+    ; lead the chain, which made every keyed body below it for a slider row -
+    ; FRAMERATE CAP's, and now GRAPHICS QUALITY's, FRM QUALITY's and UI
+    ; TRANSPARENCY's - unreachable: the row is a slider, so the chain stopped
+    ; at the one-line stand-in before it ever saw the name.
+    if (o.k = "logorst") {
         w := "Puts both apps' logo art and both shortcut icons back, without "
            . "touching any other client setting - that is the whole reason it "
            . "is its own button rather than part of REVERT SETTINGS.  "
@@ -18302,6 +18923,115 @@ RSetDetail(i) {
             w .= "  Restart Roblox after APPLY - these are read once at launch."
         }
     }
+    else if (o.k = "gmode") {
+        w := "UserGameSettings.GraphicsOptimizationMode - the client's own "
+           . "OPTIMIZE FOR choice, three ways: PERFORMANCE favours frames, "
+           . "QUALITY favours detail, BALANCED sits between. Roblox publishes "
+           . "the three names and nothing more, so treat it as the same pick "
+           . "the in-experience graphics menu offers rather than a separate "
+           . "effect; MAX QUALITY, the row above, is the ceiling that pick "
+           . "works under. Read at launch like the rest of this group."
+    }
+    else if (o.k = "shiftlock") {
+        w := "UserGameSettings.ControlMode - the SHIFT LOCK SWITCH toggle in "
+           . "the client's settings. ON is MouseLockSwitch, which lets shift "
+           . "lock be turned on and off in game; OFF is the classic camera, "
+           . "moved by holding the right mouse button. An experience that "
+           . "disables shift lock still wins. The file stores the enum's "
+           . "index, and the index changed in build 598 - this writes the "
+           . "current one."
+    }
+    else if (o.k = "cammode") {
+        w := "UserGameSettings.ComputerCameraMovementMode - the CAMERA MODE "
+           . "pick. DEFAULT is classic; CLASSIC keeps the camera where you "
+           . "put it and does not turn as you walk left or right; FOLLOW "
+           . "turns with you; ORBITAL fixes the camera's height and lets it "
+           . "circle; CAMERA TOGGLE locks and frees rotation with the right "
+           . "mouse button. An experience that forces a camera mode still "
+           . "wins. The CURSOR module's CAMERA TOGGLE slot is the crosshair "
+           . "that last mode draws."
+    }
+    else if (o.k = "movemode") {
+        w := "UserGameSettings.ComputerMovementMode - how the character is "
+           . "driven on a computer. DEFAULT is keyboard and mouse; KEYBOARD & "
+           . "MOUSE says so explicitly; CLICK TO MOVE walks the character to "
+           . "wherever you right-click, with the keyboard still working "
+           . "alongside it. An experience that forces a movement mode still "
+           . "wins."
+    }
+    else if (o.k = "fullscr") {
+        w := "UserGameSettings.Fullscreen - whether the client opens full "
+           . "screen, the same state the F11 key and the menu toggle switch "
+           . "while you play. ON opens full screen, OFF opens in a window; "
+           . "START MAXIMIZED, the row below, decides the size of that "
+           . "window. Read at launch, so a client already open keeps what "
+           . "it has until it restarts."
+    }
+    else if (o.k = "startmax") {
+        w := "UserGameSettings.StartMaximized - whether a windowed client "
+           . "opens maximised. Roblox stores the last window position and "
+           . "size beside it and this row leaves those alone; it only decides "
+           . "whether the frame is maximised when the client appears. A "
+           . "full-screen client has no frame, so FULL SCREEN ON makes this "
+           . "row inert until it is OFF or KEEP again."
+    }
+    else if (o.k = "redmot") {
+        w := "UserGameSettings.ReducedMotion - the REDUCED MOTION switch "
+           . "under the client's accessibility settings. ON calms the menu "
+           . "and interface animations, OFF keeps Roblox's own. It reaches "
+           . "the client's interface only, never an experience's own effects."
+    }
+    else if (o.k = "uitrans") {
+        w := "UserGameSettings.PreferredTransparency - the BACKGROUND "
+           . "TRANSPARENCY slider under accessibility: how see-through the "
+           . "menu and interface backgrounds are. 100% is Roblox's own "
+           . "transparency, 0% makes every background solid, and anything "
+           . "between scales it. The file stores the fraction, 0 to 1, and "
+           . "the slider writes it that way."
+    }
+    else if (o.k = "maxq") {
+        w := "UserGameSettings.MaxQualityEnabled - the bool the client stores "
+           . "next to its quality level, true when the graphics are pinned at "
+           . "the maximum level available. Roblox's own description says "
+           . "exactly that and no more, so treat it as the top notch of the "
+           . "quality range rather than a separate effect: ON pins it, OFF "
+           . "clears it, and KEEP leaves whatever the client last wrote. It "
+           . "and GRAPHICS QUALITY are one slider seen from two sides, so they "
+           . "follow each other: ON moves the slider to 10, and a slider moved "
+           . "off 10 turns this OFF. FRM QUALITY, set to anything but AUTO, "
+           . "overrides both - the flag pins the engine's level and the "
+           . "slider is ignored. Like the rest of this group it is read once "
+           . "at launch, Roblox has to be closed for the write, and REVERT "
+           . "removes the element so the client puts its own default back."
+    }
+    else if (o.k = "gfx") {
+        w := "UserGameSettings.SavedQualityLevel - the in-client quality "
+           . "slider, AUTO or 1 to 10, with GraphicsQualityLevel, the level "
+           . "the renderer actually runs at, written alongside it. MAX "
+           . "QUALITY is the same slider's top seen as a switch, so the two "
+           . "follow each other: moving this off 10 turns MAX QUALITY off, and "
+           . "MAX QUALITY ON brings this to 10. FRM QUALITY, set to anything "
+           . "but AUTO, overrides both - that flag pins the engine's level "
+           . "and the slider is ignored, so this row goes inert until FRM is "
+           . "back on AUTO. The QUALITY PRESET sets this row rather than FRM."
+    }
+    else if (o.k = "frm") {
+        w := "DFIntDebugFRMQualityLevelOverride - the engine's own quality "
+           . "ladder, 1 to 21, pinned directly. It is an OVERRIDE: while it is "
+           . "set the client's slider is ignored, so GRAPHICS QUALITY and MAX "
+           . "QUALITY go inert and are not written until this is back on "
+           . "AUTO. The QUALITY PRESET no longer sets it - the presets use the "
+           . "client's own settings and leave this to you - so it is the one "
+           . "row here for a level the slider cannot reach on its own."
+    }
+    else if (o.k = "shmap") {
+        w := "FIntRenderShadowmapResolution - the size of the shadow map, and "
+           . "so how crisp a shadow's edge is; larger costs GPU. It only "
+           . "means something while there are shadow maps to size: with "
+           . "SHADOWS OFF there are none, and LIGHTING TECHNOLOGY VOXEL draws "
+           . "voxel shadows with no map at all, so either of those makes this "
+           . "row inert until it changes."
+    }
     else if (o.ui = "file")
         w := "BROWSE picks a file; the client's own is kept and can be restored."
     else if (o.ui = "action")
@@ -18310,20 +19040,35 @@ RSetDetail(i) {
         w := "HIGH is every graphics row at its maximum. MEDIUM is a balance. "
            . "LOW is the cheapest the client will render, with the frame rate "
            . "uncapped - the point of the lowest tier is the highest frame "
-           . "rate. All three set the rendering, lighting, FRM, texture, mesh, "
-           . "anti-aliasing, framerate cap, scaling and graphics-quality rows "
-           . "in one press. They leave the font, master volume and mouse "
-           . "sensitivity exactly as you set them: those are yours, not "
-           . "quality. Staged like everything else here - press APPLY to write "
-           . "it. Change any row afterwards and the preset simply stops being "
-           . "marked, because it is read back from the rows rather than "
-           . "remembered."
+           . "rate. All three set the rendering, lighting, texture, mesh, "
+           . "anti-aliasing, framerate cap, scaling, shadow and "
+           . "post-processing rows, and the client's own quality settings: "
+           . "GRAPHICS QUALITY, MAX QUALITY and GRAPHICS MODE - HIGH pins the "
+           . "slider at 10 with MAX QUALITY ON and QUALITY mode, LOW sits at 1 "
+           . "with PERFORMANCE mode. They put FRM QUALITY back to AUTO rather "
+           . "than setting it: that row is the override that ignores the "
+           . "slider, and a preset that set both was writing one of them for "
+           . "nothing. They leave the font, master volume, mouse sensitivity "
+           . "and the window and control rows exactly as you set them: those "
+           . "are yours, not quality. Staged like everything else here - press "
+           . "APPLY to write it. Change any row afterwards and the preset "
+           . "simply stops being marked, because it is read back from the "
+           . "rows rather than remembered."
+    else if (o.ui = "slider")
+        w := "Moves the slider to pick a value."
     else
         w := "The chip on the right opens the list of values."
+    ; the XML rows go to GlobalBasicSettings, the client settings file - not
+    ; to ClientAppSettings, which is where the flag rows write
     if (o.HasOwnProp("xml") && o.xml != "")
-        w .= "  Writes " o.xml " into ClientAppSettings."
+        w .= "  Writes " o.xml " into the client settings file, GlobalBasicSettings."
     else if (o.ui != "file" && o.ui != "action" && o.ui != "preset")
         w .= "  Writes fast flags into ClientAppSettings."
+    ; the override, first thing on the sheet: a row that decides nothing right
+    ; now should say so before it says what it would decide
+    if ((ov := RSetRowOverride(o)) != "")
+        w := "OVERRIDDEN RIGHT NOW by " ov ". The pick below is kept and comes "
+           . "back the moment that changes.  " w
     if (o.HasOwnProp("v") && o.v.Length) {
         vs := ""
         for k2, vv in o.v {
@@ -19484,6 +20229,7 @@ SPFSay(msg, col := 0) {
     SPF.msgCol := col ? col : C_ON
     SPF.msgAt := A_TickCount
     HubPoke()
+    HubPokeLater(9500)                 ; LOW PERFORMANCE MODE: the frame that lands the settled look
 }
 
 ; ---- roblox log tail -------------------------------------------------------
@@ -24350,18 +25096,28 @@ AcctSplitList(v) {
 
 ; Game and group logos. kind is "g" for a universe icon, "r" for a group one -
 ; the child writes both under those prefixes so one loader covers both lists.
+; ---- why every row showed its initial ----
+; The child had fetched and cached every icon all along - the loader below
+; could not open a single one. Both of its literals carried a DOUBLED
+; backslash: the path came out as ...Temp\\yuri_ic_..., which Windows
+; tolerates, and the DllCall named "gdiplus\\GdipCreateBitmapFromFile", which
+; it does not - the function name that reached DllCall began with a
+; backslash, the lookup threw, the try swallowed it, and the row fell back to
+; the breathing initial every frame for as long as the panel was open. The
+; backtick is this language's escape character, not the backslash; a
+; backslash in a string is itself, once.
 AcctListIcon(kind, id) {
     if (id = "")
         return 0
     k := kind id
     if SPF.acctIco.Has(k)
         return SPF.acctIco[k]
-    pth := A_Temp "\\yuri_ic_" kind "_" id ".png"
+    pth := A_Temp "\yuri_ic_" kind "_" id ".png"
     if !FileExist(pth)
         return 0
     bm := 0
     try {
-        if DllCall("gdiplus\\GdipCreateBitmapFromFile", "wstr", pth, "ptr*", &bm := 0)
+        if DllCall("gdiplus\GdipCreateBitmapFromFile", "wstr", pth, "ptr*", &bm := 0)
             bm := 0
     }
     if bm
@@ -25810,7 +26566,7 @@ SPFZone(ux, uy) {
                 ; already the GAME LINK field - the row would have swallowed
                 ; every click meant for the box. The explaining half of each
                 ; row lives in its own band now, the way CLIENT SETTINGS does
-                ; it at 1080 + i.
+                ; it with RSetExpZ.
                 return 1060 + i                  ; the row explains
             }
         }
@@ -28469,6 +29225,27 @@ RSetOptions() {
     }
     o.Push(gq)
 
+    ; MAX QUALITY - UserGameSettings.MaxQualityEnabled, the <bool> the client
+    ; keeps beside the quality level: true when its graphics are pinned at the
+    ; top of the available range. A dropdown rather than a slider, because a
+    ; bool has two values and a slider with two stops reads as broken. KEEP
+    ; leaves the file's own element alone; ON and OFF write it, and REVERT
+    ; removes it like every other property here so the client re-supplies its
+    ; default. xt is the element type RSetXmlSet creates when the file has
+    ; never carried it.
+    o.Push({k: "maxq", n: "MAX QUALITY", h: "the client's max-quality switch - graphics pinned at the top of the range"
+         , grp: 2, ui: "drop", al: 1, xml: "MaxQualityEnabled", xt: "bool", pref: 1
+         , v: ["KEEP", "ON", "OFF"], x: ["", "true", "false"]})
+
+    ; GRAPHICS MODE - UserGameSettings.GraphicsOptimizationMode, the "optimize
+    ; for" choice that arrived in the same build as MaxQualityEnabled. The
+    ; token values are Enum.GraphicsOptimizationMode: Performance 0,
+    ; Balanced 1, Quality 2 - checked against the published enum, not guessed
+    ; from the order the menu lists them in.
+    o.Push({k: "gmode", n: "GRAPHICS MODE", h: "what the client optimizes for - frames, detail, or between"
+         , grp: 2, ui: "drop", al: 1, xml: "GraphicsOptimizationMode", xt: "token", pref: 1
+         , v: ["KEEP", "PERFORMANCE", "BALANCED", "QUALITY"], x: ["", "0", "1", "2"]})
+
     ; MASTER VOLUME - the file stores 0..1, the slider shows percent
     mv := {k: "vol", n: "MASTER VOLUME", h: "the client's own volume slider"
          , grp: 2, ui: "slider", al: 1, xml: "MasterVolume", xt: "float", v: ["KEEP"], x: [""]}
@@ -28488,6 +29265,49 @@ RSetOptions() {
         ms.x.Push(sv)
     }
     o.Push(ms)
+
+    ; ---- the rest of what UserGameSettings keeps ----
+    ; Every property below is one the client's own settings menu writes into
+    ; this same file, so a KEEP row reads the value the menu last saved and an
+    ; ON/OFF or a pick overwrites it the way the menu would. They carry
+    ; `pref: 1`: a preference the user set in the client's own menus, which
+    ; REVERT clears only if THIS module wrote it - see RSetXmlRevertSet - where
+    ; the quality, volume and sensitivity rows keep their older, wider revert
+    ; for a file a build without the ownership record may have written. The token values
+    ; are the published enums - ControlMode, ComputerCameraMovementMode and
+    ; ComputerMovementMode all had their indices reshuffled in build 598, so
+    ; each is the CURRENT index, checked, not the historic one. Bools are
+    ; written as the literal true/false the file uses.
+    o.Push({k: "shiftlock", n: "SHIFT LOCK SWITCH", h: "let shift lock be toggled in game - the menu's own switch"
+         , grp: 2, ui: "drop", al: 1, xml: "ControlMode", xt: "token", pref: 1
+         , v: ["KEEP", "ON", "OFF"], x: ["", "1", "0"]})
+    o.Push({k: "cammode", n: "CAMERA MODE", h: "how the camera follows you - classic, follow, orbital, toggle"
+         , grp: 2, ui: "drop", al: 1, xml: "ComputerCameraMovementMode", xt: "token", pref: 1
+         , v: ["KEEP", "DEFAULT", "CLASSIC", "FOLLOW", "ORBITAL", "CAMERA TOGGLE"], x: ["", "0", "1", "2", "3", "4"]})
+    o.Push({k: "movemode", n: "MOVEMENT MODE", h: "keyboard and mouse, or click to move"
+         , grp: 2, ui: "drop", al: 1, xml: "ComputerMovementMode", xt: "token", pref: 1
+         , v: ["KEEP", "DEFAULT", "KEYBOARD & MOUSE", "CLICK TO MOVE"], x: ["", "0", "1", "2"]})
+    o.Push({k: "fullscr", n: "FULL SCREEN", h: "open the client full screen, or in a window"
+         , grp: 2, ui: "drop", al: 1, xml: "Fullscreen", xt: "bool", pref: 1
+         , v: ["KEEP", "ON", "OFF"], x: ["", "true", "false"]})
+    o.Push({k: "startmax", n: "START MAXIMIZED", h: "a windowed client opens maximised"
+         , grp: 2, ui: "drop", al: 1, xml: "StartMaximized", xt: "bool", pref: 1
+         , v: ["KEEP", "ON", "OFF"], x: ["", "true", "false"]})
+    o.Push({k: "redmot", n: "REDUCED MOTION", h: "the accessibility switch that calms the interface animations"
+         , grp: 2, ui: "drop", al: 1, xml: "ReducedMotion", xt: "bool", pref: 1
+         , v: ["KEEP", "ON", "OFF"], x: ["", "true", "false"]})
+    ; UI TRANSPARENCY - PreferredTransparency, the accessibility slider for
+    ; how see-through the menu backgrounds are. 1 is Roblox's own transparency
+    ; and 0 is solid, so the slider runs 0%..100% of the designed value and
+    ; writes the fraction.
+    ut := {k: "uitrans", n: "UI TRANSPARENCY", h: "menu background transparency - 100% is roblox's own, 0% is solid"
+         , grp: 2, ui: "slider", al: 1, xml: "PreferredTransparency", xt: "float", pref: 1, v: ["KEEP"], x: [""]}
+    loop 11 {
+        pc := (A_Index - 1)*10
+        ut.v.Push(pc "%")
+        ut.x.Push(Format("{:.1f}", pc/100.0))
+    }
+    o.Push(ut)
 
     ; ---- the raw layer, last in the list ----
     ; grp 3 rather than joining CLIENT SETTINGS FILE: the rows above it are all
@@ -28557,12 +29377,25 @@ RSetIdx(o)  => RSET.pick.Has(o.k) ? Clamp(RSET.pick[o.k], 1, o.v.Length) : 1
 ; A base with room, tested for nothing else in the file, and derived in one
 ; place so the next row added cannot walk into anything.
 RSetRowZ(i)  => 1300 + i
+; ---- the explaining half of the row ----
+; Its own band, for the same reason. It was 1080 + i, which cleared the CURSOR
+; module's block at 1111..1151 only while the list stayed under 31 rows - at 32
+; the last two rows landed on 1111 and 1112, the dispatcher tests this band
+; before the cursor block, and a click on the ARROW IMAGE row's explanation
+; opened EDIT FAST FLAGS' sheet instead. 1500 is tested for nothing else in the
+; file and has room for a hundred rows.
+global RSET_EXPZ := 1500
+RSetExpZ(i)  => RSET_EXPZ + i
 ; ---- the slider knob, as its own target ----
 ; A second zone per slider row, because the knob has to answer to being under
 ; the pointer rather than to the pointer being somewhere in the same column.
-; 1330 is clear of the row band above (1300 + 22 rows) with room for the list to
-; keep growing.
-global RSET_KNOBZ := 1330
+; 1400, not 1330: the row band is 1301 + one per row, and the client settings
+; file group grew past the eight rows of headroom 1330 left - at 32 rows the
+; last two rows landed on 1331 and 1332, and RSetClick tests the knob range
+; before the row range, so a click on EDIT FAST FLAGS started a slider drag on
+; APPLY SETTINGS. The row band now has 99 rows of room and the knobs 99 more
+; before the flag page's zones begin at 1600.
+global RSET_KNOBZ := 1400
 RSetKnobZ(i) => RSET_KNOBZ + i
 ; ---- which of this module's zones are TEXT BOXES ----
 ; Double-click-to-select-a-word and the copy/cut/paste menu are both routed off
@@ -28625,6 +29458,7 @@ RSetSay(msg, col := 0) {
     RSET.msgCol := col ? col : C_ON
     RSET.msgAt := A_TickCount
     HubPoke()
+    HubPokeLater(5300)                 ; LOW PERFORMANCE MODE: the frame that lands the settled look
 }
 
 ; ---------------- live framerate cap ----------------
@@ -28885,20 +29719,33 @@ RSetPresetIdx(o, name) {
 ; key -> value name, per preset. LOW uncaps the frame rate on purpose: the
 ; point of the lowest graphics tier is the highest frame rate, so capping it
 ; would undo the reason for choosing it.
+;
+; ---- the level is set ONE way ----
+; The presets used to set FRM QUALITY (the override flag, 21 / 10 / 1) and
+; GRAPHICS QUALITY (the client's slider, 10 / 5 / 1) both - two rows for one
+; level, and the flag ignores the slider, so the second was written for
+; nothing. Now the presets express the level through the client's own
+; settings: the slider, MAX QUALITY - the switch that pins the top - and
+; GRAPHICS MODE, and they put FRM QUALITY back to AUTO. FRM stays the
+; power-user override: set by hand it takes the level over from all three,
+; and the rows say so - see RSetRowOverride.
 RSetPresetTable(which) {
     if (which = 1)                                   ; HIGH
-        return Map("render", "AUTO",  "light", "FUTURE",    "frm", "21"
+        return Map("render", "AUTO",  "light", "FUTURE",    "frm", "AUTO"
                  , "tex",    "3",     "mesh",  "ULTRA",     "msaa", "x4"
                  , "fps",    "240",   "dpi",   "PRESERVE",  "gfx",  "10"
+                 , "maxq",   "ON",    "gmode", "QUALITY"
                  , "shadow", "AUTO",  "shmap", "4096",      "postfx", "ON")
     if (which = 2)                                   ; MEDIUM
-        return Map("render", "AUTO",  "light", "SHADOWMAP", "frm", "10"
+        return Map("render", "AUTO",  "light", "SHADOWMAP", "frm", "AUTO"
                  , "tex",    "2",     "mesh",  "MEDIUM",    "msaa", "x2"
                  , "fps",    "120",   "dpi",   "AUTO",      "gfx",  "5"
+                 , "maxq",   "OFF",   "gmode", "BALANCED"
                  , "shadow", "SOFTER", "shmap", "2048",     "postfx", "AUTO")
-    return Map("render", "AUTO",      "light", "VOXEL",     "frm", "1"
+    return Map("render", "AUTO",      "light", "VOXEL",     "frm", "AUTO"
              , "tex",    "0",         "mesh",  "OFF",       "msaa", "x1"
              , "fps",    "MAX",       "dpi",   "AUTO",      "gfx",  "1"
+             , "maxq",   "OFF",       "gmode", "PERFORMANCE"
              , "shadow", "OFF",       "shmap", "1024",      "postfx", "OFF")
 }
 
@@ -29008,7 +29855,8 @@ RSetChosen() {
         ; fresh config
         if (o.ui = "action" || o.ui = "preset" || o.ui = "source")
             continue
-        if (RSetIdx(o) > 1)
+        ; a moot row keeps its pick but decides nothing - see RSetRowOverride
+        if (RSetIdx(o) > 1 && !RSetRowMoot(o))
             n++
     }
     ; A raw flag is as much a thing to write as a row is. Without this, adding
@@ -29062,6 +29910,24 @@ RSetReadXml() {
 }
 
 RSetXmlBak() => YURI_RSB "\GlobalBasicSettings.bak.xml"
+
+; The value the file holds, in the row's own words. "now 1" is a fact about a
+; token and tells nobody anything; "now ON" is the same fact in the label the
+; chip uses. Matched by number where both sides are numbers, so a float the
+; client wrote as 0.5 still finds the slider's 0.50 - and the raw text comes
+; back unchanged when nothing matches, which is the honest answer for a value
+; the row does not offer.
+RSetXmlLabel(o, raw) {
+    if !o.HasOwnProp("x")
+        return raw
+    for j, xv in o.x {
+        if (xv = "")
+            continue
+        if (xv = raw || (IsNumber(xv) && IsNumber(raw) && xv + 0 = raw + 0))
+            return o.v[j]
+    }
+    return raw
+}
 
 RSetEnsureDirs() {
     if !DirExist(YURI_RSB)
@@ -29150,9 +30016,9 @@ RSetXmlDel(&body, prop) {
 ; rides the row it belongs to. Modify-only on the way in, delete on the way out.
 RSetXmlTwin(o) => (o.HasOwnProp("xml") && o.xml = "SavedQualityLevel") ? "GraphicsQualityLevel" : ""
 
-; Every property this module is able to put in the file, twins included. This
-; is the set REVERT clears, so it is derived from the option table rather than
-; listed by hand - a row added above is reverted without anything else changing.
+; Every property this module is able to put in the file, twins included -
+; derived from the option table rather than listed by hand. REVERT does not
+; clear this whole set any more; RSetXmlRevertSet below picks from it.
 RSetXmlProps() {
     out := Map()
     for o in RSET_OPTS {
@@ -29209,6 +30075,32 @@ RSetXmlOwnSave(m) {
 ; this build wrote; the whole-file backup is the answer for anything an older
 ; build wrote before the record existed.
 RSetXmlOwes() => (RSetXmlOwned().Count > 0) || FileExist(RSetXmlBak())
+
+; ---- what REVERT is allowed to clear ----
+; The record names what APPLY verified, and that is the set: a property this
+; module never wrote is a preference the user set in the client's own menus -
+; shift lock, the camera mode, full screen - and clearing it is not a revert,
+; it is a second change. The whole-table set stays as the fallback for a file an
+; older build wrote before the record existed, minus the rows marked pref:
+; those rows did not exist in any build without the record, so nothing old can
+; be owed on them.
+RSetXmlRevertSet() {
+    out := Map()
+    own := RSetXmlOwned()
+    if own.Count {
+        for k, v in own
+            out[k] := 1
+        return out
+    }
+    for o in RSET_OPTS {
+        if (!o.HasOwnProp("xml") || (o.HasOwnProp("pref") && o.pref))
+            continue
+        out[o.xml] := 1
+        if ((tw := RSetXmlTwin(o)) != "")
+            out[tw] := 1
+    }
+    return out
+}
 
 
 ; ---------------- delivery: ClientSettings\ClientAppSettings.json ----------------
@@ -29466,6 +30358,8 @@ RSetPresetFlags() {
         ; fields it carries, so a row can drive flags AND the settings file
         if !o.HasOwnProp("f")
             continue
+        if RSetRowMoot(o)
+            continue                   ; another row has made this one moot - see RSetRowOverride
         i := RSetIdx(o)
         if (i <= 1 || i > o.f.Length)
             continue
@@ -29646,6 +30540,72 @@ RSetLockedRows() {
 }
 RSetRowLocked(o) => RSetLockedRows().Has(o.k)
 
+; ---- rows another row makes moot ----
+; Three places in this panel describe one thing from two sides, and a pick on
+; one side can leave the other with nothing to decide:
+;   FRM QUALITY set            -> GRAPHICS QUALITY and MAX QUALITY. The override
+;                                 flag pins the engine's level directly; the
+;                                 slider and its max switch are read and ignored.
+;   SHADOWS OFF, or            -> SHADOW DETAIL. There is no shadow map to size
+;   LIGHTING TECHNOLOGY VOXEL     with shadows off, and voxel lighting draws none.
+;   FULL SCREEN ON             -> START MAXIMIZED. A full-screen client has no
+;                                 window frame to maximise.
+; A moot row is treated the way a taken-over row is: drawn out, inert, not
+; written, with the hint naming the row that overrides it and what to change to
+; get it back. It keeps its pick, so clearing the override brings it back
+; exactly as it was left. Rows that are never moot return "". Cheap enough to
+; read per row per frame: a few index lookups, no walk.
+RSetRowOverride(o) {
+    k := o.k
+    if (k = "gfx" || k = "maxq") {
+        fr := RSetBy("frm")
+        if (fr && RSetIdx(fr) > 1)
+            return "FRM QUALITY  ·  its override pins the level  ·  set it to AUTO to use this"
+    } else if (k = "shmap") {
+        sh := RSetBy("shadow"), lt := RSetBy("light")
+        if (sh && RSetIdx(sh) = RSetPresetIdx(sh, "OFF"))
+            return "SHADOWS OFF  ·  nothing to map"
+        if (lt && RSetIdx(lt) = RSetPresetIdx(lt, "VOXEL"))
+            return "LIGHTING TECHNOLOGY VOXEL  ·  it draws no shadow maps"
+    } else if (k = "startmax") {
+        fs := RSetBy("fullscr")
+        if (fs && RSetIdx(fs) = RSetPresetIdx(fs, "ON"))
+            return "FULL SCREEN ON  ·  no window to maximise"
+    }
+    return ""
+}
+RSetRowMoot(o) => (RSetRowOverride(o) != "")
+
+; ---- one slider, two rows ----
+; MAX QUALITY says the graphics slider sits at its top; GRAPHICS QUALITY is the
+; slider. Two rows can describe one slider only while they agree, so a pick on
+; either is followed by the other: ON drags the slider to 10, and a slider moved
+; anywhere else - a lower notch, AUTO, or KEEP - drops the switch to OFF, which
+; is what Roblox's own menu does when the slider leaves its top. The follower
+; flashes and the status line says what moved, so nothing changes silently.
+; Called after every pick that lands on either row; every other key is a no-op.
+RSetLinkPick(k) {
+    if (k != "maxq" && k != "gfx")
+        return
+    gq := RSetBy("gfx"), mq := RSetBy("maxq")
+    if (!gq || !mq)
+        return
+    top := RSetPresetIdx(gq, "10"), onI := RSetPresetIdx(mq, "ON"), offI := RSetPresetIdx(mq, "OFF")
+    if (RSetIdx(mq) != onI || RSetIdx(gq) = top)
+        return
+    if (k = "maxq") {
+        RSET.pick["gfx"] := top
+        RSET.flashAt["gfx"] := A_TickCount
+        try IniWrite(top, iniPath, "rset", "gfx")
+        RSetSay("GRAPHICS QUALITY FOLLOWED TO 10 - MAX QUALITY IS THE SLIDER AT ITS TOP", AMBER)
+    } else {
+        RSET.pick["maxq"] := offI
+        RSET.flashAt["maxq"] := A_TickCount
+        try IniWrite(offI, iniPath, "rset", "maxq")
+        RSetSay("MAX QUALITY OFF - THE SLIDER LEFT ITS TOP", AMBER)
+    }
+}
+
 ; ---- taking a row over ----
 ; Editing or adding a flag that a row writes hands the WHOLE row to the user:
 ; every flag that row is currently writing becomes an override at its present
@@ -29747,6 +30707,8 @@ RSetApply() {
             for o in RSET_OPTS {
                 if !o.HasOwnProp("xml")
                     continue
+                if RSetRowMoot(o)
+                    continue           ; moot rows are not written - see RSetRowOverride
                 i := RSetIdx(o)
                 if (i <= 1 || i > o.x.Length || o.x[i] = "")
                     continue
@@ -29844,7 +30806,7 @@ RSetApply() {
         fs .= ", LOGO MATCHED NOTHING"
     xw := 0
     for o in RSET_OPTS {
-        if (o.HasOwnProp("xml") && RSetIdx(o) > 1)
+        if (o.HasOwnProp("xml") && RSetIdx(o) > 1 && !RSetRowMoot(o))
             xw++
     }
     if (xbusy && xw)
@@ -29906,7 +30868,7 @@ RSetXmlRevertFile() {
         return r
     }
     cut := 0
-    for prop, tg in RSetXmlProps() {
+    for prop, tg in RSetXmlRevertSet() {
         if RSetXmlDel(&body, prop)
             cut++
     }
@@ -29928,7 +30890,7 @@ RSetXmlRevertFile() {
     ; verified the same way APPLY verifies its writes: read the file back and
     ; see that nothing of ours is left in it
     left := 0
-    for prop, tg in RSetXmlProps() {
+    for prop, tg in RSetXmlRevertSet() {
         if (RSetXmlRead(path, prop) != "")
             left++
     }
@@ -30280,6 +31242,7 @@ RSetSlideSet(i, sx) {
         try IniWrite(nv, iniPath, "rset", o.k)
         if RSET.on
             RSetSay("CHANGED - PRESS APPLY AGAIN TO WRITE IT", AMBER)
+        RSetLinkPick(o.k)              ; after the message, so the link's own wins
     }
     HubPoke()
 }
@@ -30444,7 +31407,7 @@ RSetZone(ux, uy) {
                             && uy >= ry + 8 && uy <= ry + 32)
                             return 933 + q2          ; 934 / 935
                     }
-                    return 1080 + i                  ; the rest of the row explains
+                    return RSetExpZ(i)               ; the rest of the row explains
                 }
                 if (RSET_OPTS[i].ui = "preset") {
                     pw3 := RSetPresetChipW(), pg3 := RSetPresetChipG()
@@ -30455,7 +31418,7 @@ RSetZone(ux, uy) {
                         if (ux >= bx3 && ux <= bx3 + pw3 && uy >= ry + 6 && uy <= ry + 36)
                             return 924 + q           ; 925 / 926 / 927
                     }
-                    return 1080 + i                  ; the rest of the row explains
+                    return RSetExpZ(i)               ; the rest of the row explains
                 }
                 if (RSET_OPTS[i].ui = "file") {
                     kZ := (RSET_OPTS[i].k = "logo") ? 1
@@ -30490,8 +31453,8 @@ RSetZone(ux, uy) {
                 ; a locked row has no working control, so none of its control
                 ; rectangles answer - the whole row goes to the explanation,
                 ; which is where the reason is written
-                if RSetRowLocked(o9)
-                    return 1080 + i
+                if (RSetRowLocked(o9) || RSetRowMoot(o9))
+                    return RSetExpZ(i)
                 if (o9.ui = "action" || (o9.ui = "file" && o9.k = "font")) {
                     if (ux >= ax + HL.abw - 108 && ux <= ax + HL.abw - 16
                         && uy >= ry && uy <= ry + 26)
@@ -30516,7 +31479,7 @@ RSetZone(ux, uy) {
                         && uy >= ty9 - 10 && uy <= ty9 + 10)
                         return RSetRowZ(i)
                 }
-                return 1080 + i
+                return RSetExpZ(i)
             }
         }
     }
@@ -30562,6 +31525,7 @@ RSetDDPick(it) {
         try IniWrite(idx, iniPath, "rset", o.k)
         if RSET.on
             RSetSay("CHANGED - PRESS APPLY AGAIN TO WRITE IT", AMBER)
+        RSetLinkPick(o.k)              ; after the message, so the link's own wins
     }
     RSetDDClose()
 }
@@ -31869,6 +32833,106 @@ RSetIcon(i, cx, cy, col, live, now) {
         DelB(b2)
         b2 := SBrush(FA(col, live ? 0.9 : 0.45))
         FillEll(cx - 8, cy + 8, 4, 4, b2), DelB(b2)               ; the base
+    } else if (k = "maxq") {                       ; a level meter, brimming
+        ; Not the quality bars - GRAPHICS QUALITY owns those, and this row is
+        ; not a level but the ceiling above them. A meter whose fill rides to
+        ; the brim while the row is live, with a chevron over the cap for the
+        ; "and beyond" the setting means; the chevron bobs while live.
+        StrokeRR(cx - 4, cy - 4, 8, 13, 2, pn)
+        fl := live ? 1.0 : 0.55
+        b2 := SBrush(FA(col, live ? 0.9 : 0.45))
+        FillRR(cx - 2.5, cy - 2.5 + 10*(1 - fl), 5, 10*fl, 1, b2), DelB(b2)
+        bob := live ? Sin(DecT(now)*0.004)*0.8 : 0.0
+        Line(cx - 4, cy - 6 + bob, cx, cy - 9.5 + bob, pn)
+        Line(cx, cy - 9.5 + bob, cx + 4, cy - 6 + bob, pn)
+    } else if (k = "gmode") {                      ; a three-notch slider
+        ; The knob sits on the notch the row has picked - PERFORMANCE left,
+        ; QUALITY right, BALANCED between - and rests hollow at the middle on
+        ; KEEP, so the glyph reads the pick without the chip.
+        Line(cx - 8, cy, cx + 8, cy, pn)
+        loop 3 {
+            tx2 := cx - 8 + (A_Index - 1)*8
+            Line(tx2, cy - 3, tx2, cy + 3, pn)
+        }
+        gi  := RSetIdx(RSET_OPTS[i])
+        kx2 := (gi = 2) ? cx - 8 : (gi = 4) ? cx + 8 : cx
+        if (gi > 1) {
+            b2 := SBrush(col)
+            FillEll(kx2 - 3.2, cy - 3.2, 6.4, 6.4, b2), DelB(b2)
+        } else
+            Ell(kx2 - 3.2, cy - 3.2, 6.4, 6.4, pn)
+    } else if (k = "shiftlock") {                  ; a padlock
+        Arc(cx - 4.5, cy - 9.5, 9, 9, 180, 180, pn)         ; the shackle
+        StrokeRR(cx - 7, cy - 4.5, 14, 11, 2, pn)           ; the body
+        b2 := SBrush(col)
+        FillEll(cx - 1.6, cy - 1.2, 3.2, 3.2, b2), DelB(b2) ; the keyhole
+        Line(cx, cy + 1, cx, cy + 3.5, pn)
+    } else if (k = "cammode") {                    ; a head, and the camera on its orbit
+        ; the head sits still; the camera rides the orbit while the row is
+        ; live and parks in front when it is not - the row is about where the
+        ; camera goes, so that is the part that moves
+        b2 := SBrush(FA(col, live ? 0.9 : 0.5))
+        FillEll(cx - 2.5, cy - 2.5, 5, 5, b2), DelB(b2)
+        pn2 := Pen(FA(col, live ? 0.7 : 0.4), 1)
+        Ell(cx - 9, cy - 4.5, 18, 9, pn2), DelP(pn2)
+        an := live ? DecT(now)*0.0015 : 1.5708
+        ox := cx + 9*Cos(an), oy := cy + 4.5*Sin(an)
+        b2 := SBrush(col)
+        FillRR(ox - 2.4, oy - 1.8, 4.8, 3.6, 1, b2), DelB(b2)
+    } else if (k = "movemode") {                   ; the arrow-key cluster
+        ; four keys in the T that walks a character: up, then left, down,
+        ; right. The up key fills while the row is live.
+        loop 4 {
+            j := A_Index
+            kx2 := (j = 1) ? cx - 2.5 : cx - 8 + (j - 2)*5.5
+            ky2 := (j = 1) ? cy - 8 : cy - 2
+            if (j = 1 && live) {
+                b2 := SBrush(col)
+                FillRR(kx2, ky2, 5, 5, 1, b2), DelB(b2)
+            } else
+                StrokeRR(kx2, ky2, 5, 5, 1, pn)
+        }
+    } else if (k = "fullscr") {                    ; a frame, its corners pulling outward
+        StrokeRR(cx - 6, cy - 5, 12, 10, 1.5, pn)
+        ex := live ? 2 + 1.2*(0.5 + 0.5*Sin(DecT(now)*0.003)) : 2
+        loop 4 {
+            sx2 := (Mod(A_Index, 2) = 1) ? -1 : 1     ; left / right
+            sy2 := (A_Index <= 2) ? -1 : 1            ; top / bottom
+            ax_ := cx + sx2*(6 + ex), ay_ := cy + sy2*(5 + ex)
+            Line(ax_, ay_, ax_ - sx2*3.5, ay_, pn)
+            Line(ax_, ay_, ax_, ay_ - sy2*3.5, pn)
+        }
+    } else if (k = "startmax") {                   ; a window, and the box that maximises it
+        StrokeRR(cx - 8, cy - 7, 16, 14, 2, pn)
+        Line(cx - 8, cy - 3, cx + 8, cy - 3, pn)             ; the title bar
+        b2 := SBrush(FA(col, live ? 0.9 : 0.5))
+        FillRR(cx - 6, cy - 6, 2, 2, 0.5, b2), DelB(b2)      ; the dot at its left
+        pn2 := Pen(FA(col, live ? 0.95 : 0.55), 1.2)
+        StrokeRR(cx + 2, cy - 6.2, 4.4, 2.4, 0.5, pn2), DelP(pn2)   ; the maximise box
+    } else if (k = "redmot") {                     ; a wave, and what the switch does to it
+        ; motion on the left, calm on the right: the wave flattens along its
+        ; length while REDUCED MOTION is ON, and runs full height otherwise
+        rm := RSetIdx(RSET_OPTS[i])
+        px0 := cx - 9, py0 := cy
+        loop 9 {
+            t  := A_Index/9.0
+            x1 := cx - 9 + 18*t
+            am := (rm = 2) ? 3.6*(1 - t) + 0.3 : 3.6
+            y1 := cy + Sin(t*9.42)*am
+            Line(px0, py0, x1, y1, pn)
+            px0 := x1, py0 := y1
+        }
+    } else if (k = "uitrans") {                    ; a pane over a checker
+        ; the pane's fill follows the row: a set row draws it at the chosen
+        ; opacity, so the glyph previews the value before it is written
+        b2 := SBrush(FA(col, live ? 0.5 : 0.3))
+        FillRR(cx - 8, cy - 8, 7, 7, 1, b2)
+        FillRR(cx - 1, cy - 1, 7, 7, 1, b2), DelB(b2)
+        ti := RSetIdx(RSET_OPTS[i])
+        op := (ti > 1) ? 1 - (ti - 2)/10.0 : 0.5            ; v[2] is 0% transparency, solid
+        b2 := SBrush(FA(col, 0.25 + 0.65*op))
+        FillRR(cx - 4, cy - 4, 12, 12, 2, b2), DelB(b2)
+        StrokeRR(cx - 4, cy - 4, 12, 12, 2, pn)
     } else {                                       ; font: letter A
         Line(cx - 6, cy + 7, cx, cy - 8, pn)
         Line(cx, cy - 8, cx + 6, cy + 7, pn)
@@ -32663,11 +33727,13 @@ RSetDbBody(ax, ay, ay2, lTop, lBot, ff, sld, now, acc) {
         pn := Pen(FA(Alpha(AccHi(acc, 0.4), Round(190*pr)), ff), 1.4*pr + 0.2)
         StrokeRR(cx + 16 - ex, sy - ex*0.55, HL.abw - 32 + ex*2, 26 + ex*1.1, 7 + ex*0.35, pn), DelP(pn)
     }
-    pn := Pen(FA(Alpha(THMix(0xFFFFFF, acc, fcD)
-                     , Round((26 + 30*hvq) + (170 - (26 + 30*hvq))*fcD)), ff), 1.2 + 0.1*fcD)
+    ; PenP for a THMix result - see the note on THMix: the blend is already
+    ; themed, and Pen would theme it a second time, inverting it in light mode
+    pn := PenP(FA(Alpha(THMix(0xFFFFFF, acc, fcD)
+                      , Round((26 + 30*hvq) + (170 - (26 + 30*hvq))*fcD)), ff), 1.2 + 0.1*fcD)
     StrokeRR(cx + 16, sy, HL.abw - 32, 26, 7, pn), DelP(pn)
-    pn := Pen(FA(Alpha(THMix(0xFF9AA8C0, acc, fcD)
-                     , Round((115 + 60*hvq) + (190 - (115 + 60*hvq))*fcD)), ff), 1.4)
+    pn := PenP(FA(Alpha(THMix(0xFF9AA8C0, acc, fcD)
+                      , Round((115 + 60*hvq) + (190 - (115 + 60*hvq))*fcD)), ff), 1.4)
     Ell(cx + 26, sy + 7, 11, 11, pn)
     Line(cx + 36, sy + 17, cx + 40, sy + 21, pn), DelP(pn)
 
@@ -32847,8 +33913,8 @@ RSetFxField(z, fx, fy, fw, fh, val, foc, acc, ff, now) {
     }
     b := SBrush(FA(Alpha(0xFFFFFF, Round((10 + 8*hv) + (20 - (10 + 8*hv))*foc)), ff))
     FillRR(fx, fy, fw, fh, 7, b), DelB(b)
-    pn := Pen(FA(Alpha(THMix(acc, AccHi(acc, 0.4), foc)
-                     , Round((60 + 60*hv) + (190 - (60 + 60*hv))*foc)), ff), 1 + 0.4*foc)
+    pn := PenP(FA(Alpha(THMix(acc, AccHi(acc, 0.4), foc)           ; PenP: THMix is pre-themed
+                      , Round((60 + 60*hv) + (190 - (60 + 60*hv))*foc)), ff), 1 + 0.4*foc)
     StrokeRR(fx, fy, fw, fh, 7, pn), DelP(pn)
     ; a rail down the caret edge, growing out of the middle as focus lands
     if (foc > 0.01) {
@@ -33006,7 +34072,7 @@ RSetSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
             set  := (idx > 1)
             ; the row is three zones now - the control, the knob, and the rest - so
             ; the highlight takes whichever the pointer is over
-            hv   := Max(HL.h.Get(RSetRowZ(i), 0.0), HL.h.Get(1080 + i, 0.0)
+            hv   := Max(HL.h.Get(RSetRowZ(i), 0.0), HL.h.Get(RSetExpZ(i), 0.0)
                       , HL.h.Get(RSetKnobZ(i), 0.0))
             sld  := (1 - cg)*10 - rowSl          ; entrance slide, minus the page pushing it left
             axs  := ax + sld                     ; row CONTENT rides both; panel chrome does not
@@ -33033,8 +34099,14 @@ RSetSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
             ; Only rows that actually carry flags: the client settings FILE rows
             ; below write XML, which this switch has nothing to do with.
             skip  := o.HasOwnProp("f") && !RSetSrcRows()
-            avail := avail && !lock
-            fbc   := lock ? fb*0.34 : (skip ? fb*0.55 : fb)   ; the control's own alpha
+            ; ---- and rows another row has made moot ----
+            ; Drawn out the way a locked row is, for the same reason: this
+            ; control decides nothing while the other row is set. The hint
+            ; names the row and the way back. See RSetRowOverride.
+            ovr   := RSetRowOverride(o)
+            moot  := (ovr != "")
+            avail := avail && !lock && !moot
+            fbc   := (lock || moot) ? fb*0.34 : (skip ? fb*0.55 : fb)   ; the control's own alpha
             if (o.ui = "action")
                 live := (o.k = "apply")   ? (chosen > 0)
                       : (o.k = "fxedit")  ? (RSET.extra.Count > 0)
@@ -33070,6 +34142,13 @@ RSetSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
                 Arc(axs + 32, ry + 4, 9, 9, 180, 180, pn), DelP(pn)
                 b := SBrush(FA(Alpha(0xFF9AA8C0, 160), fb))
                 FillRR(axs + 30.5, ry + 8.5, 12, 8, 2, b), DelB(b)
+            } else if moot {
+                ; a struck ring at the same corner: bypassed, not taken. The
+                ; shackle means the value lives elsewhere; this means another
+                ; row decides and this one is waiting.
+                pn := Pen(FA(Alpha(0xFF9AA8C0, 160), fb), 1.3)
+                Ell(axs + 31.5, ry + 4.5, 9, 9, pn)
+                Line(axs + 33.5, ry + 11.5, axs + 38.5, ry + 6.5, pn), DelP(pn)
             }
 
             ; ---- how far the text may run before it meets the control ----
@@ -33102,12 +34181,14 @@ RSetSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
             }
             else if lock
                 hint := "taken over in EDIT FAST FLAGS  ·  remove the override there to get this back"
+            else if moot
+                hint := "overridden by " ovr
             else if skip
                 hint := o.h "  ·  not written - FLAG SOURCE is EDIT FAST FLAGS"
             else if !avail
                 hint := "not present in your client settings file"
             else if (o.HasOwnProp("xml") && RSET.xmlHave.Has(o.xml))
-                hint := o.h "  ·  now " RSET.xmlHave[o.xml]
+                hint := o.h "  ·  now " RSetXmlLabel(o, RSET.xmlHave[o.xml])
             else if (o.ui = "file" && (o.k = "logo" || o.k = "logos")) {
                 kH   := (o.k = "logos") ? 2 : 1
                 srcH := RSetLogoOf(kH)
@@ -33252,7 +34333,7 @@ RSetSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
                     q3  := A_Index
                     hq3 := HL.h.Get(933 + q3, 0.0)
                     onq3 := RSET.srcT*Clamp(1 - Abs(RSET.srcSelT - q3), 0.0, 1.0)
-                    Txt(q3 = 1 ? "SYSTEMS" : "FLAGS", sgx + (q3 - 1)*sgw, ry + 14, sgw, 14, HL.fXs
+                    TxtP(q3 = 1 ? "SYSTEMS" : "FLAGS", sgx + (q3 - 1)*sgw, ry + 14, sgw, 14, HL.fXs   ; TxtP: THMix is pre-themed
                         , FA(Alpha(THMix(0xFFC7CBE0, AccHi(acc, 0.4), onq3)
                                  , Round(140 + 60*hq3 + 55*onq3)), fb), fmtC)
                 }
@@ -33540,6 +34621,10 @@ global bgOpacity := 1.0
 try hubTheme := Integer(IniRead(iniPath, "hub", "theme", "0"))
 try hubArmTint := Integer(IniRead(iniPath, "hub", "armtint", "1"))
 try hubLowPerf := Integer(IniRead(iniPath, "hub", "lowperf", "0"))
+; the town the heart's page opens on - one of three, chosen from the chips in
+; its header and kept across launches
+global hubTown := 1
+try hubTown := Clamp(Integer(IniRead(iniPath, "hub", "town", "1")), 1, 3)
 try hubTop     := Integer(IniRead(iniPath, "hub", "ontop",   "1"))
 try hubTrueMin := Integer(IniRead(iniPath, "hub", "truemin", "0"))
 try hubAutoUpd := Integer(IniRead(iniPath, "hub", "autoupdate", "0"))
@@ -33563,35 +34648,68 @@ global profName := "USERNAME", profBio := "EMPTY BIO", profRing := 1, profFontI 
 ; index 1, which is a bundled image and not "their" picture.
 global profPicSet := 0
 global PFONTS := ["Segoe UI", "Bahnschrift", "Consolas", "Georgia", "Trebuchet MS", "Candara", "Cambria", "Impact"]
-global CHANGELOG := [["+", "tabs, save / export + saved-script library"]
-    , ["+", "profile editor - ring, name, font, bio"]
-    , ["+", "SCRIPT HUB - write / paste / place .ahk"]
-    , ["+", "editor selection - ctrl A / C / X / V"]
-    , ["+", "placed cards - portrait, EDIT, live state"]
-    , ["+", "framed gallery carousel on this page"]
-    , ["+", "dark & light theme + transparency"]
-    , ["*", "light theme rebuilt on a paper palette"]
-    , ["*", "placed scripts stay fully editable"]
-    , ["*", "warnings push the layout instead of hiding"]
-    , ["*", "dashboard is now a general overview"]
-    , ["*", "one pool slot each for avatar / avatar_1"]
-    , ["+", "animated dark / light theme transition"]
-    , ["+", "bigger hub - screen-time dashboard"]
-    , ["+", "CHECK validates scripts with an output line"]
-    , ["*", "profile polish, tab animations, bigger gallery"]
-    , ["*", "profile plate centred - render perf pass"]
-    , ["+", "dual-engine scripts - v1 and v2 both place"]
-    , ["+", "dashboard changelog + live system counters"]
-    , ["+", "settings reset - one click back to factory"]
-    , ["*", "credits and settings ambient polish"]
-    , ["*", "readable output line with engine badge"]
-    , ["+", "saved places cycle every banner - click to skip"]
-    , ["+", "discord activity: account, join link, focus state"]
-    , ["*", "BETTER MATCHMAKING renamed AUTO-REGION FINDER"]
-    , ["+", "new BETTER MATCHMAKING - picks measured servers"]
-    , ["*", "JOIN only rerolls with AUTO-REGION FINDER on"]
-    , ["+", "CHECK FOR UPDATES + AUTO UPDATE setting"]
-    , ["+", "FLAG MANAGER: string flags inject live, refusals say why"]]
+; ---- v1.0.1 ----
+; The release list: everything the hub ships with, page by page in the
+; order the sidebar and the module rail present them, the flag manager last
+; so the dashboard's WHAT'S NEW - which shows the tail of this list - opens
+; on the module most people come for. Every line is a "+" because
+; everything is new; "*" is for a change or a fix in a later build. Keep
+; a line under ~55 characters: both the dashboard card and the UPDATE LOGS
+; list elide past that.
+global CHANGELOG := [["+", "the hub: dashboard, sidebar, seven pages"]
+    , ["+", "launch gate - OPEN ROBLOX, OPEN HUB, ACCOUNTS"]
+    , ["+", "profile - picture, ring, name, bio, hub font"]
+    , ["+", "gallery - your pictures on the gate and the logs"]
+    , ["+", "six accents, dark / light theme, two opacities"]
+    , ["+", "ARMED TINT recolours the hub while a system is on"]
+    , ["+", "minimise to a pill or the tray - never steals focus"]
+    , ["+", "screen-time dashboard - session, total, daily avg"]
+    , ["+", "live SYSTEMS and SCRIPTS counters"]
+    , ["+", "CHECK FOR UPDATES + AUTO UPDATE from the repo"]
+    , ["+", "PERFORMANCE mode - flat, snapped, idles at zero"]
+    , ["+", "ON TOP, one-click appearance reset"]
+    , ["+", "a detail sheet on every row - click its name"]
+    , ["+", "guided 56-step tour that opens the real panels"]
+    , ["+", "CREDITS - the makers, their links, a pixel cafe"]
+    , ["+", "UPDATE LOGS - this list, and the gallery reel"]
+    , ["+", "TOWN - the heart opens three living pixel towns"]
+    , ["+", "NIGHTFALL - a skyline on its own two-minute day"]
+    , ["+", "MAIN STREET - a city street, side on, in summer"]
+    , ["+", "GREENVALE - a village from above, forest round it"]
+    , ["+", "the towns keep the real time; fireworks on the hour"]
+    , ["+", "SCRIPT HUB - write, paste, load, CHECK, PLACE .ahk"]
+    , ["+", "editor tabs, saved-script library, export .AHK / .TXT"]
+    , ["+", "placed cards - portrait, ENABLE / STOP, EDIT, v1 + v2"]
+    , ["+", "DEVICE OPTIMIZATIONS - five groups, snapshots, revert"]
+    , ["+", "LOGIN ITEMS - apps that open and close with Roblox"]
+    , ["+", "SPECIAL - discord activity, server region, finder"]
+    , ["+", "BETTER MATCHMAKING, multi-instance, FPS BOOST"]
+    , ["+", "LIVE strip - game, region, home, discord"]
+    , ["+", "ACCOUNTS - browser login, one client per account"]
+    , ["+", "account profiles - avatar, groups, creations, icons"]
+    , ["+", "SAVED PLACES - stats, banners, JOIN / HUNT links"]
+    , ["+", "CURSOR - arrow, shift lock, camera and text slots"]
+    , ["+", "cursor APPLY across every install and strapper mods"]
+    , ["+", "FAR CURSOR, AUTO RE-APPLY after a Roblox update"]
+    , ["+", "CLIENT SETTINGS - presets, rendering, lighting"]
+    , ["+", "textures, meshes, AA, framerate cap, shadows, post-fx"]
+    , ["+", "fonts and logos, a fast flags page, FLAG SOURCE"]
+    , ["+", "settings file - quality, MAX QUALITY, graphics mode"]
+    , ["+", "volume, sensitivity, shift lock, camera, movement"]
+    , ["+", "full screen, start maximised, reduced motion, UI"]
+    , ["+", "rows that override each other say so, and go quiet"]
+    , ["+", "REVERT clears only what the module wrote"]
+    , ["+", "FAST FLAG MANAGER - inject live into the client"]
+    , ["+", "bool flags read and written one byte wide"]
+    , ["+", "UNINJECT restores originals, RE-APPLY holds them"]
+    , ["+", "RE-APPLY never injects on its own - INJECT decides"]
+    , ["+", "AUTO INJECT, SINGLETON lookup, multi-client tabs"]
+    , ["+", "flag DATABASE, IMPORT / EXPORT, UPDATE FLAGS"]
+    , ["+", "CLEAN - export what the last injection kept"]
+    , ["+", "LOGS - injection, updates, HISTORY with restore"]
+    , ["+", "HITBOX and 30HZ HITBOX presets"]
+    , ["+", "COMMUNITY FLAGS - sets shared by other players"]
+    , ["+", "community sync by content hash, and a REFRESH"]]
 global famP := 0, fP := 0, fPs := 0
 try profName := IniRead(iniPath, "profile", "name", "USERNAME")
 try profBio := IniRead(iniPath, "profile", "bio", "EMPTY BIO")
@@ -34382,6 +35500,18 @@ GroupLine(x1, x2, y, acc, f, now) {
     FillEll(x2 - 2, y - 2, 4, 4, b), DelB(b)
 }
 
+; ---- one frame, later ----
+; LOW PERFORMANCE MODE stops the renderer the moment nothing is in flight, and
+; a status message's freshness - its colour for the first few seconds - is a
+; flourish it no longer keeps frames for. So the Say functions book one frame
+; for just after their message has aged, and that frame lands the settled
+; look. A no-op in the normal mode, where the busy predicate holds the rate
+; itself; the one-shot merely replaces any earlier one, so a burst of
+; messages costs one frame, not one per message.
+HubPokeLater(ms) {
+    if hubLowPerf
+        SetTimer(HubPoke, -ms)
+}
 HubPoke() {
     ; Not while a solve is running. PuzSay pokes once per finished board, and
     ; each poke drives the hub to 60 fps - a full panel frame competing with the
@@ -36266,14 +37396,20 @@ HubOpen() {
     HL.opw := (HL.sbx + HL.sbw - 11) - 14 - HL.optx
     HL.opF := (MeasureW("OPERATOR", HL.fS) + 9 <= HL.opw) ? HL.fS : HL.fXs
     ; The version badges size themselves to ZVER - it changes with every
-    ; release and "v1.0.0" already overran the 74 and 52 they were typed
+    ; release and "v1.0.0 BETA" already overran the 74 and 52 they were typed
     ; at. Measured once here, read by the header, the credits card, the
     ; dashboard chip and the hit test beside it.
     HL.vbw := Max(74, Round(MeasureW(ZVER, fBadge)) + 18)      ; fBadge badges (header, credits)
     HL.zvw := Max(52, Round(MeasureW(ZVER, HL.fS)) + 14)       ; the dashboard's small chip
     HL.ubw := Round(MeasureW("CHECK FOR UPDATES", HL.fS)) + 24 ; the button beside it, same face
     HL.scr := [BuildScr("DASHBOARD", HL.fT), BuildScr("INTEGRATIONS", HL.fT), BuildScr("SCRIPT HUB", HL.fT)
-        , BuildScr("SETTINGS", HL.fT), BuildScr("CREDITS", HL.fT), BuildScr("UPDATE LOGS", HL.fT)]
+        , BuildScr("SETTINGS", HL.fT), BuildScr("CREDITS", HL.fT), BuildScr("UPDATE LOGS", HL.fT)
+        , BuildScr("TOWN", HL.fT)]                 ; the seventh: the heart's page - see TownDraw
+    ; the heart as a control: its hover, the tab it opens, the nav pill that
+    ; steps aside for it, and the burst a press throws
+    HL.townT := 0.0, HL.navA := 1.0, HL.navLast := 1, HL.heartAt := 0
+    HL.townPrev := 0, HL.townAt := 0            ; the town switch: what it left, and when
+    HL.cogA := 22.5, HL.cogV := 0.0, HL.cogAt := 0   ; the SETTINGS cog: its angle, its spin, its last frame
     HL.intro := A_TickCount, HL.closeAt := 0, HL.scrAt := A_TickCount
     ; the opening gate - set here, with the rest of HL, so it cannot be wiped by
     ; a top-level declaration that runs later. See HubGateDraw.
@@ -36321,7 +37457,7 @@ HubOpen() {
     HL.ceVis := Max(3, Floor((HL.ceH - 16)/15))
     HL.h := Map()
     HL.hz := [1, 2, 5, 6, 7, 9, 10, 47, 50, 53, 54, 69, 60, 61, 62, 63, 64, 65, 66, 67, 205
-        , 20, 21, 22, 23, 24, 25, 31, 32, 33, 34, 35, 36, 40, 41, 42, 248, 249
+        , 20, 21, 22, 23, 24, 25, 31, 32, 33, 34, 35, 36, 37, 40, 41, 42, 248, 249, 2221, 2222, 2223
         , 43, 44, 45, 46, 48, 49, 68
         ; Splitting a row into "control" and "the rest" means TWO zones per
         ; row, and a zone that is not registered here never gets a hover value
@@ -36390,9 +37526,8 @@ HubOpen() {
         , 925, 926, 927, 928
         ; FLAG SOURCE: its switch and its two segments
         , 933, 934, 935
-        ; the explaining half of each client-settings row
-        , 1081, 1082, 1083, 1084, 1085, 1086, 1087, 1088, 1089, 1090, 1091, 1092, 1093, 1094, 1095, 1096
-        , 1097, 1098
+        ; the explaining half of each client-settings row is pushed from the
+        ; row count below, with the control column and the knobs
         , 920, 921, 922, 923, 924, 930, 940, 941, 942, 943, 944, 945, 946
         , 404, 966, 967, 968, 969, 970, 971
         ; SPECIAL row bodies, rebased out of the 960s so a sixth system could
@@ -36440,7 +37575,7 @@ HubOpen() {
     ; its hover follows. It cannot rot again.
     loop RSET_SYSN {
         HL.hz.Push(RSetRowZ(A_Index))        ; the control column
-        HL.hz.Push(1080 + A_Index)           ; the rest of the row
+        HL.hz.Push(RSetExpZ(A_Index))        ; the rest of the row
         HL.hz.Push(RSetKnobZ(A_Index))       ; a slider row's knob, on its own
     }
     ; the raw flag page: BACK, DATABASE, both add fields, ADD, the two
@@ -36626,6 +37761,18 @@ HubZone(sx, sy) {
             ny := HubNavY(A_Index)
             if uy >= ny && uy <= ny + HL.nvh
                 return 30 + A_Index
+        }
+    }
+    ; the heart, the seventh entry - the same centre the renderer draws it at
+    hcx0 := HL.sbx + HL.sbw/2 + 5, hcy0 := HubNavY(6) + HL.nvh + 53
+    if ((ux - hcx0)**2 + ((uy - hcy0)*1.1)**2 <= 1296)
+        return 37
+    ; the three town chips in TOWN's header - the rectangles TownChips draws
+    if (hubTab = 7 && uy >= HL.cty - 3 && uy <= HL.cty + 21) {
+        loop 3 {
+            cxk := HL.ctx + HL.ctw - 40 - (4 - A_Index)*90
+            if (ux >= cxk && ux <= cxk + 84)
+                return 2220 + A_Index
         }
     }
     if (ux - HL.avcx)**2 + (uy - HL.avcy)**2 <= 484
@@ -37036,6 +38183,12 @@ HubClick(wParam, lParam, msg, hwnd) {
         DllCall("SetCapture", "ptr", HL.gui.Hwnd)
     } else if z >= 31 && z <= 36
         HubTabSet(z - 30)
+    else if z = 37 {
+        ; the heart: opens its page, and closes it again from there - back to
+        ; the dashboard, the way the hub greets you
+        HL.heartAt := A_TickCount
+        HubTabSet(hubTab = 7 ? 1 : 7)
+    }
     else if z = 42 || z = 46 {
         HL.drag := z = 42 ? 3 : 4, HL.dragZone := z
         DllCall("SetCapture", "ptr", HL.gui.Hwnd)
@@ -37123,6 +38276,10 @@ HubClick(wParam, lParam, msg, hwnd) {
         TutClick(z)
         HubPoke()
     }
+    else if (z >= 2221 && z <= 2223) {
+        FFM.clickAt[z] := A_TickCount
+        TownPick(z - 2220)
+    }
     else if (z = 1220 || z = 1221) {
         FFM.clickAt[z] := A_TickCount
         HubCredWho(z = 1220 ? 1 : 2)
@@ -37182,8 +38339,8 @@ HubClick(wParam, lParam, msg, hwnd) {
     else if (z >= 900 && z <= 959) || (z >= 1301 && z <= 1300 + RSET_SYSN)
         || (z > RSET_KNOBZ && z <= RSET_KNOBZ + RSET_SYSN)
         RSetClick(z)
-    else if z >= 1081 && z <= 1080 + RSET_SYSN
-        RSetDetail(z - 1080)
+    else if z > RSET_EXPZ && z <= RSET_EXPZ + RSET_SYSN
+        RSetDetail(z - RSET_EXPZ)
     else if z = 1152 {
         HL.drag := 13, HL.dragZone := 1152
         DllCall("SetCapture", "ptr", HL.gui.Hwnd)
@@ -38841,7 +39998,11 @@ HubRender() {
     ; wants to be out of the way. An exponential ease also crawls through its
     ; last few percent, which is most of what "too long" actually was - so the
     ; tail is snapped rather than eased to nothing.
-    DET.t += ((DET.on ? 1.0 : 0.0) - DET.t)*(DET.on ? 0.26 : 0.55)
+    ; Snapped in LOW PERFORMANCE MODE like everything EK covers: this ease
+    ; is not in the busy predicate - the idle frames used to finish it - and
+    ; that mode now STOPS on an idle frame, which would have left the sheet
+    ; a quarter open until the next poke.
+    DET.t += ((DET.on ? 1.0 : 0.0) - DET.t)*(hubLowPerf ? 1.0 : (DET.on ? 0.26 : 0.55))
     if (!DET.on && DET.t < 0.06)
         DET.t := 0.0
     SPF.viewT += (((SPF.view != "") ? 1.0 : 0.0) - SPF.viewT)*EK(0.24)
@@ -38885,8 +40046,16 @@ HubRender() {
         HL.armT := 0.0
     else if tinted && HL.armT > 0.996
         HL.armT := 1.0
-    nvTgt := HubNavY(hubTab)
+    ; The pill marks one of the six entries. The seventh tab is opened from the
+    ; heart below the list and has no entry to mark, so on it the pill fades
+    ; out where it last sat rather than sliding to a row that does not exist -
+    ; and comes back on the entry that is chosen next.
+    if (hubTab <= 6)
+        HL.navLast := hubTab
+    nvTgt := HubNavY(HL.navLast)
     HL.navY := HL.navY + (nvTgt - HL.navY)*EK(0.22)
+    HL.navA  := HL.navA + (((hubTab = 7) ? 0.0 : 1.0) - HL.navA)*EK(0.2)
+    HL.townT := HL.townT + (((hubTab = 7) ? 1.0 : 0.0) - HL.townT)*EK(0.16)
     ; hub-wide status tint (avatar ring, minimised orb). AMBER means "something
     ; is armed", so it follows every module, not just autoblock.
     ; Three states on one path: accent when nothing is armed, amber when armed,
@@ -39159,18 +40328,19 @@ HubRender() {
     dvx := HL.sbx + HL.sbw + 15
     b := VBrush(dvx, HL.cty - 6, 1, ch - 66, FA(Alpha(0xFFFFFF, 40), cf), Alpha(0xFFFFFF, 0))
     DllCall("gdiplus\GdipFillRectangle", "ptr", G, "ptr", b, "float", dvx, "float", HL.cty - 6, "float", 1, "float", ch - 66), DelB(b)
-    b := VBrush(HL.sbx + sdx, HL.navY, HL.sbw, HL.nvh, FA(Alpha(hubCur, 38), s2), FA(Alpha(hubCur, 12), s2))
+    sN := s2*HL.navA                             ; the pill's own alpha - gone on the seventh tab
+    b := VBrush(HL.sbx + sdx, HL.navY, HL.sbw, HL.nvh, FA(Alpha(hubCur, 38), sN), FA(Alpha(hubCur, 12), sN))
     FillRR(HL.sbx + sdx, HL.navY, HL.sbw, HL.nvh, 9, b), DelB(b)
-    MicroBackdrop(HL.sbx + sdx, HL.navY, HL.sbw, HL.nvh, 9, hubCur, s2, now, 0.8)
-    pn := Pen(FA(Alpha(hubCur, 90 + 30*emb2G), s2), 1)
+    MicroBackdrop(HL.sbx + sdx, HL.navY, HL.sbw, HL.nvh, 9, hubCur, sN, now, 0.8)
+    pn := Pen(FA(Alpha(hubCur, 90 + 30*emb2G), sN), 1)
     StrokeRR(HL.sbx + sdx, HL.navY, HL.sbw, HL.nvh, 9, pn), DelP(pn)
-    b := SBrush(FA(Alpha(hubCur, 220), s2))
+    b := SBrush(FA(Alpha(hubCur, 220), sN))
     FillRR(HL.sbx + sdx, HL.navY + 8, 3, HL.nvh - 16, 1.5, b), DelB(b)
-    b := SBrush(FA(Alpha(hubCur, 26 + 14*emb2G), s2))
+    b := SBrush(FA(Alpha(hubCur, 26 + 14*emb2G), sN))
     FillEll(HL.sbx + sdx + 12, HL.navY + HL.nvh/2 - 11, 22, 22, b), DelB(b)
     loop 2 {
         tk2 := A_Index
-        pn := Pen(FA(Alpha(hubCur, 90 + 90*Max(0.0, Sin(DecT(now)*0.0035 - tk2*0.9))**2), s2), 1.3)
+        pn := Pen(FA(Alpha(hubCur, 90 + 90*Max(0.0, Sin(DecT(now)*0.0035 - tk2*0.9))**2), sN), 1.3)
         Line(HL.sbx + sdx + HL.sbw - 10, HL.navY + 12 + (tk2 - 1)*10, HL.sbx + sdx + HL.sbw - 5, HL.navY + 12 + (tk2 - 1)*10, pn), DelP(pn)
     }
     loop 6 {
@@ -39203,7 +40373,33 @@ HubRender() {
         } else if i = 4 {
             pn := Pen(icc, 1.6)
             Ell(icx - 4.6, icy - 4.6, 9.2, 9.2, pn)
-            ga := actv ? now*0.05 : 22.5 + 45*hv
+            ; ---- one angle, carried between frames ----
+            ; The cog used to take its angle from two unrelated formulas:
+            ; now*0.05 while SETTINGS was the tab, 22.5 + 45*hv otherwise. Every
+            ; change of state was therefore a jump - it teleported to wherever
+            ; the clock said the moment the tab was chosen, and snapped back to
+            ; its rest pose the moment another was, mid-turn. Now the angle is a
+            ; value that only ever moves from where it is: choosing the tab
+            ; spins it up, leaving the tab spins it down and lets it settle on
+            ; the next tooth pose ahead, a hover turns it a quarter tooth
+            ; forward, and the hover ending turns it forward again onto the
+            ; next rest pose - never back. dt is clamped so a stalled frame
+            ; cannot whip it round.
+            dtc := HL.cogAt ? Min(now - HL.cogAt, 50) : 0
+            HL.cogAt := now
+            vT := (actv && !hubLowPerf) ? 0.05 : 0.0
+            HL.cogV += (vT - HL.cogV)*EK(0.08)
+            HL.cogA += HL.cogV*dtc
+            if !actv {
+                want := (hv > 0.5) ? 67.5 : 22.5
+                dA := Mod(want - HL.cogA, 90)
+                if (dA < 0)
+                    dA += 90
+                HL.cogA += dA*EK(0.16)
+            }
+            if (HL.cogA > 36000)
+                HL.cogA -= 36000
+            ga := HL.cogA
             loop 4 {
                 a_ := (ga + (A_Index - 1)*90)*0.0174533
                 Line(icx + 5.6*Cos(a_), icy + 5.6*Sin(a_), icx + 8.4*Cos(a_), icy + 8.4*Sin(a_), pn)
@@ -39226,18 +40422,24 @@ HubRender() {
         Txt(lab, nx + 38, ny, HL.sbw - 42, HL.nvh, fBadge
             , FA(Alpha(actv ? 0xFFFFFF : 0xC7CBE0, actv ? 235 : 120 + 95*hv), s2), fmtL)
     }
-    ; LOW PERFORMANCE MODE: no sidebar centrepiece. Two glow discs, a flock of
-    ; five orbiting hearts, two risers and a rotating bezier heart - the single
-    ; most expensive purely-ornamental thing on screen, and it is redrawn every
-    ; frame while the hub is open.
+    ; ---- the heart: the seventh entry ----
+    ; It was the sidebar's centrepiece and nothing else. Now it is a control:
+    ; hovering lifts it, pressing opens TOWN - the page behind it - and while
+    ; that page is up it sits lit and ringed, the way the pill lights an entry.
+    ; LOW PERFORMANCE MODE used to skip the whole centrepiece; a control has to
+    ; be there to press, so the heart itself is always drawn and only the
+    ; ornament round it - glow discs, the orbiting flock, the risers, the
+    ; sparks - is what that mode drops.
     hcx := HL.sbx + sdx + HL.sbw/2 + 5, hcy := HubNavY(6) + HL.nvh + 53
-    if !hubLowPerf {
+    hvH := HL.h.Get(37, 0.0)
+    selH := HL.townT
     hph2 := Mod(DecT(now), 1400)/1400.0
     thmp := Max(0.0, Sin(hph2*6.283))**8 + 0.55*Max(0.0, Sin(hph2*6.283 - 1.05))**8
-    hs := 27*(1 + 0.11*thmp)
-    b := SBrush(FA(Alpha(hubCur, 8), s2))
+    hs := 27*(1 + 0.11*thmp)*(1 + 0.08*hvH + 0.05*selH)
+    if !hubLowPerf {
+    b := SBrush(FA(Alpha(hubCur, 8 + 10*selH), s2))
     FillEll(hcx - 62, hcy - 60, 124, 124, b), DelB(b)
-    b := SBrush(FA(Alpha(hubCur, 20 + 52*thmp), s2))
+    b := SBrush(FA(Alpha(hubCur, 20 + 52*thmp + 30*hvH + 24*selH), s2))
     FillEll(hcx - hs*1.65, hcy - hs*1.5, hs*3.3, hs*3.3, b), DelB(b)
     loop (hubLowPerf ? 0 : 5) {
         k6 := A_Index
@@ -39259,6 +40461,7 @@ HubRender() {
         ma := Sin(3.14159*ph6)
         MiniHeart(mhx, mhy, 3.4 + k6, ElA(TH(FA(Alpha(AccHi(hubCur, 0.4), Round(140*ma)), s2))))
     }
+    }                                            ; end of the ornament LOW PERFORMANCE MODE drops
     stH := PushXform(hcx, hcy, 1.0, 3.2*Sin(DecT(now)*0.0016))
     DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &hp2 := 0)
     DllCall("gdiplus\GdipAddPathBezier", "ptr", hp2
@@ -39283,6 +40486,30 @@ HubRender() {
     FillEll(hcx + hs*0.22, hcy - hs*0.52, hs*0.14, hs*0.12, b), DelB(b)
     DllCall("gdiplus\GdipDeletePath", "ptr", hp2)
     Pop(stH)
+    ; ---- the burst a press throws ----
+    ; Eight small hearts out from the centre over half a second, fading as
+    ; they go - the acknowledgement the press gets before the page arrives.
+    if (HL.heartAt && now - HL.heartAt < 560 && !hubLowPerf) {
+        bt := (now - HL.heartAt)/560.0
+        be := 1 - (1 - bt)**2
+        loop 8 {
+            ba := (A_Index - 1)*0.785 + 0.39
+            brd := hs*(0.6 + 1.9*be)
+            MiniHeart(hcx + brd*Cos(ba), hcy + brd*Sin(ba)*0.9 - 6*be, 3.6 + 1.2*(1 - bt)
+                    , ElA(TH(FA(Alpha(AccHi(hubCur, 0.4), Round(200*(1 - bt))), s2))))
+        }
+    } else if (HL.heartAt && now - HL.heartAt >= 560)
+        HL.heartAt := 0
+    ; ---- lit and ringed while its page is up ----
+    if (selH > 0.01) {
+        pn := Pen(FA(Alpha(AccHi(hubCur, 0.45), Round(150*selH)), s2), 1.4)
+        Ell(hcx - hs*1.32, hcy - hs*1.22, hs*2.64, hs*2.44, pn), DelP(pn)
+        pn := Pen(FA(Alpha(hubCur, Round(60*selH)), s2), 1)
+        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+        Ell(hcx - hs*1.52, hcy - hs*1.42, hs*3.04, hs*2.84, pn), DelP(pn)
+        Txt("TOWN", hcx - 30, hcy + hs*1.28, 60, 12, HL.fXs, FA(Alpha(AccHi(hubCur, 0.4), Round(200*selH)), s2), fmtC)
+    }
+    if !hubLowPerf {
     if thmp > 0.03 {
         rr2 := hs*(1.28 + 0.85*(1 - thmp))
         pn := Pen(FA(Alpha(hubCur, 125*thmp), s2), 1.5)
@@ -39761,7 +40988,10 @@ HubRender() {
         if (GalHasRot()) {
             if (HL.mbIdx < GalLo() || HL.mbIdx > GalHi())
                 HL.mbIdx := GalLo(), HL.mbNext := GalLo()
-            if (!HL.mbFade && now - HL.mbAt >= 4200) {
+            ; the reel is ambient motion - a picture every 4.2 s for nobody in
+            ; particular - and LOW PERFORMANCE MODE draws none of that: the
+            ; pill keeps the picture it has, and the renderer can stop on it
+            if (!hubLowPerf && !HL.mbFade && now - HL.mbAt >= 4200) {
                 HL.mbNext := (HL.mbIdx >= GalHi()) ? GalLo() : HL.mbIdx + 1
                 HL.mbFade := now, HL.mbAt := now
             }
@@ -40075,7 +41305,7 @@ HubRender() {
         || HL.minStart || HL.burstAt
         || (HL.scatAt && now - HL.scatAt < 400) || (HL.minT > 0.004 && HL.minT < 0.996)
         || (HL.minV > 0.004 && HL.minV < 0.996) || (HL.minV < -0.001)
-        || (HL.minT >= 0.5 && (HL.mbFade || GalHasRot() || HL.armT > 0.004))
+        || (HL.minT >= 0.5 && (HL.mbFade || (!hubLowPerf && GalHasRot()) || HL.armT > 0.004))
         || FFM.ctx || (FFM.ctxAt && now - FFM.ctxAt < 260)
         ; the detail sheet's body while it is easing to a new scroll position,
         ; and for as long as its bar is being dragged
@@ -40105,7 +41335,7 @@ HubRender() {
             ; knew it was on screen. So it is named directly, and released the
             ; moment its close animation is done.
             || FFM.view = "comm" || (FFM.viewPrev = "comm" && now - FFM.viewAt < 400)
-            || (FFM.wrAt && now - FFM.wrAt < 800) || (FFM.msgAt && now - FFM.msgAt < 5200)))
+            || (FFM.wrAt && now - FFM.wrAt < 800) || (!hubLowPerf && FFM.msgAt && now - FFM.msgAt < 5200)))
         || (hubTab = 2 && hubMod = 3 && (Abs(CSR.scr - CSR.scrT) > 0.4 || HL.drag = 13
             || Abs(CSR.farT  - (curFar  ? 1.0 : 0.0)) > 0.01
             || Abs(CSR.autoT - (curAuto ? 1.0 : 0.0)) > 0.01
@@ -40116,7 +41346,7 @@ HubRender() {
             || (CSR.slot[3].pickAt && now - CSR.slot[3].pickAt < 900)
             || (CSR.slot[4].pickAt && now - CSR.slot[4].pickAt < 900)
             || (CSR.applyAt && now - CSR.applyAt < 900)
-            || (CSR.msgAt && now - CSR.msgAt < 5200)))
+            || (!hubLowPerf && CSR.msgAt && now - CSR.msgAt < 5200)))
         || (hubTab = 2 && hubMod = 5 && (Abs(SPF.t1 - (spfDiscord ? 1.0 : 0.0)) > 0.01
             || Abs(SPF.t2 - (spfRegion ? 1.0 : 0.0)) > 0.01
             || Abs(SPF.t3 - (spfMatch ? 1.0 : 0.0)) > 0.01
@@ -40129,7 +41359,7 @@ HubRender() {
             || (!hubLowPerf && spfFps)
             || Abs(SPF.renT - (SPF.renOpen ? 1.0 : 0.0)) > 0.004
             || Abs(SPF.sysScr - SPF.sysScrT) > 0.4 || HL.drag = 16 || HL.drag = 17
-            || (SPF.view = "acct" && (SPF.avAuto || SPF.avDrag
+            || (SPF.view = "acct" && ((!hubLowPerf && SPF.avAuto) || SPF.avDrag
                 || Abs(SPF.acctTabT - SPF.acctTab) > 0.004
                 || Abs(SPF.acctPaneT - SPF.acctPane) > 0.004
                 || (SPF.acctTabAt && now - SPF.acctTabAt < 900)
@@ -40139,15 +41369,15 @@ HubRender() {
             || SPF.view != "" || (SPF.viewAt && now - SPF.viewAt < 420)
             || Abs(SPF.tabT - ((SPF.savTab = 2) ? 1.0 : 0.0)) > 0.004
             || (SPF.savAt && now - SPF.savAt < 1000) || (SPF.copyAt && now - SPF.copyAt < 1200)
-            || (SPF.msgAt && now - SPF.msgAt < 9400)
-            || (SPF.acctAt && now - SPF.acctAt < 20000)))
+            || (!hubLowPerf && SPF.msgAt && now - SPF.msgAt < 9400)
+            || (!hubLowPerf && SPF.acctAt && now - SPF.acctAt < 20000)))
         || HubGateUp()                                   ; the opening gate
         || (hubTab = 2 && hubMod = 4 && FFM.edit != "")   ; a caret has to blink
         || (hubTab = 2 && hubMod = 4 && (RSET.fxAt && now - RSET.fxAt < RSET_FXMS + 60))
         || (hubTab = 2 && hubMod = 4 && (RSET.fxAddAt && now - RSET.fxAddAt < 900))
         || (hubTab = 2 && hubMod = 4 && (RSET.dbAt && now - RSET.dbAt < RSET_FXMS + 60))
         || (hubTab = 2 && hubMod = 4 && (HL.drag = 22 || Abs(RSET.dbScr - RSET.dbScrT) > 0.4))
-        || (hubTab = 2 && hubMod = 4 && RSET.fx && RSET.msgAt && now - RSET.msgAt < 4200)
+        || (hubTab = 2 && hubMod = 4 && RSET.fx && !hubLowPerf && RSET.msgAt && now - RSET.msgAt < 4200)
         || (hubTab = 2 && hubMod = 4 && (RSET.fxDelAt && now - RSET.fxDelAt < 900))
         || (hubTab = 2 && hubMod = 4 && RSET.fxGone.Count)
         || (hubTab = 2 && hubMod = 4 && RSET.focAt && now - RSET.focAt < RSET_FOCMS + 60)
@@ -40157,18 +41387,18 @@ HubRender() {
         || (hubTab = 2 && hubMod = 4 && (Abs(RSET.scr - RSET.scrT) > 0.4 || HL.drag = 14 || HL.drag = 21
             || HL.drag = 15 || RSET.dd || RSET.ddT > 0.004
             || Abs(RSET.onT - (RSET.on ? 1.0 : 0.0)) > 0.004
-            || RSET.on || FFM.clickAt.Count || RSET.flashAt.Count
+            || (!hubLowPerf && RSET.on) || FFM.clickAt.Count || RSET.flashAt.Count
             || (RSET.applyAt && now - RSET.applyAt < 900)
-            || (RSET.msgAt && now - RSET.msgAt < 5200)))
+            || (!hubLowPerf && RSET.msgAt && now - RSET.msgAt < 5200)))
         || (FFM.viewAt && now - FFM.viewAt < 420)
         || (FFM.logTabAt && now - FFM.logTabAt < FFM_TABMS + 60)
         || FFM.dbIns.Count || RSET.dbIns.Count
         || (RSET.landAt && now - RSET.landAt < FFM_INSMS + 60)
         || (credWhoAt && now - credWhoAt < FFM_TABMS + 60)
         || (DOP.busy != "") || (DOP.flashLast && now - DOP.flashLast < 600)
-        || (hubTab = 2 && hubMod = 6 && (DOP.msgAt && now - DOP.msgAt < 6200))
+        || (hubTab = 2 && hubMod = 6 && (!hubLowPerf && DOP.msgAt && now - DOP.msgAt < 6200))
         || TUT.on
-        || (hubTab = 2 && hubMod = 7 && ((LGI.msgAt && now - LGI.msgAt < 6200)
+        || (hubTab = 2 && hubMod = 7 && ((!hubLowPerf && LGI.msgAt && now - LGI.msgAt < 6200)
             || (LGI.animAt && now - LGI.animAt < 800) || Abs(LGI.scr - LGI.scrT) > 0.4
             || LGI.pickPid || (LGI.actAt && now - LGI.actAt < 1200)))
         || (HL.profOpen ? HL.profT < 0.996 : HL.profT > 0.004) || (HL.bioOpen ? HL.bioT < 0.996 : HL.bioT > 0.004)
@@ -40186,6 +41416,10 @@ HubRender() {
     ; worth running the renderer four times faster to complete; it simply
     ; lands on the next idle frame instead. Dragging and scrolling still get
     ; the fast rate, because those have to track the pointer.
+    ; `inFlight` is the full predicate, kept before it is narrowed: it is what
+    ; decides, below, whether the mode may STOP the renderer or has to keep
+    ; the settle rate for a flourish that still needs a frame to land on.
+    inFlight := busy
     if (hubLowPerf && busy)
         busy := HL.drag || HL.minStart || posFix || (hubTabAt && now - hubTabAt < 320)
              || (HL.modAt && now - HL.modAt < 200) || FFM.edit != "" || SH.focus
@@ -40230,6 +41464,11 @@ HubRender() {
     ; braces: a frame that somehow ran during a solve stops the timer itself.
     if PZ_solving
         HubTim(0)
+    else if hubLowPerf
+        ; three states, none of them ambient: real interaction at the fast
+        ; rate, a flourish still landing at the settle rate, and otherwise a
+        ; stop - the hover watcher wakes it (HubTim, HubWatch)
+        HubTim(busy ? TICK_A : (inFlight ? TICK_LP : 0))
     else if (deep && spfFps && WinActive("ahk_exe RobloxPlayerBeta.exe"))
         HubTim(TICK_G)                        ; see TICK_G: from deep idle only
     else
@@ -40239,7 +41478,7 @@ HubRender() {
         if f <= 0.01
             return
         x0 := HL.ctx + dx, y0 := HL.cty + dy2
-        ttl := tab = 1 ? "DASHBOARD" : tab = 2 ? "INTEGRATIONS" : tab = 3 ? "SCRIPT HUB" : tab = 4 ? "SETTINGS" : tab = 5 ? "CREDITS" : "UPDATE LOGS"
+        ttl := tab = 1 ? "DASHBOARD" : tab = 2 ? "INTEGRATIONS" : tab = 3 ? "SCRIPT HUB" : tab = 4 ? "SETTINGS" : tab = 5 ? "CREDITS" : tab = 7 ? "TOWN" : "UPDATE LOGS"
         scr := HL.scr[tab]
         scrA := (tab = fTab) ? HL.scrAt : now - 99999
         tcol := Mix(0xFFE8EAF6, hubCur, 0.2)
@@ -42124,7 +43363,7 @@ HubRender() {
             ; its value - not something to make the parser decide about.
             bT := [{z: 49, t: "PERFORMANCE", on: hubLowPerf, e: HL.lpT, at: HL.lpAt
                   , l1: hubLowPerf ? "effects off" : "full effects"
-                  , l2: hubLowPerf ? "flat, no motion" : "every surface animates"}
+                  , l2: hubLowPerf ? "flat - idles at zero" : "every surface animates"}
                  , {z: 50, t: "ON TOP", on: hubTop, e: HL.topT, at: HL.topAt
                   , l1: hubTop ? "always on top" : "normal window"
                   , l2: hubTop ? "stays above windows" : "windows can cover it"}
@@ -42379,7 +43618,10 @@ HubRender() {
             b := SBrush(FA(Alpha(hubCur, 140 + 55*emb2G), f))
             FillEll(x0 + 16, ly2 + 47, 4, 4, b), DelB(b)
             Txt("no frameworks - raw GDI+ and a lot of easing math", x0 + 26, ly2 + 42, 320, 14, HL.fXs, FA(Alpha(hubCur, 150), f), fmtL)
-            spx4 := x0 + HL.ctw - 196, spy4 := ly2 - 4
+            ; ten lower than it sat: the card shares its row with the three-line
+            ; blurb, and its old top aligned with the blurb's first line, which
+            ; left it riding high against the block it is meant to balance
+            spx4 := x0 + HL.ctw - 196, spy4 := ly2 + 6
             b := SBrush(FA(Alpha(0x000000, 44), f))
             FillRR(spx4 + 2, spy4 + 4, 196, 72, 12, b), DelB(b)
             b := VBrush(spx4, spy4, 196, 72, FA(0xFF171A30, f), FA(0xFF12141F, f))
@@ -42390,15 +43632,8 @@ HubRender() {
             pn := Pen(FA(Alpha(hubCur, 150), f), 1.5)
             Line(spx4 + 10, spy4 + 1.5, spx4 + 26, spy4 + 1.5, pn)
             Line(spx4 + 170, spy4 + 70.5, spx4 + 186, spy4 + 70.5, pn), DelP(pn)
-            sgx := spx4 + 22, sgy := spy4 + 38
-            pn := Pen(FA(Alpha(hubCur, 190), f), 1.6)
-            Arc(sgx, sgy - 6, 12, 12, 120, 200, pn)
-            Line(sgx + 11, sgy, sgx + 32, sgy - 8, pn)
-            Line(sgx + 32, sgy - 8, sgx + 44, sgy + 2, pn)
-            Line(sgx + 44, sgy + 2, sgx + 72, sgy - 4, pn), DelP(pn)
-            swp2 := Mod(DecT(now), 2400)/2400.0
-            b := SBrush(FA(Alpha(AccHi(hubCur, 0.5), 220*Sin(3.14159*swp2)), f))
-            FillEll(sgx + swp2*70 - 1.8, sgy - 6 + 4*Sin(swp2*9), 3.6, 3.6, b), DelB(b)
+            ; the scene: a pixel cafe, two contributors in it - see CafeDraw
+            CafeDraw(spx4 + 12, spy4 + 6, hubCur, f, now)
             Txt("two contributors - est 2026", spx4 + 14, spy4 + 52, 170, 12, HL.fXs, FA(0x52C7CBE0, f), fmtL)
             lky := HL.lky + dy2
             ; doodles sit in the strip between the blurb and FIND ME, and stay
@@ -42420,9 +43655,6 @@ HubRender() {
                 b := SBrush(FA(Alpha(hubCur, Round(50 + 70*Abs(Sin(DecT(now)*0.0018 + dk)))), f))
                 FillEll(dpx - 1.4, dpy - 1.4, 2.8, 2.8, b), DelB(b)
             }
-            ; signature doodle where the old caption sat
-            Doodle(2, sgx + 104, sgy - 4, 10, hubCur, f, now, 1.6)
-            Doodle(1, sgx + 132, sgy - 12, 6, hubCur, f, now, 3.1)
             Txt("FIND ME", x0, lky - 20, 100, 14, fBadge, FA(0x62C7CBE0, f), fmtL)
             ; the rule stops short of the chips instead of running under them
             FadeLine(x0 + 62, x0 + HL.ctw - 162, lky - 13, 0x20FFFFFF, f)
@@ -42562,6 +43794,14 @@ HubRender() {
             b := SBrush(FA(Alpha(hubCur, 140 + 60*emb2G), f))
             FillEll(occ - 2.5, ocy2 - 2.5, 5, 5, b), DelB(b)
             Txt("crafted frame by frame - thank you for running " APPNAME, x0, cbY + 36, HL.ctw - 60, 14, HL.fXs, FA(0x48C7CBE0, f), fmtL)
+        } else if tab = 7 {
+            ; ---- TOWN ----
+            ; The heart's page: the whole content column given to one scene,
+            ; and three chips in the title row to choose which. Everything
+            ; about the scenes lives in TownDraw; this branch only frames them
+            ; between the title strip and the footer line.
+            TownChips(x0, y0, hubCur, f)
+            TownDraw(x0, y0 + 36, HL.ctw, HL.pd + HL.ch - 34 - HL.cty - 36, hubCur, f, now)
         } else {
             vbw2 := HL.vbw
             b := SBrush(FA(Alpha(hubCur, 26 + 10*emb2G), f))
@@ -43114,6 +44354,15 @@ UsageTick() {
         usgFlushN := 0
         UsageFlush()
     }
+    ; ---- the dashboard's clocks, in LOW PERFORMANCE MODE ----
+    ; SESSION and TOTAL TIME advance by the second, and that mode now stops
+    ; the renderer on any idle frame - so a dashboard left open would show a
+    ; stopped clock. This tick already runs once a second: while the dashboard
+    ; is the tab on screen and the renderer is stopped, it books the one frame
+    ; that moves the figures on. Any other tab has nothing that changes with
+    ; the clock, and a running renderer redraws them itself.
+    if (hubLowPerf && hubLive && !hubHidden && hubTab = 1 && !hubP && HL.minT < 0.5)
+        HubPoke()
 }
 ScrLoadList() {
     global SHList := []
@@ -48317,10 +49566,50 @@ HubTim(p) {
     ; path pokes the loop back to TICK_A (HubPoke), and every background
     ; result that lands calls HubPoke too, so a stopped loop is never a stuck
     ; one - it is the hub costing nothing while it is left alone.
+    ; ---- LOW PERFORMANCE MODE, again: idle is a STOP, not a slow rate ----
+    ; The 250 ms idle tier drew four frames a second of a picture that could
+    ; not change: easing is snapped, nothing ambient is drawn, and a pointer
+    ; resting on a row is a row already lit. Those frames existed to notice the
+    ; pointer moving to another row. So the renderer now stops on every idle
+    ; tier and HubWatch runs in its place: a hit test at HUB_WATCH_MS, no
+    ; drawing, that pokes exactly one frame when the zone under the pointer
+    ; changes. The one idle rate kept is TICK_LP, asked for by name by a frame
+    ; that has a flourish still to land - see the cadence decision in
+    ; HubRender - and it goes back to a stop the frame the flourish is done.
+    ; A hub left alone in this mode now costs nothing at all, deep idle or
+    ; not, and wakes on the first zone change or poke.
     if (hubLowPerf && p)
-        p := (p <= TICK_A) ? 40 : (p <= TICK_S) ? 250 : 0
+        p := (p <= TICK_A) ? 40 : (p = TICK_LP) ? 250 : 0
     if p != hubP
         hubP := p, SetTimer(HubRender, p, -10)
+    if (hubLowPerf && hubLive && !hubHidden)
+        SetTimer(HubWatch, HUB_WATCH_MS)
+}
+; ---- the hover watcher ----
+; What stands in for the idle frames LOW PERFORMANCE MODE no longer draws. It
+; asks the hit test which zone is under the pointer and pokes the renderer
+; once when the answer changes - onto a row, off it, onto the next. A poke is
+; TICK_A, one frame lands the snapped hover, that frame finds nothing in
+; flight and stops the renderer again. Stops itself the moment the mode is
+; off or the hub is hidden, so it is never a second heartbeat in the normal
+; mode. A hit test is arithmetic over a hundred rectangles; at 50 ms it is
+; not measurable.
+HubWatch() {
+    static last := -1
+    if (!hubLowPerf || !hubLive || hubHidden || galOpen || cropUIOn || !IsObject(HL)) {
+        SetTimer(HubWatch, 0)
+        last := -1
+        return
+    }
+    z := HubZoneCursor()
+    if (hubP > 0 || HL.drag) {
+        last := z                               ; the renderer is running and sees the pointer itself -
+        return                                  ; keep the baseline current so the stop is not followed by a poke
+    }
+    if (z != last) {
+        last := z
+        HubPoke()
+    }
 }
 
 ; card drop-shadow: the ring stack is deterministic per geometry, so it is
@@ -48731,6 +50020,1139 @@ HubReassert() {
 
 ; small hand-drawn marks used to fill the empty stretches in CREDITS.
 ; kind: 1 star, 2 spiral, 3 squiggle, 4 arrow, 5 orbit dot
+; ================= TOWN =================
+; The page behind the sidebar's heart: three towns, each the whole content
+; column, chosen from three chips in the title row and kept across launches.
+;   1  NIGHTFALL   a skyline seen from across the river, on its own two-minute
+;                  day - the sun crosses and sets in a band of dusk, the stars
+;                  and the windows come on, a moon crosses, and it dawns again
+;   2  MAIN STREET a row of tall houses on a city street, side on: brick,
+;                  ochre, slate; arched windows, balconies, an awning, a shop
+;                  front, trees in autumn, a plane towing a banner overhead
+;   3  GREENVALE   a village from above: paths through grass, four houses under
+;                  pitched roofs, a pond, a well, a crop plot, and a forest
+;                  round the edge
+; Every town is drawn on a grid of 4-px cells as flat squares - nothing is a
+; picture, every part is drawn - and everything that moves moves on DecT(now),
+; so LOW PERFORMANCE MODE gets a still of it (the clocks excepted: they read
+; the real time).
+;
+; ---- their colours are their own ----
+; The rest of the hub is drawn through TH(), which reads a dark-mode colour
+; and maps it for paper. A town drawn that way came out wrong in light mode:
+; clouds mapped to ink, a night sky to pale paper, and every wall to whatever
+; the classifier made of it. So the towns use the pre-themed primitives -
+; SBrushP, PenP, TxtP, VBrushP - and explicit palettes, and look the same in
+; both themes, the way a picture in a light-themed window looks. Only the
+; chips and the frame's edge follow the theme.
+;
+; Cells: x 0..141 left to right, y 0..100 top to bottom, and each town keys
+; its own layout off that. TB is the one brush helper they share.
+TB(c, f) => SBrushP(FA(c, f))
+
+; ---- the switch ----
+TownPick(k) {
+    global hubTown
+    if (k = hubTown)
+        return
+    HL.townPrev := hubTown, HL.townAt := A_TickCount
+    hubTown := k
+    try IniWrite(hubTown, iniPath, "hub", "town")
+    HubPoke()
+}
+; the three chips, in the title row's right half, the way the dashboard keeps
+; its two buttons there
+TownChips(x0, y0, acc, f) {
+    names := ["NIGHTFALL", "MAIN STREET", "GREENVALE"]
+    loop 3 {
+        cx := x0 + HL.ctw - 40 - (4 - A_Index)*90
+        FFMBtn(2220 + A_Index, cx, y0 - 3, 84, 24, names[A_Index], acc, f, (hubTown = A_Index) ? 1 : 0, HL.fS)
+    }
+}
+; The frame is a clip and nothing else - no plate, no shadow, no border: the
+; town is the page. The switch slides the old town out and the new one in,
+; the way the tabs change.
+TownDraw(vx, vy, vw, vh, acc, f, now) {
+    pC := RRPath(vx, vy, vw, vh, 14)
+    sv := PushG()
+    DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pC, "int", 0)
+    cs := 4.0
+    ox := vx + 1, oy := vy
+    tw := HL.townAt ? Ease3((now - HL.townAt)/460.0) : 1.0
+    if (tw >= 1 && HL.townAt)
+        HL.townAt := 0, HL.townPrev := 0
+    if (tw < 1 && HL.townPrev)
+        TownScene(HL.townPrev, ox - 24*tw, oy, cs, acc, f*(1 - tw), now)
+    TownScene(hubTown, ox + 24*(1 - tw), oy, cs, acc, f*tw, now)
+    Pop(sv)
+    DllCall("gdiplus\GdipDeletePath", "ptr", pC)
+}
+TownScene(k, ox, oy, cs, acc, f, now) {
+    if (k = 2)
+        TownStreet(ox, oy, cs, acc, f, now)
+    else if (k = 3)
+        TownVillage(ox, oy, cs, acc, f, now)
+    else
+        TownNight(ox, oy, cs, acc, f, now)
+}
+; ---- a stepped sky: bands, not a gradient, and in the town's own colours ----
+SkyBands(ox, oy, cs, rows, cTop, cBot, f, n := 8) {
+    loop n {
+        k := A_Index
+        c := Mix(cTop, cBot, (k - 1)/(n - 1.0))
+        b := TB(c, f)
+        FillRR(ox, oy + Round((k - 1)*rows/n)*cs, 142*cs, (Round(k*rows/n) - Round((k - 1)*rows/n))*cs, 0, b), DelB(b)
+    }
+}
+
+; ---- the shared pieces ----
+; A cell in a town's own colour. The brush comes from the cache, so there is
+; nothing to free - which is what lets a scene be written as one fill per
+; line instead of a brush, a fill and a delete.
+TPx(ox, oy, cs, x, y, w, h, c, f) {
+    if (b := SBrushP(FA(c, f)))
+        FillRR(ox + x*cs, oy + y*cs, w*cs, h*cs, 0, b)
+}
+; A walker, feet on row y, two frames of legs by stp, facing dir (1 right,
+; -1 left). Head, hair, shirt, trousers, and a hat if asked.
+TownWalker(P, x, y, shirt, pants, skin, hair, stp, dir, hat := 0) {
+    P(x, y - 6, 2, 2, skin), P(x, y - 7, 2, 1, hair)
+    if hat
+        P(x - 1, y - 8, 4, 1, hat), P(x, y - 9, 2, 1, hat)
+    P(x, y - 4, 2, 2, shirt), P(x + (dir > 0 ? 2 : -1), y - 4, 1, 1, skin)
+    P(x - stp, y - 2, 1, 2, pants), P(x + 1 + stp, y - 2, 1, 2, pants)
+}
+; A round tree: trunk on the base row, three tiers of canopy leaning by sw,
+; the top left lit.
+TownTree(P, x, base, sw, trunk, dark, light, big := 0) {
+    if big {
+        P(x + 4, base - 7, 3, 7, trunk)
+        P(x + 1 + sw, base - 18, 9, 3, dark), P(x + sw, base - 15, 11, 5, dark), P(x + 1 + sw, base - 10, 9, 3, dark)
+        P(x + 2 + sw, base - 17, 4, 1, light), P(x + 1 + sw, base - 14, 3, 2, light), P(x + 7 + sw, base - 13, 2, 1, light)
+    } else {
+        P(x + 3, base - 5, 2, 5, trunk)
+        P(x + 1 + sw, base - 11, 6, 2, dark), P(x + sw, base - 9, 8, 3, dark), P(x + 2 + sw, base - 6, 4, 1, dark)
+        P(x + 2 + sw, base - 10, 2, 1, light), P(x + 1 + sw, base - 8, 2, 1, light)
+    }
+}
+; A cloud in two tones, the shadow along its underside.
+TownCloud(P, x, y, w, top, under) {
+    P(x, y + 1, w, 3, top), P(x + 2, y, w - 5, 1, top), P(x + w//3, y - 1, w//3, 1, top)
+    P(x + 1, y + 4, w - 2, 1, under)
+}
+; A bird as three cells, wings up or down.
+TownBird(P, x, y, up, c) {
+    P(x - 1, y - up, 1, 1, c), P(x, y, 1, 1, c), P(x + 1, y - up, 1, 1, c)
+}
+
+; =============== 1  NIGHTFALL ===============
+; A skyline seen from across the river, on its own two-minute day. Six depths
+; back to front: sky, a far city, two ranges of hills with pines on the near
+; one, the river with the viaduct and a boat on it, the bank, the street. At
+; night the windows come on and lie on the water, the lamps pool light on the
+; pavement, the headlamps throw cones; a shower passes every couple of
+; minutes, with umbrellas going up for it; and at the top of every real hour
+; there are fireworks over the tower.
+TownNight(ox, oy, cs, acc, f, now) {
+    t := DecT(now)
+    P(x, y, w, h, c) => TPx(ox, oy, cs, x, y, w, h, c, f)
+    ; ---- the day ----
+    ph     := Mod(t, 120000)/120000.0
+    sunAlt := Sin(ph*6.2832)
+    dayc   := Clamp(0.5 + 0.9*sunAlt, 0.0, 1.0)
+    night  := 1 - dayc
+    dusk   := Clamp(1 - Abs(sunAlt)*2.6, 0.0, 1.0)
+    rain   := (Mod(t, 100000) < 12000) ? Clamp(Min(Mod(t, 100000), 12000 - Mod(t, 100000))/1500.0, 0.0, 1.0) : 0.0
+    wh   := 0xFFF4F1E8
+    warm := 0xFFFFD98A
+    cT := Mix(Mix(0xFF0B1230, 0xFF74BDEA, dayc), 0xFF5A3F7A, dusk*0.6)
+    cB := Mix(Mix(0xFF2A3466, 0xFFCFE8F7, dayc), 0xFFF2A468, dusk*0.9)
+    cT := Mix(cT, 0xFF4A5470, rain*0.5), cB := Mix(cB, 0xFF7A8496, rain*0.5)
+    SkyBands(ox, oy, cs, 58, cT, cB, f, 14)
+    ; stars: twenty-six, six of them bright crosses, each on its own twinkle
+    if (night > 0.02 && rain < 0.5) {
+        loop 26 {
+            k  := A_Index
+            sx := Mod(k*37 + 11, 142), sy := Mod(k*23 + 5, 44) + 1
+            a  := Round(night*(1 - rain)*(90 + 130*Abs(Sin(t*0.0029 + k*1.3))))
+            P(sx, sy, 1, 1, Alpha(wh, a))
+            if (Mod(k, 5) = 0)
+                P(sx - 1, sy, 1, 1, Alpha(wh, a//2)), P(sx + 1, sy, 1, 1, Alpha(wh, a//2)), P(sx, sy - 1, 1, 1, Alpha(wh, a//2)), P(sx, sy + 1, 1, 1, Alpha(wh, a//2))
+        }
+        sph := Mod(t, 11000)
+        if (sph < 640) {
+            loop 5 {
+                k := A_Index
+                P(112 - Round(sph*0.062) + (k - 1), 6 + Round(sph*0.028) - (k - 1), 1, 1, Alpha(wh, Round(night*220*(1 - sph/640.0)*(1 - (k - 1)*0.22))))
+            }
+        }
+    }
+    ; the sun by day, the moon by night, on one arc, each with its halo
+    arcP := (ph < 0.5) ? ph*2 : (ph - 0.5)*2
+    ax_  := 6 + Round(128*arcP)
+    ay_  := 56 - Round(48*Sin(arcP*3.14159))
+    if (ph < 0.5) {
+        b := TB(Alpha(0xFFFFE9A8, Round(40*(1 - rain))), f), FillEll(ox + (ax_ - 8)*cs, oy + (ay_ - 8)*cs, 17*cs, 17*cs, b)
+        P(ax_ - 3, ay_ - 2, 7, 5, 0xFFFFD86B), P(ax_ - 2, ay_ - 3, 5, 7, 0xFFFFD86B), P(ax_ - 1, ay_ - 2, 3, 2, 0xFFFFF0B8)
+        loop 8 {
+            an := (A_Index - 1)*0.785 + t*0.0003
+            P(ax_ + Round(6*Cos(an)), ay_ + Round(6*Sin(an)), 1, 1, Alpha(0xFFFFE9A8, 150))
+        }
+    } else {
+        b := TB(Alpha(wh, Round(26*night)), f), FillEll(ox + (ax_ - 7)*cs, oy + (ay_ - 7)*cs, 15*cs, 15*cs, b)
+        P(ax_ - 2, ay_ - 1, 5, 3, wh), P(ax_ - 1, ay_ - 2, 3, 5, wh)
+        P(ax_ - 1, ay_ - 1, 3, 3, Mix(cT, cB, 0.45)), P(ax_, ay_ - 2, 2, 5, Mix(cT, cB, 0.45))
+        P(ax_ - 2, ay_, 1, 1, 0xFFD8D4C4), P(ax_ - 1, ay_ + 1, 1, 1, 0xFFD8D4C4)
+    }
+    ; clouds, five, two tones, lit by the day and greyed by the rain
+    cTop := Mix(Mix(0xFF3A4270, wh, 0.35 + 0.65*dayc), 0xFF8A93A8, rain*0.6)
+    cUnd := Mix(Mix(0xFF2A3058, 0xFFC4D6E6, 0.35 + 0.65*dayc), 0xFF6A7488, rain*0.6)
+    loop 5 {
+        k := A_Index
+        TownCloud(P, Mod(t*(0.0014 + 0.0006*k) + k*37, 178) - 22, 3 + Mod(k*7, 22), 11 + Mod(k, 3)*4, cTop, cUnd)
+    }
+    ; a balloon, slow and bobbing; a flock of five in a V
+    bx_ := Mod(t*0.0022, 200) - 24, by_ := 12 + Round(4*Sin(t*0.0009))
+    P(bx_ - 2, by_ - 1, 5, 3, 0xFFE8574A), P(bx_ - 1, by_ - 2, 3, 5, 0xFFE8574A), P(bx_ - 1, by_ - 1, 1, 3, 0xFFFFE08A), P(bx_ + 1, by_ - 1, 1, 3, 0xFFB83A2E)
+    P(bx_ - 1, by_ + 3, 1, 1, 0xFF8A5A3A), P(bx_ + 1, by_ + 3, 1, 1, 0xFF8A5A3A), P(bx_ - 1, by_ + 4, 3, 1, 0xFF8A5A3A)
+    fl := Mod(t*0.019, 190) - 20
+    loop 5 {
+        k := A_Index
+        TownBird(P, fl - Abs(k - 3)*4, 14 + Abs(k - 3)*2 + Round(1.5*Sin(t*0.003 + k)), Mod(Floor(t/210) + k, 2), Mix(0xFF1B2140, 0xFF2B2F45, dayc))
+    }
+    ; ---- the far city: a skyline a long way off, pale, its dots on at night ----
+    cFar := Mix(Mix(0xFF1C2650, 0xFF9FC2DC, dayc), 0xFF6A7A90, rain*0.5)
+    for sk, sh in [9, 14, 11, 18, 8, 13, 16, 10, 12, 19, 9, 15, 12, 17, 8, 14, 11, 16, 9, 13, 15, 10, 18, 12, 9, 16, 11, 14]
+        P((sk - 1)*5, 58 - sh - 4, 5, sh + 4, cFar)
+    if (night > 0.1) {
+        loop 40 {
+            k := A_Index
+            if (Mod(k*7, 5) < 3)
+                P(Mod(k*31 + 3, 140), 44 + Mod(k*11, 12), 1, 1, Alpha(warm, Round(150*night)))
+        }
+    }
+    ; ---- two ranges of hills, the far one paler, pines on the near ridge ----
+    cH1 := Mix(Mix(0xFF2A3466, 0xFF7EA6C8, dayc), 0xFF5A6A80, rain*0.4)
+    cH2 := Mix(Mix(0xFF1A2448, 0xFF4E7EA6, dayc), 0xFF445466, rain*0.4)
+    loop 36 {
+        k  := A_Index
+        hh := 9 + Round(6*Sin(k*0.41 + 2) + 3*Sin(k*1.1))
+        P((k - 1)*4, 58 - hh, 4, hh, cH1)
+    }
+    loop 36 {
+        k  := A_Index
+        hh := 5 + Round(4*Sin(k*0.55) + 3*Sin(k*1.3 + 1))
+        P((k - 1)*4, 58 - hh, 4, hh, cH2)
+    }
+    cPine := Mix(0xFF0F1A38, 0xFF2E5A4A, dayc)
+    loop 14 {
+        k  := A_Index
+        px := 3 + (k - 1)*10 + Mod(k*3, 4)
+        hh := 5 + Round(4*Sin(k*0.55) + 3*Sin(k*1.3 + 1))
+        P(px, 58 - hh - 4, 1, 4, cPine), P(px - 1, 58 - hh - 3, 3, 2, cPine), P(px - 2, 58 - hh - 1, 5, 1, cPine)
+    }
+    ; the windmill, its four blades turning in steps
+    P(119, 44, 3, 14, cH2), P(118, 43, 5, 1, cH2)
+    wa := Floor(Mod(t*0.03, 360)/15)*15
+    pn := PenP(FA(Mix(0xFF3B4A78, 0xFF8AA6C4, dayc), f), 2)
+    loop 4 {
+        an := (wa + (A_Index - 1)*90)*0.0174533
+        Line(ox + 120.5*cs, oy + 44.5*cs, ox + 120.5*cs + 9*cs*Cos(an), oy + 44.5*cs + 9*cs*Sin(an), pn)
+    }
+    DelP(pn)
+    ; ---- the river, the viaduct and its arches, the lights on the water ----
+    cW  := Mix(Mix(0xFF16204A, 0xFF64A8D6, dayc), 0xFF3F5468, rain*0.4)
+    cW2 := Mix(Mix(0xFF25326A, 0xFF9ACBEA, dayc), 0xFF5A7088, rain*0.4)
+    P(0, 58, 142, 8, cW)
+    loop 12 {
+        k := A_Index
+        P(Mod(k*17 + Round(t*0.004) + k*3, 150) - 8, 59 + Mod(k, 6), 5 - Mod(k, 3), 1, cW2)
+    }
+    ; the moon or sun lying on the water, broken by the ripple
+    loop 4 {
+        k := A_Index
+        P(ax_ - 1 + Round(Sin(t*0.005 + k*1.7)*1.5), 59 + (k - 1)*2, 3 - Mod(k, 2), 1, Alpha((ph < 0.5) ? 0xFFFFD86B : wh, Round(70 + 40*Sin(t*0.004 + k))))
+    }
+    if (night > 0.1) {                            ; the far city's lights, lying on it too
+        loop 20 {
+            k := A_Index
+            P(Mod(k*31 + 3, 140), 60 + Mod(k*7, 5), 1, 1, Alpha(warm, Round(70*night*(0.5 + 0.5*Sin(t*0.006 + k)))))
+        }
+    }
+    ; the boat, crossing slowly, its lamp on at night - drawn before the piers,
+    ; so it passes behind the viaduct rather than through its legs
+    bxb := 150 - Mod(t*0.0028, 190)
+    P(bxb, 62, 8, 2, 0xFF5A3E2E), P(bxb + 2, 61, 4, 1, 0xFFE9D5A8), P(bxb + 4, 59, 1, 2, 0xFF3A2E24)
+    P(bxb + 4, 58, 1, 1, night > 0.2 ? warm : 0xFFE0574A)
+    P(bxb - 2 - Round(Mod(t*0.01, 3)), 63, 2, 1, cW2)
+    P(0, 55, 142, 2, 0xFF4A4F6E), P(0, 55, 142, 1, 0xFF6A6F8E)
+    loop 12
+        P((A_Index - 1)*12 + 4, 57, 2, 9, 0xFF3A3F5C), P((A_Index - 1)*12 + 3, 57, 4, 1, 0xFF4A4F6E)
+    ; the train, every twenty-four seconds
+    tph := Mod(t, 24000)
+    if (tph < 8000) {
+        tx_ := -32 + Round(tph*0.0245)
+        P(tx_, 51, 9, 4, 0xFF9A3B3B), P(tx_ + 1, 50, 4, 1, 0xFF7A2B2B), P(tx_ + 11, 52, 9, 3, 0xFF6E7391), P(tx_ + 21, 52, 9, 3, 0xFF6E7391)
+        P(tx_ + 7, 50, 2, 1, warm), P(tx_ + 8, 52, 1, 1, warm), P(tx_ + 13, 53, 1, 1, warm), P(tx_ + 16, 53, 1, 1, warm), P(tx_ + 23, 53, 1, 1, warm), P(tx_ + 26, 53, 1, 1, warm)
+        loop 6
+            P(tx_ + (A_Index - 1)*5 + 1, 55, 2, 1, 0xFF2A2E44)
+        loop 3 {
+            k  := A_Index
+            sp := Mod(t*0.0013 + k*0.33, 1.0)
+            P(tx_ + 1 - Round(sp*7), 49 - Round(sp*4), 1, 1, Alpha(wh, Round(140*(1 - sp))))
+        }
+    }
+    ; ---- the bank, and the street ----
+    cG := Mix(Mix(0xFF243A2C, 0xFF5B9A5C, dayc), 0xFF3A5A44, rain*0.3)
+    P(0, 66, 142, 16, cG)
+    loop 40 {
+        k := A_Index
+        P(Mod(k*29, 142), 67 + Mod(k*17, 14), 2, 1, Mix(cG, 0xFF000000, 0.15))
+    }
+    if (night > 0.3 && rain < 0.3) {              ; fireflies over the grass
+        loop 8 {
+            k := A_Index
+            P(10 + Mod(k*31, 122) + Round(2*Sin(t*0.0009 + k)), 68 + Mod(k*7, 12) + Round(Sin(t*0.0013 + k*2)), 1, 1, Alpha(0xFFD6FF7A, Round(200*night*Max(0.0, Sin(t*0.004 + k*1.7)))))
+        }
+    }
+    cPv := Mix(Mix(0xFF4A4D66, 0xFF9C9DB0, dayc), 0xFF5A6070, rain*0.4)
+    cRd := Mix(Mix(0xFF23263A, 0xFF474B5E, dayc), 0xFF2A2E3E, rain*0.5)
+    P(0, 82, 142, 4, cPv), P(0, 85, 142, 1, Mix(cPv, 0xFF000000, 0.25))
+    P(0, 86, 142, 9, cRd)
+    loop 30 {
+        k := A_Index
+        P(Mod(k*23, 142), 87 + Mod(k*5, 7), 1, 1, Mix(cRd, wh, 0.06))
+    }
+    loop 18
+        P((A_Index - 1)*8 + 2, 90, 4, 1, 0xFFB8B08A)
+    loop 6                                        ; the crossing, in front of the tower
+        P(60 + (A_Index - 1)*4, 86, 2, 9, Mix(0xFFD8D4C4, cRd, 0.3))
+    if (rain > 0.05 || night > 0.4) {             ; the road, wet or lit: the lamps lying on it
+        for lk, lx0 in [20, 56, 90, 122]
+            P(lx0 - 1, 87, 3, 8, Alpha(warm, Round(26*Max(rain, night*0.7))))
+    }
+    P(0, 95, 142, 6, Mix(Mix(0xFF1F3325, 0xFF4F8A4F, dayc), 0xFF2E4A38, rain*0.3))
+    ; ---- the buildings: x, width, height, kind (0 plain, 1 cafe, 2 shop, 3 tower, 4 billboard) ----
+    bld := [[2, 14, 16, 0], [17, 11, 22, 4], [29, 13, 14, 1], [43, 12, 26, 3], [56, 7, 12, 0]
+          , [78, 13, 20, 2], [92, 9, 15, 0], [102, 15, 24, 3], [118, 10, 18, 0], [129, 12, 13, 0]]
+    pal := [0xFF3E4463, 0xFF4A3F5C, 0xFF5A4A3E, 0xFF3A4C66, 0xFF4E4658, 0xFF44405E, 0xFF3F5158, 0xFF4B4466, 0xFF3D4560, 0xFF524A52]
+    for bi, bd in bld {
+        bx0 := bd[1], bw0 := bd[2], bh0 := bd[3], bk := bd[4]
+        top := 82 - bh0
+        cWl := Mix(pal[bi], 0xFF0E1428, night*0.55)
+        P(bx0, top, bw0, bh0, cWl)
+        loop bh0//2 {                             ; brick courses: every other row, offset
+            r := A_Index
+            P(bx0 + Mod(r, 2), top + 1 + (r - 1)*2, bw0 - 2, 1, Mix(cWl, 0xFF000000, 0.08))
+        }
+        P(bx0 + bw0 - 2, top, 2, bh0, Mix(cWl, 0xFF000000, 0.35))
+        P(bx0, top, bw0, 1, Mix(cWl, wh, 0.35)), P(bx0, top + 1, bw0, 1, Mix(cWl, wh, 0.12))
+        P(bx0 + bw0//2 - 1, 79, 2, 3, 0xFF2A2236), P(bx0 + bw0//2, 80, 1, 1, warm)
+        P(bx0 + bw0//2 - 2, 78, 4, 1, Mix(cWl, wh, 0.25))
+        wy := top + 3
+        while (wy <= 76) {
+            wx := bx0 + 2
+            while (wx <= bx0 + bw0 - 5) {
+                hsh := Mod(bi*7 + wx*13 + wy*5, 9)
+                lit := (hsh < 6) ? 1.0 : (hsh < 8) ? (0.5 + 0.5*Sin(t*0.0007 + hsh + wx)) : 0.0
+                gl  := night*lit
+                cGl := (Mod(hsh, 4) = 1 && gl > 0.5 && Mod(Floor(t/90) + wx, 7) < 2) ? 0xFF8AB8FF : warm   ; a television, now and then
+                P(wx, wy, 2, 2, Mix(Mix(0xFF9FB6D6, 0xFF1C2238, night*0.8), cGl, gl))
+                if (Mod(hsh, 3) = 0)              ; a curtain half across
+                    P(wx, wy, 1, 2, Mix(cWl, 0xFFE9D5A8, 0.5))
+                P(wx - 1, wy - 1, 4, 1, Mix(cWl, wh, 0.2)), P(wx - 1, wy + 2, 4, 1, Mix(cWl, wh, 0.25))
+                if (gl > 0.3)                     ; the light spilling down the wall
+                    P(wx, wy + 3, 2, 1, Alpha(warm, Round(40*gl)))
+                wx += 4
+            }
+            wy += 4
+        }
+        if (bk = 1) {                             ; the cafe: an awning, a sign, two bulbs, tables outside
+            loop bw0 - 2 {
+                k := A_Index
+                P(bx0 + k, top + 6, 1, 2, Mod(k, 2) ? 0xFFE0D8C8 : 0xFFC44A4A)
+                if Mod(k, 2)
+                    P(bx0 + k, top + 8, 1, 1, 0xFFE0D8C8)
+            }
+            P(bx0 + 2, top + 2, bw0 - 4, 3, 0xFF2A2236), P(bx0 + 5, top + 3, 3, 1, warm), P(bx0 + 9, top + 3, 1, 1, warm)
+            on1 := (Mod(t, 1000) < 500)
+            P(bx0 + 3, top + 3, 1, 1, on1 ? warm : 0xFF5A4A50), P(bx0 + bw0 - 4, top + 3, 1, 1, on1 ? 0xFF5A4A50 : warm)
+            P(bx0 + 1, 81, 3, 1, 0xFF6E4A34), P(bx0 + 2, 79, 1, 2, 0xFF6E4A34), P(bx0 + bw0 - 4, 81, 3, 1, 0xFF6E4A34), P(bx0 + bw0 - 3, 79, 1, 2, 0xFF6E4A34)
+            P(bx0, 78, 5, 1, 0xFFC44A4A), P(bx0 + bw0 - 5, 78, 5, 1, 0xFFC44A4A)
+        } else if (bk = 2) {                      ; the shop: a lit board with a chasing border
+            P(bx0 + 1, top + 2, bw0 - 2, 4, 0xFF1C1E2A)
+            P(bx0 + 3, top + 3, 2, 2, 0xFFFF6A6A), P(bx0 + 6, top + 3, 2, 2, warm), P(bx0 + 9, top + 3, 2, 2, 0xFF8AB8FF)
+            loop (bw0 - 2)*2 + 8 {
+                k := A_Index
+                onk := (Mod(Floor(t/120) + k, 5) = 0)
+                if (k <= bw0 - 2)
+                    P(bx0 + k, top + 1, 1, 1, onk ? 0xFFFFE9A8 : 0xFF6A5A4A)
+                else if (k <= (bw0 - 2)*2)
+                    P(bx0 + k - (bw0 - 2), top + 6, 1, 1, onk ? 0xFFFFE9A8 : 0xFF6A5A4A)
+                else if (k <= (bw0 - 2)*2 + 4)
+                    P(bx0, top + 1 + (k - (bw0 - 2)*2), 1, 1, onk ? 0xFFFFE9A8 : 0xFF6A5A4A)
+                else
+                    P(bx0 + bw0 - 1, top + 1 + (k - (bw0 - 2)*2 - 4), 1, 1, onk ? 0xFFFFE9A8 : 0xFF6A5A4A)
+            }
+            P(bx0 + 2, 75, bw0 - 4, 4, Mix(0xFFFFE9C0, 0xFF3A2E24, dayc*0.7))
+        } else if (bk = 3) {                      ; a tower block: a spire, a beacon, units on the roof
+            P(bx0 + bw0//2, top - 3, 1, 3, 0xFF8A8FA8)
+            P(bx0 + bw0//2, top - 4, 1, 1, (Mod(t, 1600) < 200) ? 0xFFFF6A6A : 0xFF6A3A3A)
+            P(bx0 + 2, top - 2, 3, 2, 0xFF6A6F8E), P(bx0 + 3, top - 1, 1, 1, 0xFF3A3F5C)
+        } else if (bk = 4) {                      ; the billboard, blinking
+            P(bx0 + 1, top - 7, bw0 - 2, 6, 0xFF1C1E2A), P(bx0 + 3, top - 1, 1, 1, 0xFF6A6F8E), P(bx0 + bw0 - 4, top - 1, 1, 1, 0xFF6A6F8E)
+            bl := (Mod(t, 2200) < 1600)
+            P(bx0 + 2, top - 6, bw0 - 4, 4, bl ? 0xFFE8574A : 0xFF6A2A2A)
+            P(bx0 + 3, top - 5, 2, 2, 0xFFFFE9A8), P(bx0 + 6, top - 5, 3, 2, 0xFFFFE9A8)
+        }
+        if (bi = 4 || bi = 8) {                   ; a fire escape zigzag on the towers
+            loop (bh0 - 6)//4 {
+                r := A_Index
+                P(bx0 - 1, top + 4 + (r - 1)*4, 3, 1, 0xFF2A2E44), P(bx0 - 1, top + 5 + (r - 1)*4, 1, 3, 0xFF2A2E44)
+            }
+        }
+        if (bi = 2 || bi = 4 || bi = 8) {         ; chimneys and their smoke
+            cxk := bx0 + bw0 - 4
+            P(cxk, top - 2, 2, 2, 0xFF6A5A5A), P(cxk, top - 2, 2, 1, 0xFF8A7A7A)
+            loop 3 {
+                k  := A_Index
+                sp := Mod(t*0.0009 + k*0.33 + bi*0.1, 1.0)
+                P(cxk + Round(Sin(sp*6.28 + k)*0.8) + 1 - Round(sp*3), top - 3 - Round(sp*6), 1, 1, Alpha(wh, Round(120*(1 - sp))))
+            }
+        }
+    }
+    ; ---- the clock tower, keeping the real time ----
+    cSt := Mix(0xFF6B6F8A, 0xFF1E2440, night*0.5)
+    P(64, 26, 12, 56, cSt), P(74, 26, 2, 56, Mix(cSt, 0xFF000000, 0.3))
+    loop 28
+        P(64 + Mod(A_Index, 2), 27 + (A_Index - 1)*2, 10, 1, Mix(cSt, 0xFF000000, 0.08))
+    P(64, 26, 12, 1, 0xFF9A9EB8), P(67, 19, 6, 7, Mix(0xFF9A9EB8, 0xFF2A3050, night*0.5)), P(69, 15, 2, 4, 0xFFB9BDD4)
+    P(68, 21, 1, 3, 0xFF2A2E44), P(71, 21, 1, 3, 0xFF2A2E44)                     ; the belfry's openings
+    P(69, 22, 2, 1, (Mod(A_Sec, 15) = 0) ? warm : 0xFFB89A4A)                    ; the bell, glinting on the quarter
+    P(65, 30, 10, 10, 0xFF3A3F5C), P(66, 31, 8, 8, 0xFFF4EFDC)
+    if (night > 0.3)
+        b := TB(Alpha(warm, Round(30*night)), f), FillEll(ox + 63*cs, oy + 28*cs, 14*cs, 14*cs, b)
+    P(69, 31, 2, 1, 0xFF5A5470), P(69, 38, 2, 1, 0xFF5A5470), P(66, 34, 1, 2, 0xFF5A5470), P(73, 34, 1, 2, 0xFF5A5470)
+    ccx := ox + 70*cs, ccy := oy + 35*cs
+    hrA := (Mod(A_Hour, 12) + A_Min/60.0)*30*0.0174533 - 1.5708
+    mnA := A_Min*6*0.0174533 - 1.5708
+    scA := A_Sec*6*0.0174533 - 1.5708
+    pn := PenP(FA(0xFF2A2E44, f), 2.2)
+    Line(ccx, ccy, ccx + 2.6*cs*Cos(hrA), ccy + 2.6*cs*Sin(hrA), pn)
+    Line(ccx, ccy, ccx + 3.6*cs*Cos(mnA), ccy + 3.6*cs*Sin(mnA), pn), DelP(pn)
+    pn := PenP(FA(0xFFD9463E, f), 1)
+    Line(ccx, ccy, ccx + 3.8*cs*Cos(scA), ccy + 3.8*cs*Sin(scA), pn), DelP(pn)
+    b := TB(0xFF2A2E44, f), FillEll(ccx - 2, ccy - 2, 4, 4, b)
+    P(64, 42, 12, 1, 0xFF9A9EB8), P(64, 62, 12, 1, 0xFF9A9EB8)
+    cTw := Mix(0xFF9FB6D6, warm, night)
+    P(68, 46, 1, 3, cTw), P(71, 46, 1, 3, cTw), P(68, 54, 1, 3, cTw), P(71, 54, 1, 3, cTw), P(68, 66, 1, 3, cTw), P(71, 66, 1, 3, cTw)
+    P(66, 74, 8, 8, Mix(cSt, 0xFF000000, 0.3)), P(68, 76, 4, 6, 0xFF2A2236), P(69, 79, 1, 1, warm)
+    if (Mod(t, 700) < 350)
+        P(71, 15, 4, 2, 0xFFE0574A)
+    else
+        P(71, 16, 4, 2, 0xFFE0574A), P(74, 15, 1, 1, 0xFFE0574A)
+    ; ---- fireworks, at the top of every real hour ----
+    if (A_Min = 0 && A_Sec < 14) {
+        loop 3 {
+            k  := A_Index
+            fp := Mod(A_Sec*1000 + A_MSec - k*1800, 4200)/4200.0
+            if (fp < 0)
+                continue
+            fcx := 40 + k*28, fcy := 18 + Mod(k, 2)*8
+            fcl := (k = 1) ? 0xFFFF6A6A : (k = 2) ? 0xFFFFE08A : 0xFF8AB8FF
+            loop 12 {
+                an := (A_Index - 1)*0.5236
+                rr := Round(fp*16)
+                P(fcx + Round(rr*Cos(an)), fcy + Round(rr*Sin(an)) + Round(fp*fp*6), 1, 1, Alpha(fcl, Round(240*(1 - fp))))
+            }
+        }
+    }
+    ; ---- trees, swaying, on the bank ----
+    cLd := Mix(0xFF3D7A4A, 0xFF1E3A2A, night*0.5), cLl := Mix(0xFF6FBF63, 0xFF2E5A3A, night*0.5)
+    for tk, tx0 in [1, 60, 100, 134]
+        TownTree(P, tx0, 82, Round(Sin(t*0.0011 + tk*1.9)), 0xFF5A3E2E, cLd, cLl)
+    TownTree(P, 8, 78, Round(Sin(t*0.0009 + 3)), 0xFF5A3E2E, cLd, cLl, 1)
+    ; ---- the fountain ----
+    P(63, 83, 14, 3, 0xFF8A8DA5), P(64, 84, 12, 1, 0xFF4F8FD0), P(63, 83, 14, 1, 0xFFA5A8BE)
+    loop 3 {
+        k  := A_Index
+        fp := Abs(Sin(t*0.0021 + k*1.05))
+        P(66 + (k - 1)*3, 82 - Round(fp*4), 1, 1 + Round(fp*2), 0xFFB8E0F8)
+    }
+    ; ---- street furniture: lamps with their pools, a shelter, a phone box, a hydrant, a cart ----
+    for lk, lx0 in [20, 56, 90, 122] {
+        P(lx0, 76, 1, 6, 0xFF2A2E44), P(lx0 - 1, 75, 3, 1, 0xFF2A2E44), P(lx0 - 1, 76, 1, 1, 0xFF2A2E44), P(lx0 + 1, 76, 1, 1, 0xFF2A2E44)
+        if (night > 0.05) {
+            P(lx0, 76, 1, 1, Alpha(warm, Round(235*night)))
+            b := TB(Alpha(warm, Round(36*night)), f), FillEll(ox + (lx0 - 5)*cs, oy + 74*cs, 11*cs, 12*cs, b)
+            b := TB(Alpha(warm, Round(22*night)), f), FillEll(ox + (lx0 - 7)*cs, oy + 80*cs, 15*cs, 6*cs, b)
+        }
+    }
+    P(44, 76, 9, 1, 0xFF3A3F5C), P(44, 77, 1, 5, 0xFF3A3F5C), P(52, 77, 1, 5, 0xFF3A3F5C), P(45, 77, 7, 4, Mix(0xFF9FB6D6, warm, night*0.6))
+    P(46, 78, 5, 2, Mix(0xFF2A2E44, warm, night*0.5)), P(45, 81, 7, 1, 0xFF6E4A34)
+    P(108, 76, 3, 6, 0xFFC44A4A), P(109, 77, 1, 3, Mix(0xFF9FB6D6, warm, night*0.5)), P(108, 75, 3, 1, 0xFF8A3A3A)
+    P(84, 80, 2, 2, 0xFFE8574A), P(83, 80, 4, 1, 0xFFE8574A), P(84, 79, 2, 1, 0xFFB83A2E)
+    P(114, 78, 6, 3, 0xFFE9D5A8), P(115, 77, 4, 1, 0xFFC44A4A), P(114, 81, 1, 1, 0xFF2A2E44), P(119, 81, 1, 1, 0xFF2A2E44), P(120, 76, 1, 5, 0xFF6E4A34)
+    P(116, 76, 2, 1, Alpha(wh, Round(120 + 60*Sin(t*0.005))))
+    P(126, 77, 6, 2, 0xFFE0D8C8), P(128, 79, 1, 3, 0xFF5A5470), P(127, 77, 1, 2, 0xFFE0574A)
+    P(106, 83, 8, 1, 0xFF6E4A34), P(106, 84, 1, 2, 0xFF6E4A34), P(113, 84, 1, 2, 0xFF6E4A34)
+    P(96, 83, 2, 3, 0xFF3A3F5C), P(96, 82, 2, 1, 0xFF6A6F8E)
+    ; ---- the people, and the dog ----
+    cols := [[0xFF3A4C8A, 0xFF23263A], [0xFF8A3A4C, 0xFF3A4C8A], [0xFF4FA85C, 0xFF3A2E24], [0xFFE0872E, 0xFF23263A], [0xFF6A4A8A, 0xFF2A2E44]]
+    loop 5 {
+        k   := A_Index
+        dir := (k = 4 || k = 5) ? -1 : 1
+        px0 := (dir > 0) ? Mod(t*(0.0032 + 0.0008*k) + k*41, 158) - 8 : 150 - Mod(t*(0.003 + 0.0006*k) + k*53, 158)
+        stp := Mod(Floor(t/170) + k, 2)
+        TownWalker(P, px0, 86, cols[k][1], cols[k][2], 0xFFF1C9A2, (k = 3) ? 0xFFE9D5A8 : 0xFF3A2E24, stp, dir, (k = 5) ? 0xFF6A4A8A : 0)
+        if (rain > 0.3)
+            P(px0 - 2, 76, 6, 1, cols[k][1]), P(px0 - 1, 75, 4, 1, cols[k][1]), P(px0 + 1, 77, 1, 3, 0xFF2A2E44)
+        if (k = 2) {
+            P(px0 - 4, 84, 3, 1, 0xFF8A6A4A), P(px0 - 5, 83, 1, 1, 0xFF8A6A4A), P(px0 - 4 + stp, 85, 1, 1, 0xFF8A6A4A), P(px0 - 2 - stp, 85, 1, 1, 0xFF8A6A4A), P(px0 - 2, 83 - stp, 1, 1, 0xFF8A6A4A)
+        }
+    }
+    ; ---- the cars, both ways, lamps on at night; a bus every half minute ----
+    cx1 := Mod(t*0.014, 174) - 14
+    P(cx1, 88, 8, 2, 0xFFE8C94A), P(cx1 + 2, 87, 4, 1, 0xFF9FD3F0), P(cx1 + 3, 86, 2, 1, 0xFF2A2E44), P(cx1 + 1, 90, 1, 1, 0xFF1C1E2A), P(cx1 + 6, 90, 1, 1, 0xFF1C1E2A)
+    cx3 := Mod(t*0.011 + 90, 174) - 14
+    P(cx3, 88, 8, 2, 0xFFC94A3E), P(cx3 + 2, 87, 4, 1, 0xFF9FD3F0), P(cx3 + 1, 90, 1, 1, 0xFF1C1E2A), P(cx3 + 6, 90, 1, 1, 0xFF1C1E2A)
+    cx2 := 156 - Mod(t*0.0105 + 60, 174)
+    P(cx2, 92, 8, 2, 0xFF3F7FC9), P(cx2 + 2, 91, 4, 1, 0xFF9FD3F0), P(cx2 + 1, 94, 1, 1, 0xFF1C1E2A), P(cx2 + 6, 94, 1, 1, 0xFF1C1E2A)
+    bph := Mod(t, 30000)
+    if (bph < 9000) {
+        bxs := 160 - Round(bph*0.021)
+        P(bxs, 91, 18, 3, 0xFF4FA85C), P(bxs + 1, 90, 16, 1, 0xFF9FD3F0), P(bxs + 2, 94, 1, 1, 0xFF1C1E2A), P(bxs + 15, 94, 1, 1, 0xFF1C1E2A), P(bxs + 8, 94, 1, 1, 0xFF1C1E2A)
+        loop 7
+            P(bxs + 2 + (A_Index - 1)*2, 92, 1, 1, Mix(0xFF9FD3F0, warm, night))
+    }
+    if (night > 0.05) {
+        for ck, cxx in [cx1, cx3] {
+            P(cxx + 8, 89, 1, 1, Alpha(0xFFFFF3C4, Round(235*night))), P(cxx - 1, 89, 1, 1, Alpha(0xFFFF5A5A, Round(200*night)))
+            P(cxx + 9, 88, 5, 3, Alpha(0xFFFFF3C4, Round(34*night))), P(cxx + 14, 87, 3, 5, Alpha(0xFFFFF3C4, Round(16*night)))
+        }
+        P(cx2 - 1, 93, 1, 1, Alpha(0xFFFFF3C4, Round(235*night))), P(cx2 + 8, 93, 1, 1, Alpha(0xFFFF5A5A, Round(200*night)))
+        P(cx2 - 6, 92, 5, 3, Alpha(0xFFFFF3C4, Round(34*night)))
+    }
+    ; ---- the foreground: a fence, and a cat on it ----
+    P(0, 97, 142, 1, 0xFF6E4A34), P(0, 98, 142, 1, 0xFF5A3E2E)
+    loop 24
+        P((A_Index - 1)*6, 96, 1, 3, 0xFF6E4A34), P((A_Index - 1)*6, 96, 1, 1, 0xFF8A6A4A)
+    tail := (Mod(t, 800) < 400)
+    P(30, 94, 5, 2, 0xFF2A2436), P(34, 93, 2, 2, 0xFF2A2436), P(34, 92, 1, 1, 0xFF2A2436), P(36, 92, 1, 1, 0xFF2A2436)
+    if tail
+        P(29, 93, 1, 1, 0xFF2A2436), P(28, 92, 1, 1, 0xFF2A2436)
+    else
+        P(29, 94, 1, 1, 0xFF2A2436), P(28, 94, 1, 1, 0xFF2A2436)
+    P(35, 93, 1, 1, 0xFFFFE08A)
+    ; ---- the rain, when it comes ----
+    if (rain > 0.02) {
+        loop 40 {
+            k  := A_Index
+            rp := Mod(t*0.0012 + k*0.137, 1.0)
+            P(Mod(k*37 + Round(rp*8), 142), Round(rp*100), 1, 2, Alpha(0xFFB9DCF2, Round(150*rain)))
+        }
+    }
+}
+
+; =============== 2  MAIN STREET ===============
+; Side on, a summer afternoon: five tall houses shoulder to shoulder - slate
+; with balconies, brown with an awning over a shop, red brick with a glass
+; front and a fire escape, ochre with a red door, slate again - arched windows
+; in white frames with curtains and flower boxes, a water tower and an aerial
+; and a garden on the roofs, laundry and string lights between them, a cafe
+; terrace under red umbrellas with a busker outside it, cobbles, a cyclist, a
+; van, a bus, pigeons that take off, and a plane towing a banner overhead.
+TownStreet(ox, oy, cs, acc, f, now) {
+    t := DecT(now)
+    P(x, y, w, h, c) => TPx(ox, oy, cs, x, y, w, h, c, f)
+    SkyBands(ox, oy, cs, 84, 0xFF5EAFE8, 0xFFD8EEF9, f, 12)
+    wh := 0xFFFFFFFF
+    ; the sun, high and left, its halo and its rays
+    b := TB(Alpha(0xFFFFF0B8, 46), f), FillEll(ox + 4*cs, oy - 6*cs, 26*cs, 26*cs, b)
+    b := TB(Alpha(0xFFFFF0B8, 60), f), FillEll(ox + 9*cs, oy - 1*cs, 16*cs, 16*cs, b)
+    P(14, 3, 6, 4, 0xFFFFE9A8), P(15, 2, 4, 6, 0xFFFFE9A8), P(15, 3, 3, 2, wh)
+    ; clouds, seven, small and far to big and near
+    loop 7 {
+        k := A_Index
+        TownCloud(P, Mod(t*(0.0011 + 0.0005*k) + k*29, 178) - 22, 3 + Mod(k*7, 24), 8 + Mod(k, 4)*4, wh, 0xFFCFE2F0)
+    }
+    ; the plane, and the banner it tows, rippling
+    pxl := Mod(t*0.011, 210) - 40, pyl := 9 + Round(1.5*Sin(t*0.0014))
+    P(pxl, pyl, 7, 2, 0xFFE8574A), P(pxl + 6, pyl - 1, 1, 1, 0xFFE8574A), P(pxl + 2, pyl - 1, 3, 1, 0xFFF4F1E8), P(pxl - 1, pyl + 1, 2, 1, 0xFFF4F1E8), P(pxl - 1, pyl - 1, 1, 1, 0xFF3A3F5C)
+    P(pxl + 3, pyl, 2, 1, 0xFF9FD3F0)
+    loop 14 {
+        k := A_Index
+        P(pxl - 3 - k, pyl + Round(Sin(t*0.006 - k*0.8)*1.2), 1, 2, Mod(k, 2) ? 0xFFFFE9A8 : 0xFFD9463E)
+    }
+    loop 3 {
+        k := A_Index
+        TownBird(P, 180 - Mod(t*0.016 + k*30, 200), 22 + k*5 + Round(2*Sin(t*0.003 + k)), Mod(Floor(t/230) + k, 2), 0xFF3A3F5C)
+    }
+    ; a distant skyline in two depths
+    for sk, sh in [14, 22, 17, 26, 12, 20, 24, 15, 19, 27, 13, 21, 18, 23]
+        P((sk - 1)*10, 58 - sh, 9, sh + 26, 0xFFC6DCEA)
+    for sk, sh in [10, 16, 12, 20, 9, 15, 18, 11, 14, 21, 10, 17, 13, 19] {
+        P((sk - 1)*10 + 3, 66 - sh, 8, sh + 18, 0xFFB0CBDF)
+        loop 3
+            P((sk - 1)*10 + 4 + (A_Index - 1)*2, 68 - sh + (Mod(sk*3 + A_Index, 4)*4), 1, 2, 0xFF9CB8CE)
+    }
+    ; ---- the row: x, width, top, wall, trim, kind (0 balconies, 1 awning shop, 2 brick arches, 3 ochre, 4 slate) ----
+    row := [[0, 27, 30, 0xFF4A5470, 0xFF7A88AA, 0], [27, 30, 34, 0xFFB4703A, 0xFFE0A66C, 1], [57, 36, 24, 0xFFB84A3A, 0xFFDB7D68, 2]
+          , [93, 29, 28, 0xFFD9A15A, 0xFFF2CC8E, 3], [122, 20, 22, 0xFF3F4A63, 0xFF6A7CA8, 4]]
+    for ri, r in row {
+        rx := r[1], rw := r[2], rtop := r[3], cw := r[4], ct := r[5], rk := r[6]
+        P(rx, rtop, rw, 84 - rtop, cw)
+        loop (84 - rtop)//2 {                      ; brick courses, offset every other row
+            q := A_Index
+            P(rx + 1 + Mod(q, 2), rtop + 3 + (q - 1)*2, rw - 3, 1, Mix(cw, 0xFF000000, 0.10))
+        }
+        loop 60 {                                 ; and a speckle of darker bricks
+            k := A_Index
+            P(rx + 1 + Mod(k*7, rw - 2), rtop + 4 + Mod(k*11, 84 - rtop - 6), 2, 1, Mix(cw, 0xFF000000, 0.16))
+        }
+        P(rx + rw - 1, rtop, 1, 84 - rtop, Mix(cw, 0xFF000000, 0.3))
+        loop (84 - rtop)//4                       ; quoins up the corner
+            P(rx + (Mod(A_Index, 2) ? 0 : 1), rtop + 2 + (A_Index - 1)*4, 2, 2, Mix(cw, wh, 0.25))
+        P(rx, rtop, rw, 2, ct), P(rx, rtop + 2, rw, 1, Mix(cw, 0xFF000000, 0.2)), P(rx + 1, rtop - 1, rw - 2, 1, Mix(ct, wh, 0.3))
+        loop rw//3
+            P(rx + (A_Index - 1)*3 + 1, rtop + 1, 1, 1, Mix(ct, 0xFF000000, 0.15))
+        ; floors of windows: four wide, five tall, an arch, glass with the sky
+        ; in it, a pale frame, a sill - and curtains, blinds, a plant, a cat
+        fy := rtop + 5
+        fi := 0
+        while (fy <= 66) {
+            fi++
+            wx := rx + 3
+            wi := 0
+            while (wx <= rx + rw - 7) {
+                wi++
+                P(wx - 1, fy + 6, 6, 1, Mix(cw, wh, 0.42))
+                P(wx, fy + 1, 4, 5, wh), P(wx + 1, fy, 2, 1, wh)
+                P(wx + 1, fy + 2, 2, 3, 0xFFA9D3EE), P(wx + 1, fy + 1, 2, 1, 0xFF7FB7E0), P(wx + 2, fy + 2, 1, 1, 0xFFD6ECF8)
+                v := Mod(ri*5 + fi*3 + wi*7, 6)
+                if (v = 0)
+                    P(wx + 1, fy + 2, 1, 3, 0xFFF4E4C8), P(wx + 2, fy + 2, 1, 1, 0xFFF4E4C8)
+                else if (v = 1)
+                    P(wx + 1, fy + 2, 2, 1, 0xFFE8E2D4), P(wx + 1, fy + 3, 2, 1, 0xFFD8D2C4)
+                else if (v = 2)
+                    P(wx + 1, fy + 4, 1, 1, 0xFF4FA85C), P(wx + 2, fy + 3, 1, 1, 0xFFE8574A)
+                if (v = 3 && fi = 2)              ; the cat, in one window per house
+                    P(wx + 1, fy + 3, 2, 2, 0xFF2A2436), P(wx + 1, fy + 2, 1, 1, 0xFF2A2436), P(wx + 2, fy + 2, 1, 1, 0xFF2A2436)
+                if (rk = 0 || rk = 4) {           ; balconies on the grey houses: a slab, a rail, a pot
+                    P(wx - 1, fy + 6, 6, 1, Mix(cw, wh, 0.35))
+                    loop 4
+                        P(wx - 1 + (A_Index - 1)*2, fy + 4, 1, 2, 0xFF23263A)
+                    P(wx - 1, fy + 4, 6, 1, 0xFF23263A)
+                    P(wx + 4, fy + 5, 1, 1, 0xFFE8574A), P(wx + 4, fy + 4, 1, 1, 0xFF4FA85C)
+                } else if (rk = 3 && Mod(wi, 2) = 1) {   ; flower boxes on the ochre house
+                    P(wx, fy + 6, 4, 1, 0xFF7A4A2A), P(wx, fy + 5, 1, 1, 0xFFE8574A), P(wx + 1, fy + 5, 1, 1, 0xFF4FA85C), P(wx + 2, fy + 5, 1, 1, 0xFFFFE08A), P(wx + 3, fy + 5, 1, 1, 0xFF4FA85C)
+                } else if (rk = 2 && fi = 2 && wi = 2) { ; an open window, its curtain out in the wind
+                    P(wx + 1, fy + 1, 2, 4, 0xFF5A2A22), P(wx + 3, fy + 1 + Round(Abs(Sin(t*0.003))*1), 1, 3, 0xFFF4E4C8)
+                }
+                wx += 8
+            }
+            fy += 10
+        }
+        ; the ground floor
+        if (rk = 1) {                             ; the shop: an awning with a scalloped fringe, a window, a door, a sign
+            P(rx + 3, 72, 22, 12, 0xFF3A2A22)
+            P(rx + 5, 74, 8, 6, 0xFFFFE9C0), P(rx + 6, 75, 2, 2, 0xFFE8574A), P(rx + 9, 76, 2, 2, 0xFF4FA85C), P(rx + 6, 78, 5, 1, 0xFFD9B23E)
+            P(rx + 17, 74, 5, 10, 0xFF7A4A2A), P(rx + 21, 79, 1, 1, 0xFFFFD98A), P(rx + 18, 75, 3, 3, 0xFF9FD3F0)
+            loop 22 {
+                k := A_Index
+                P(rx + 2 + k, 70, 1, 2, Mod(k, 2) ? 0xFFF4F1E8 : 0xFFD9463E)
+                P(rx + 2 + k, 72, 1, 1 + Mod(k + Floor(t/400), 2), Mod(k, 2) ? 0xFFF4F1E8 : 0xFFD9463E)
+            }
+            P(rx + 3, 69, 22, 1, 0xFFB84A3A), P(rx + 8, 66, 12, 3, 0xFF23263A), P(rx + 10, 67, 2, 1, 0xFFFFE08A), P(rx + 13, 67, 4, 1, 0xFFFFE08A)
+            P(rx + 6, 75, 1, 1, (Mod(t, 1400) < 900) ? 0xFFFF6A6A : 0xFF6A3A3A)
+        } else if (rk = 2) {                      ; the glass front, a fire escape, a stone base
+            P(rx + 2, 72, 32, 12, 0xFF2A2E44), P(rx + 2, 72, 32, 1, 0xFF5A5E78)
+            P(rx + 3, 73, 13, 9, 0xFFB9DCF2), P(rx + 20, 73, 13, 9, 0xFFB9DCF2)
+            P(rx + 4, 74, 4, 7, 0xFF8FC3E6), P(rx + 21, 74, 4, 7, 0xFF8FC3E6), P(rx + 10, 76, 4, 4, 0xFFD9463E), P(rx + 27, 76, 3, 4, 0xFF4FA85C), P(rx + 24, 77, 2, 3, 0xFFFFE08A)
+            P(rx + 16, 74, 4, 10, 0xFF4A3A2A), P(rx + 19, 79, 1, 1, 0xFFFFD98A)
+            loop 4 {
+                q := A_Index
+                P(rx + 30, rtop + 8 + (q - 1)*10, 5, 1, 0xFF23263A), P(rx + 34, rtop + 9 + (q - 1)*10, 1, 9, 0xFF23263A)
+                loop 3
+                    P(rx + 30 + (A_Index - 1)*2, rtop + 6 + (q - 1)*10, 1, 2, 0xFF23263A)
+            }
+        } else if (rk = 3) {                      ; the red door and its steps, hedges either side
+            P(rx + 12, 74, 5, 10, 0xFF9A2A2A), P(rx + 13, 75, 3, 3, 0xFF9FD3F0), P(rx + 16, 79, 1, 1, 0xFFFFD98A), P(rx + 11, 73, 7, 1, 0xFFF2CC8E)
+            P(rx + 10, 83, 9, 1, 0xFFC9A87A), P(rx + 11, 82, 7, 1, 0xFFD9B98A)
+            P(rx + 3, 76, 5, 1, 0xFF2A2E44), P(rx + 21, 76, 5, 1, 0xFF2A2E44)
+            P(rx + 3, 73, 5, 3, 0xFF3E8A48), P(rx + 21, 73, 5, 3, 0xFF3E8A48), P(rx + 4, 74, 1, 1, 0xFFE8574A), P(rx + 23, 74, 1, 1, 0xFFE8574A), P(rx + 6, 73, 1, 1, 0xFF6FBF63)
+        } else {                                  ; a plain door, a lamp beside it
+            P(rx + rw//2 - 2, 76, 4, 8, 0xFF2A2236), P(rx + rw//2 + 1, 80, 1, 1, 0xFFFFD98A), P(rx + rw//2 - 1, 77, 2, 2, 0xFF9FD3F0)
+            P(rx + rw//2 + 3, 77, 1, 1, 0xFFFFE9A8), P(rx + rw//2 + 3, 78, 1, 1, 0xFF23263A)
+        }
+        ; the roofs: a water tower, an aerial, a garden, laundry lines
+        if (ri = 2) {
+            P(rx + 20, rtop - 7, 5, 5, 0xFF6A5A4A), P(rx + 19, rtop - 8, 7, 1, 0xFF4A3A2A), P(rx + 21, rtop - 9, 3, 1, 0xFF4A3A2A)
+            P(rx + 21, rtop - 2, 1, 2, 0xFF3A2E24), P(rx + 23, rtop - 2, 1, 2, 0xFF3A2E24), P(rx + 20, rtop - 6, 5, 1, 0xFF7A6A5A)
+        } else if (ri = 4) {
+            P(rx + 6, rtop - 8, 1, 8, 0xFF2A2E44), P(rx + 3, rtop - 6, 7, 1, 0xFF2A2E44), P(rx + 4, rtop - 4, 5, 1, 0xFF2A2E44), P(rx + 5, rtop - 2, 3, 1, 0xFF2A2E44)
+        } else if (ri = 3) {
+            TownTree(P, rx + 10, rtop, Round(Sin(t*0.0012)), 0xFF5A3E2E, 0xFF3E8A48, 0xFF6FBF63)   ; inside its own roof, clear of the next house
+            P(rx + 8, rtop - 2, 8, 2, 0xFF7A4A2A), P(rx + 8, rtop - 3, 8, 1, 0xFF4FA85C), P(rx + 10, rtop - 4, 1, 1, 0xFFE8574A), P(rx + 13, rtop - 4, 1, 1, 0xFFFFE08A)
+        }
+    }
+    ; string lights between the shop and the brick house, and the laundry, waving
+    loop 12 {
+        k := A_Index
+        P(30 + k*2, 46 + Round(Sin((k - 1)/11.0*3.14159)*3), 1, 1, (Mod(Floor(t/300) + k, 3) = 0) ? 0xFFFFE9A8 : 0xFFE8C05A)
+    }
+    loop 4 {
+        k  := A_Index
+        wv := Round(Sin(t*0.004 + k)*0.6 + 0.5)
+        P(5 + k*2 + (k > 2 ? 118 : 0), 41 + wv, 1, 2 - wv, Mod(k, 2) ? 0xFFFFE9A8 : 0xFFB9DCF2)
+    }
+    P(4, 41, 10, 1, 0xFF23263A), P(122, 41, 8, 1, 0xFF23263A)
+    ; ---- the pavement and the road ----
+    P(0, 84, 142, 6, 0xFFCFCABC)
+    loop 70 {
+        k := A_Index
+        P(Mod(k*2 + (Mod(k, 2) ? 1 : 0), 142), 84 + Mod(k*3, 5), 1, 1, 0xFFC0BAAC)
+    }
+    P(0, 89, 142, 1, 0xFFA9A396), P(0, 90, 142, 11, 0xFF585D6B)
+    loop 40 {
+        k := A_Index
+        P(Mod(k*23, 142), 91 + Mod(k*5, 9), 1, 1, 0xFF60656F)
+    }
+    loop 18
+        P((A_Index - 1)*8 + 2, 95, 4, 1, 0xFFE8C95A)
+    loop 6
+        P(70 + (A_Index - 1)*4, 90, 2, 11, 0xFF9A9EA8)
+    P(0, 90, 142, 1, 0xFF6C7080), P(96, 88, 3, 2, 0xFF4A4E5C), P(97, 89, 1, 1, 0xFF3A3E4C)
+    ; the trees in autumn, swaying, and leaves falling
+    for tk, tx0 in [10, 96, 126] {
+        cL := (tk = 2) ? 0xFFE0872E : 0xFFD9B23E, cL2 := (tk = 2) ? 0xFFF2A24A : 0xFFF0CF62
+        TownTree(P, tx0, 84, Round(Sin(t*0.0012 + tk*1.7)), 0xFF5A3E2E, cL, cL2, 1)
+        P(tx0 + 2, 84, 7, 1, 0xFF8A6A4A)
+    }
+    loop 6 {
+        k  := A_Index
+        lp := Mod(t*0.00035 + k*0.17, 1.0)
+        P(8 + Mod(k*23, 130) + Round(Sin(lp*12 + k)*2), 60 + Round(lp*24), 1, 1, Mod(k, 2) ? 0xFFE0872E : 0xFFD9B23E)
+    }
+    ; ---- the terrace under the awning: tables, umbrellas, and the busker ----
+    for tk, tx0 in [30, 42] {
+        P(tx0, 74, 1, 10, 0xFF23263A), P(tx0 - 4, 73, 9, 1, 0xFFD9463E), P(tx0 - 3, 72, 7, 1, 0xFFD9463E), P(tx0 - 2, 71, 5, 1, 0xFFE8574A)
+        loop 4
+            P(tx0 - 4 + (A_Index - 1)*2, 74, 1, 1, 0xFFF4F1E8)
+        P(tx0 - 3, 80, 7, 1, 0xFF6E4A34), P(tx0 - 2, 81, 1, 3, 0xFF6E4A34), P(tx0 + 2, 81, 1, 3, 0xFF6E4A34)
+        P(tx0 - 2, 79, 1, 1, 0xFFF4F1E8), P(tx0 + 1, 79, 1, 1, 0xFF8A3A4C)
+    }
+    TownWalker(P, 51, 84, 0xFF6A4A8A, 0xFF23263A, 0xFFF1C9A2, 0xFF3A2E24, 0, 1, 0xFF23263A)
+    P(53, 80, 3, 1, 0xFF8A5A3A), P(55, 79, 1, 1, 0xFF8A5A3A), P(56, 80, 1, 2, 0xFF5A3E2E)
+    loop 3 {
+        k  := A_Index
+        np := Mod(t*0.0007 + k*0.33, 1.0)
+        P(56 + Round(Sin(np*8 + k)*2), 76 - Round(np*10), 1, 1, Alpha(0xFF23263A, Round(200*(1 - np)))), P(57 + Round(Sin(np*8 + k)*2), 75 - Round(np*10), 1, 1, Alpha(0xFF23263A, Round(160*(1 - np))))
+    }
+    P(48, 83, 3, 1, 0xFF8A6A4A), P(49, 82, 1, 1, 0xFFE8C95A)
+    ; street furniture: iron lamps with baskets, a mailbox, a hydrant, bins, a bike rack, a bus stop
+    for lk, lx0 in [64, 118] {
+        P(lx0, 76, 1, 8, 0xFF23263A), P(lx0 - 2, 75, 5, 1, 0xFF23263A), P(lx0 - 2, 76, 1, 1, 0xFF23263A), P(lx0 + 2, 76, 1, 1, 0xFF23263A), P(lx0 - 1, 74, 3, 1, 0xFF23263A)
+        P(lx0 - 3, 77, 2, 2, 0xFF4FA85C), P(lx0 + 2, 77, 2, 2, 0xFF4FA85C), P(lx0 - 3, 77, 1, 1, 0xFFE8574A), P(lx0 + 3, 78, 1, 1, 0xFFFFE08A)
+    }
+    P(60, 80, 3, 4, 0xFF3F7FC9), P(60, 79, 3, 1, 0xFF2F5F99), P(61, 81, 1, 1, 0xFFF4F1E8)
+    P(86, 81, 2, 3, 0xFFE8574A), P(85, 81, 4, 1, 0xFFE8574A), P(86, 80, 2, 1, 0xFFB83A2E)
+    P(115, 80, 3, 4, 0xFF5A5E78), P(115, 79, 3, 1, 0xFF3A3E4C), P(119, 80, 3, 4, 0xFF4A6E4A), P(119, 79, 3, 1, 0xFF2E4A2E)
+    P(102, 80, 8, 1, 0xFF23263A), P(103, 81, 1, 3, 0xFF23263A), P(108, 81, 1, 3, 0xFF23263A)
+    P(104, 81, 4, 1, 0xFFB8322A), P(105, 82, 1, 1, 0xFF23263A), P(107, 82, 1, 1, 0xFF23263A)
+    P(134, 76, 1, 8, 0xFF23263A), P(132, 76, 5, 3, 0xFFE8C95A), P(133, 77, 3, 1, 0xFF23263A)
+    P(36, 82, 6, 2, 0xFF6E4A34)
+    ; the pigeons: five pecking on the pavement, one that takes off now and then
+    loop 5 {
+        k  := A_Index
+        pk := (Mod(t + k*300, 1100) < 550)
+        px0 := 74 + k*5 + Round(Sin(t*0.0004 + k)*2)
+        P(px0, 83, 2, 1, 0xFF8A8DA5), P(px0 + 2, 82 + (pk ? 1 : 0), 1, 1, 0xFF8A8DA5), P(px0 + 1, 82, 1, 1, 0xFFA5A8BE)
+    }
+    fph := Mod(t, 8000)
+    if (fph < 2600) {
+        fx0 := 80 + Round(fph*0.02), fy0 := 82 - Round(fph*0.012)
+        TownBird(P, fx0, fy0, Mod(Floor(t/120), 2), 0xFF8A8DA5)
+    }
+    ; ---- the people, the child with the balloon, the couple on the bench, the dog ----
+    cols := [[0xFF3A4C8A, 0xFF23263A], [0xFF4FA85C, 0xFF5A3E2E], [0xFFE8574A, 0xFF3A4C8A], [0xFF6A4A8A, 0xFF23263A], [0xFFD9B23E, 0xFF4A3A2A]]
+    loop 5 {
+        k   := A_Index
+        dir := (k >= 4) ? -1 : 1
+        px0 := (dir > 0) ? Mod(t*(0.0032 + 0.0007*k) + k*45, 158) - 8 : 150 - Mod(t*(0.0034 + 0.0005*k) + k*70, 158)
+        stp := Mod(Floor(t/170) + k, 2)
+        if (k = 3) {
+            P(px0, 80, 2, 2, 0xFFF1C9A2), P(px0, 79, 2, 1, 0xFFE9D5A8), P(px0, 82, 2, 1, cols[k][1]), P(px0 - stp, 83, 1, 1, cols[k][2]), P(px0 + 1 + stp, 83, 1, 1, cols[k][2])
+            P(px0 + 2, 78, 1, 4, 0xFF9A9EA8), P(px0 + 2, 75 + Round(Sin(t*0.003)*1), 2, 3, 0xFFE8574A), P(px0 + 2, 74 + Round(Sin(t*0.003)*1), 1, 1, 0xFFFF8A7A)
+        } else
+            TownWalker(P, px0, 84, cols[k][1], cols[k][2], 0xFFF1C9A2, (k = 2) ? 0xFFE9D5A8 : (k = 5) ? 0xFFB83A2E : 0xFF3A2E24, stp, dir, (k = 4) ? 0xFF23263A : 0)
+        if (k = 1)
+            P(px0 - 4, 83, 3, 1, 0xFF8A6A4A), P(px0 - 5, 82, 1, 1, 0xFF8A6A4A), P(px0 - 4 + stp, 84, 1, 1, 0xFF8A6A4A), P(px0 - 2 - stp, 84, 1, 1, 0xFF8A6A4A), P(px0 - 2, 82 - stp, 1, 1, 0xFF8A6A4A)
+        if (k = 5)
+            P(px0 - 2, 81, 2, 3, 0xFFE0872E)
+    }
+    P(37, 78, 2, 2, 0xFFF1C9A2), P(37, 77, 2, 1, 0xFF3A2E24), P(37, 80, 2, 2, 0xFF8A3A4C), P(39, 78, 2, 2, 0xFFF1C9A2), P(39, 77, 2, 1, 0xFFE9D5A8), P(39, 80, 2, 2, 0xFF3A4C8A)
+    ; ---- the cyclist, the van, a car, and the bus ----
+    ; the cyclist rides the road's near edge - a bike lane under the kerb -
+    ; not the shop fronts
+    cyx := Mod(t*0.0075, 170) - 12
+    P(cyx, 90, 2, 1, 0xFF23263A), P(cyx + 4, 90, 2, 1, 0xFF23263A), P(cyx + 1, 89, 4, 1, 0xFFB8322A), P(cyx + 2, 86, 2, 3, 0xFF4FA85C), P(cyx + 2, 84, 2, 2, 0xFFF1C9A2), P(cyx + 2, 83, 2, 1, 0xFFD9463E)
+    P(cyx + 1 + Mod(Floor(t/110), 2), 91, 1, 1, 0xFF3A3E4C), P(cyx + 5 - Mod(Floor(t/110), 2), 91, 1, 1, 0xFF3A3E4C)
+    vph := Mod(t, 14000)
+    if (vph < 6000) {
+        vx0 := 150 - Round(vph*0.028)
+        P(vx0, 91, 12, 4, 0xFFF4F1E8), P(vx0, 90, 9, 1, 0xFFF4F1E8), P(vx0 + 9, 91, 3, 2, 0xFF9FD3F0), P(vx0 + 1, 91, 5, 2, 0xFFE8574A), P(vx0 + 2, 95, 1, 1, 0xFF1C1E2A), P(vx0 + 10, 95, 1, 1, 0xFF1C1E2A)
+    }
+    cph := Mod(t, 9000)
+    if (cph < 5000) {
+        cx1 := -12 + Round(cph*0.031)
+        P(cx1, 92, 9, 2, 0xFF3F7FC9), P(cx1 + 2, 91, 5, 1, 0xFF9FD3F0), P(cx1 + 1, 94, 1, 1, 0xFF1C1E2A), P(cx1 + 7, 94, 1, 1, 0xFF1C1E2A)
+    }
+    bph := Mod(t, 40000)
+    if (bph < 9000) {
+        bxs := -20 + Round(bph*0.02)
+        P(bxs, 91, 18, 4, 0xFFE8574A), P(bxs + 1, 90, 16, 1, 0xFFC94A3E), P(bxs + 1, 91, 16, 2, 0xFF9FD3F0), P(bxs + 2, 95, 1, 1, 0xFF1C1E2A), P(bxs + 15, 95, 1, 1, 0xFF1C1E2A), P(bxs + 9, 95, 1, 1, 0xFF1C1E2A)
+    }
+}
+
+; =============== 3  GREENVALE ===============
+; From above: a village square with a fountain where the paths cross, a
+; stream running down from the pond under a wooden bridge, four houses under
+; tiled roofs in their own gardens, a market stall, a well, a crop plot with
+; sunflowers and a scarecrow the crows still land on, fences and lamps and
+; benches, and a forest in three depths all the way round. Villagers walk the
+; paths, one fishes, one farms; ducks, fish, chickens, rabbits, a deer at the
+; forest's edge, bees over the flowers, butterflies, and the shadows of clouds
+; going over the whole of it.
+TownVillage(ox, oy, cs, acc, f, now) {
+    t := DecT(now)
+    P(x, y, w, h, c) => TPx(ox, oy, cs, x, y, w, h, c, f)
+    ; ---- the ground ----
+    P(0, 0, 142, 101, 0xFF7CBF5A)
+    loop 110 {
+        k := A_Index
+        P(Mod(k*29, 142), Mod(k*17 + 3, 101), 2, 1, 0xFF6BB04E)
+    }
+    loop 24 {
+        k := A_Index
+        P(Mod(k*43 + 5, 138), Mod(k*31 + 7, 97), 4 + Mod(k, 3), 2, 0xFF86C866)
+    }
+    ; the paths: a trunk across, a spur to the pond, a loop to the plot, the square where they cross
+    for pk, pr in [[0, 44, 142, 10], [64, 20, 10, 20], [64, 58, 10, 26], [14, 54, 10, 30], [14, 80, 72, 8], [98, 80, 14, 8], [112, 54, 6, 6], [90, 18, 8, 28]]
+        P(pr[1], pr[2], pr[3], pr[4], 0xFFE3CC90)
+    loop 60 {
+        k := A_Index
+        P(Mod(k*23 + 5, 142), 45 + Mod(k*7, 8), 1, 1, 0xFFD2B77A)
+    }
+    loop 40 {
+        k := A_Index
+        py_ := 20 + Mod(k*11, 64)
+        if (py_ < 38 || py_ > 60)
+            P(65 + Mod(k*3, 8), py_, 1, 1, 0xFFD2B77A)
+    }
+    P(0, 44, 142, 1, 0xFF9DBE6A), P(0, 53, 142, 1, 0xFF9DBE6A)
+    ; the square: cobbles, and the fountain in the middle of it
+    P(58, 38, 22, 22, 0xFFC9B792)
+    loop 60 {
+        k := A_Index
+        P(58 + Mod(k*7, 22), 38 + Mod(k*11, 22), 1, 1, 0xFFB7A47E)
+    }
+    P(64, 44, 10, 10, 0xFF8A8DA5), P(65, 45, 8, 8, 0xFF4C8FD8), P(68, 48, 2, 2, 0xFF9A9EB8)
+    loop 4 {
+        an := (A_Index - 1)*1.5708 + t*0.001
+        fp := Abs(Sin(t*0.0025 + A_Index))
+        P(69 + Round((2 + 2*fp)*Cos(an)), 49 + Round((2 + 2*fp)*Sin(an)), 1, 1, 0xFFDDF0FA)
+    }
+    P(66, 46, 1, 1, 0xFFA6D4F0), P(71, 51, 1, 1, 0xFFA6D4F0)
+    ; the stream, from the pond down under the bridge and off the bottom
+    for sk, sg in [[92, 76, 5, 6], [90, 82, 5, 6], [88, 88, 5, 7], [86, 95, 5, 6]]
+        P(sg[1], sg[2], sg[3], sg[4], 0xFF4C8FD8), P(sg[1] - 1, sg[2], 1, sg[4], 0xFF3B6E9E), P(sg[1] + sg[3], sg[2], 1, sg[4], 0xFF3B6E9E)
+    loop 10 {
+        k := A_Index
+        sp := Mod(t*0.0009 + k*0.1, 1.0)
+        P(92 - Round(sp*6) + Mod(k, 3), 77 + Round(sp*22), 1, 1, 0xFFA6D4F0)
+    }
+    P(86, 81, 12, 3, 0xFF8A6A4A), P(86, 80, 12, 1, 0xFF6E4A34), P(86, 84, 12, 1, 0xFF6E4A34)   ; the bridge, where the path crosses
+    loop 6
+        P(86 + (A_Index - 1)*2, 82, 1, 1, 0xFF7A5A3A)
+    ; cloud shadows, three, over everything below
+    loop 3 {
+        k   := A_Index
+        cxk := Mod(t*(0.0009 + 0.0004*k) + k*50, 200) - 40
+        cyk := 10 + k*28
+        P(cxk, cyk + 2, 26, 8, Alpha(0xFF1E3A2A, 30)), P(cxk + 4, cyk, 16, 2, Alpha(0xFF1E3A2A, 30)), P(cxk + 6, cyk + 10, 14, 2, Alpha(0xFF1E3A2A, 30))
+    }
+    ; ---- the pond: a bank, the water, lilies, reeds, ducks, a fish now and then ----
+    P(83, 57, 26, 20, 0xFF8FA96A), P(81, 60, 30, 14, 0xFF8FA96A)
+    P(84, 58, 24, 18, 0xFF3B6E9E), P(82, 61, 28, 12, 0xFF3B6E9E)
+    P(85, 59, 22, 16, 0xFF4C8FD8), P(83, 62, 26, 10, 0xFF4C8FD8)
+    loop 3 {
+        k  := A_Index
+        rp := Mod(t*0.0009 + k*0.33, 1.0)
+        rr := 1 + Round(rp*5)
+        rcx := 88 + k*6, rcy := 63 + Mod(k, 2)*5
+        cR := Alpha(0xFFA6D4F0, Round(200*(1 - rp)))
+        P(rcx - rr, rcy - rr, rr*2 + 1, 1, cR), P(rcx - rr, rcy + rr, rr*2 + 1, 1, cR), P(rcx - rr, rcy - rr, 1, rr*2 + 1, cR), P(rcx + rr, rcy - rr, 1, rr*2 + 1, cR)
+    }
+    loop 6 {
+        k := A_Index
+        P(86 + Mod(k*7, 20), 60 + Mod(k*5, 13), 2 + Mod(k, 2), 1, Alpha(0xFFDDF0FA, Round(60 + 60*Sin(t*0.004 + k))))
+    }
+    P(86, 70, 3, 2, 0xFF4FA85C), P(87, 70, 1, 1, 0xFFF2A2C8), P(102, 61, 3, 2, 0xFF4FA85C), P(103, 61, 1, 1, 0xFFF2A2C8), P(95, 73, 2, 1, 0xFF4FA85C)
+    P(84, 74, 3, 3, 0xFF4FA85C), P(105, 57, 3, 3, 0xFF4FA85C), P(85, 73, 1, 1, 0xFF6FBF63), P(106, 56, 1, 1, 0xFF6FBF63)
+    for dk, dph in [0.0, 0.5] {
+        da := t*0.0006 + dph*6.28
+        dx0 := 95 + Round(7*Cos(da)), dy0 := 66 + Round(4*Sin(da))
+        P(dx0, dy0, 2, 1, 0xFFF4F1E8), P(dx0 + (Cos(da) < 0 ? -1 : 2), dy0 - 1, 1, 1, 0xFFF4F1E8), P(dx0 + (Cos(da) < 0 ? -2 : 3), dy0 - 1, 1, 1, 0xFFE8A64A)
+    }
+    fph := Mod(t, 6000)
+    if (fph < 900) {
+        fa := fph/900.0
+        P(97 + Round(fa*4), 66 - Round(Sin(fa*3.14159)*4), 2, 1, 0xFFE8A64A), P(96 + Round(fa*4), 66 - Round(Sin(fa*3.14159)*4), 1, 1, 0xFFFFD98A)
+    }
+    ; the fisherman on the bank, the bobber on the water
+    P(78, 62, 2, 2, 0xFFF1C9A2), P(78, 61, 2, 1, 0xFFD9B23E), P(78, 64, 2, 2, 0xFF3A4C8A), P(80, 62, 4, 1, 0xFF5A3E2E), P(84, 62, 1, 2, 0xFF23263A)
+    P(85, 64 + (Mod(t, 1600) < 800 ? 0 : 1), 1, 1, 0xFFE8574A)
+    ; ---- the houses: x, y, width, depth, roof, wall ----
+    hs := [[30, 12, 22, 18, 0xFFD9463E, 0xFFE9D5A8], [104, 10, 20, 16, 0xFF8AA0B8, 0xFFE0D8C8]
+         , [32, 58, 18, 16, 0xFF9A6238, 0xFFE9D5A8], [117, 62, 14, 14, 0xFF6FB3B6, 0xFFEFE6D0]]
+    for hi, h in hs {
+        hx := h[1], hy := h[2], hw := h[3], hd := h[4], cR := h[5], cWl := h[6]
+        P(hx - 3, hy - 3, hw + 6, hd + 8, 0xFF88C862)                                            ; its garden
+        loop hw + 6
+            P(hx - 3 + (A_Index - 1), hy - 3, 1, 1, Mod(A_Index, 2) ? 0xFF8A6A4A : 0xFF7A5A3A)
+        loop hd + 8
+            P(hx - 3, hy - 3 + (A_Index - 1), 1, 1, Mod(A_Index, 2) ? 0xFF8A6A4A : 0xFF7A5A3A), P(hx + hw + 2, hy - 3 + (A_Index - 1), 1, 1, Mod(A_Index, 2) ? 0xFF8A6A4A : 0xFF7A5A3A)
+        P(hx + 1, hy + hd, hw, 2, Alpha(0xFF1E3A2A, 60)), P(hx + hw, hy + 1, 1, hd, Alpha(0xFF1E3A2A, 60))
+        P(hx, hy + hd - 4, hw, 4, cWl), P(hx, hy + hd - 1, hw, 1, Mix(cWl, 0xFF000000, 0.2))
+        P(hx, hy, hw, hd - 4, cR)
+        loop (hd - 4)//2                          ; the tile rows
+            P(hx, hy + (A_Index - 1)*2 + 1, hw, 1, Mix(cR, 0xFF000000, 0.14))
+        P(hx, hy + (hd - 4)//2, hw, 1, Mix(cR, 0xFF000000, 0.3))                                 ; the ridge
+        P(hx, hy, hw, 1, Mix(cR, 0xFFFFFFFF, 0.22))
+        P(hx + hw//2 - 2, hy + 2, 4, 3, Mix(cR, 0xFF000000, 0.35)), P(hx + hw//2 - 1, hy + 3, 2, 1, 0xFF9FD3F0)   ; a dormer
+        P(hx + hw//2 - 1, hy + hd - 3, 3, 3, 0xFF6A3A22), P(hx + hw//2, hy + hd - 2, 1, 1, 0xFFFFD98A)
+        P(hx + hw//2 - 2, hy + hd, 5, 1, 0xFFC9A87A)                                              ; the step
+        P(hx + 2, hy + hd - 3, 3, 2, 0xFF9FD3F0), P(hx + hw - 5, hy + hd - 3, 3, 2, 0xFF9FD3F0), P(hx + 2, hy + hd - 3, 1, 2, 0xFFF4E4C8)
+        P(hx + 2, hy + hd - 1, 3, 1, 0xFF7A4A2A), P(hx + hw - 5, hy + hd - 1, 3, 1, 0xFF7A4A2A), P(hx + 3, hy + hd - 2, 1, 1, 0xFFE8574A), P(hx + hw - 4, hy + hd - 2, 1, 1, 0xFFFFE08A)
+        P(hx + hw - 4, hy + 1, 2, 2, 0xFF5A4A4A), P(hx + hw - 4, hy + 1, 2, 1, 0xFF7A6A6A)
+        loop 3 {
+            k  := A_Index
+            sp := Mod(t*0.0008 + k*0.33 + hi*0.2, 1.0)
+            P(hx + hw - 3 + Round(Sin(sp*6 + k)*1.5), hy - Round(sp*6), 1, 1, Alpha(0xFFF4F1E8, Round(150*(1 - sp))))
+        }
+        if (hi = 1)                               ; a flag on the first house, two frames
+            P(hx + 2, hy - 2, 1, 5, 0xFF5A3E2E), P(hx + 3, hy - 2 + (Mod(t, 700) < 350 ? 0 : 1), 3, 2, 0xFFE8574A)
+        if (hi = 3) {                             ; the dog and its house, below the well
+            P(hx + hw + 4, hy + 16, 5, 4, 0xFF7A4A2A), P(hx + hw + 4, hy + 15, 5, 1, 0xFF9A2A2A), P(hx + hw + 6, hy + 18, 1, 2, 0xFF3A2E24)
+            dgx := hx + hw + 4 + Round(3*Sin(t*0.0007)), dgy := hy + 20
+            P(dgx, dgy, 3, 1, 0xFFC9A87A), P(dgx + 3, dgy - 1, 1, 1, 0xFFC9A87A), P(dgx - 1, dgy - (Mod(t, 600) < 300 ? 1 : 0), 1, 1, 0xFFC9A87A)
+        }
+        if (hi = 2)                               ; a washing line, waving
+            P(hx - 2, hy + hd + 2, 12, 1, 0xFF23263A), P(hx, hy + hd + 3, 2, 2 - Mod(Floor(t/350), 2), 0xFFFFE9A8), P(hx + 4, hy + hd + 3, 2, 2 - Mod(Floor(t/350) + 1, 2), 0xFFB9DCF2), P(hx + 8, hy + hd + 3, 2, 2 - Mod(Floor(t/350), 2), 0xFFF2A2C8)
+    }
+    ; ---- the well, the market stall, benches, lamps, a signpost ----
+    P(56, 62, 6, 5, 0xFF7A7A8A), P(57, 63, 4, 3, 0xFF5A5E78), P(58, 64, 2, 2, 0xFF3B6E9E), P(56, 60, 1, 2, 0xFF6A3A22), P(61, 60, 1, 2, 0xFF6A3A22), P(55, 59, 8, 1, 0xFF9A2A2A), P(56, 58, 6, 1, 0xFFB83A2E)
+    P(58, 61 + Mod(Floor(t/900), 2), 1, 1, 0xFF8A6A4A)
+    P(108, 32, 10, 6, 0xFF8A6A4A), P(107, 30, 12, 2, Mod(Floor(t/500), 2) ? 0xFFE8574A : 0xFFD9463E)
+    loop 6
+        P(107 + (A_Index - 1)*2, 30, 1, 2, 0xFFF4F1E8)
+    P(109, 34, 2, 2, 0xFFE8A64A), P(112, 34, 2, 2, 0xFFE8574A), P(115, 34, 2, 2, 0xFF4FA85C), P(109, 36, 8, 1, 0xFFD9B23E)
+    P(48, 38, 6, 2, 0xFF6E4A34), P(48, 40, 1, 1, 0xFF6E4A34), P(53, 40, 1, 1, 0xFF6E4A34), P(82, 38, 6, 2, 0xFF6E4A34), P(82, 40, 1, 1, 0xFF6E4A34), P(87, 40, 1, 1, 0xFF6E4A34)
+    P(49, 37, 2, 1, 0xFF3A4C8A), P(52, 37, 2, 1, 0xFF8A3A4C), P(49, 36, 2, 1, 0xFFF1C9A2), P(52, 36, 2, 1, 0xFFF1C9A2)
+    ; the lamps stand on grass, outside the square's corners, off every path
+    for lk, lp in [[57, 34], [83, 34], [108, 41], [12, 76], [55, 70], [112, 76]]
+        P(lp[1], lp[2], 1, 3, 0xFF2A2E44), P(lp[1] - 1, lp[2] - 1, 3, 1, 0xFF2A2E44), P(lp[1], lp[2] - 1, 1, 1, 0xFFFFE9A8)
+    P(128, 38, 1, 6, 0xFF5A3E2E), P(126, 38, 6, 2, 0xFFE0D8C8), P(126, 41, 5, 2, 0xFFE0D8C8)
+    ; ---- the plot: three crops, a scarecrow, and the crows that land on it ----
+    P(98, 88, 34, 12, 0xFFA8895A), P(98, 88, 34, 1, 0xFF8A6A4A), P(98, 99, 34, 1, 0xFF8A6A4A)
+    loop 3 {
+        r := A_Index
+        loop 8 {
+            c := A_Index
+            gw := Round(Sin(t*0.0015 + r + c)*0.5 + 0.5)
+            cxp := 100 + (c - 1)*4, cyp := 91 + (r - 1)*3
+            if (r = 1)
+                P(cxp, cyp - gw, 2, 1 + gw, 0xFF4FA85C), P(cxp, cyp + 1, 2, 1, 0xFFE8A64A)
+            else if (r = 2)
+                P(cxp, cyp - 1, 1, 3, 0xFF3E8A48), P(cxp - 1, cyp - 2 - gw, 3, 2, 0xFFFFD98A), P(cxp, cyp - 2 + (1 - gw), 1, 1, 0xFF7A4A2A)
+            else
+                P(cxp, cyp, 3, 2, 0xFFE0872E), P(cxp + 1, cyp - 1, 1, 1, 0xFF3E8A48), P(cxp, cyp, 1, 1, 0xFFF2A24A)
+        }
+    }
+    P(126, 90, 1, 8, 0xFF5A3E2E), P(123, 92, 7, 1, 0xFF5A3E2E), P(125, 88, 3, 2, 0xFFE9D5A8), P(124, 87, 5, 1, 0xFFD9B23E), P(125, 86, 3, 1, 0xFFD9B23E), P(124, 93, 5, 2, 0xFF8A3A4C)
+    cph := Mod(t, 9000)
+    if (cph > 5000 && cph < 8000)
+        P(122, 91 - Mod(Floor(t/400), 2), 2, 1, 0xFF23263A), P(124, 90, 1, 1, 0xFF23263A)
+    else if (cph <= 5000)
+        TownBird(P, 60 + Round(cph*0.013), 30 - Round(Sin(cph/5000.0*3.14159)*8), Mod(Floor(t/160), 2), 0xFF23263A)
+    ; flowers, a scatter in four colours, and the bees over them
+    for fk, fc in [0xFFE8574A, 0xFFFFE08A, 0xFFF4F1E8, 0xFFF2A2C8] {
+        loop 8 {
+            k  := A_Index + fk*8
+            fx := Mod(k*31 + 7, 138) + 1, fy := Mod(k*13 + 2, 40) + (Mod(k, 2) ? 2 : 58)
+            if ((fx >= 58 && fx <= 80 && fy >= 38 && fy <= 60) || (fx >= 81 && fx <= 111 && fy >= 57 && fy <= 77))
+                continue                          ; not on the cobbles, not on the water
+            P(fx, fy, 1, 1, fc)
+        }
+    }
+    for bk, bx0 in [12, 84, 130] {
+        P(bx0 + Round(4*Sin(t*0.0021 + bk)), 34 + Round(3*Sin(t*0.0033 + bk*2)), 1, 1, 0xFFFFD98A), P(bx0 + Round(4*Sin(t*0.0021 + bk)), 33 + Round(3*Sin(t*0.0033 + bk*2)), 1, 1, Mod(Floor(t/90), 2) ? 0xFFF4F1E8 : 0xFF23263A)
+    }
+    ; ---- the forest, three depths, all the way round; bushes, rocks, mushrooms, a log ----
+    loop 52 {
+        k := A_Index
+        if (k <= 18)
+            tx0 := (k - 1)*8, ty0 := -3 + Mod(k, 3)*2, dp := Mod(k, 3)
+        else if (k <= 36)
+            tx0 := (k - 19)*8 + 4, ty0 := 90 + Mod(k, 3)*2, dp := Mod(k + 1, 3)
+        else if (k <= 44)
+            tx0 := -3 + Mod(k, 2)*3, ty0 := 4 + (k - 37)*11, dp := Mod(k, 3)
+        else
+            tx0 := 135 + Mod(k, 2)*3, ty0 := 2 + (k - 45)*11, dp := Mod(k + 2, 3)
+        sw := Round(Sin(t*0.0011 + k*1.3))
+        cD := (dp = 0) ? 0xFF2E7A45 : (dp = 1) ? 0xFF347F4A : 0xFF3A8A50
+        cL := (dp = 0) ? 0xFF4FA85C : (dp = 1) ? 0xFF5AB366 : 0xFF6FBF63
+        P(tx0 + 2, ty0 + 8, 6, 2, Alpha(0xFF1E3A2A, 70))
+        P(tx0 + 1 + sw, ty0 + 1, 7, 6, cD), P(tx0 + 2 + sw, ty0, 5, 8, cD)
+        P(tx0 + 2 + sw, ty0 + 1, 3, 2, cL), P(tx0 + 1 + sw, ty0 + 3, 2, 1, cL), P(tx0 + 5 + sw, ty0 + 4, 2, 1, Mix(cD, 0xFF000000, 0.2))
+    }
+    for bk, bs in [[14, 30], [122, 26], [6, 84], [122, 80], [76, 24], [84, 8]]
+        P(bs[1], bs[2] + 1, 5, 2, 0xFF3E8A48), P(bs[1] + 1, bs[2], 3, 1, 0xFF4FA85C), P(bs[1] + 1, bs[2] + 3, 3, 1, 0xFF2E7A45)
+    for rk, rs in [[58, 30], [110, 40], [26, 70]]
+        P(rs[1], rs[2], 3, 2, 0xFF8A8DA5), P(rs[1] + 1, rs[2], 1, 1, 0xFFB0B4C4), P(rs[1], rs[2] + 2, 3, 1, 0xFF5A5E78)
+    P(20, 24, 1, 1, 0xFFE8574A), P(19, 25, 3, 1, 0xFFE8574A), P(20, 26, 1, 1, 0xFFF4F1E8), P(134, 36, 1, 1, 0xFFE8574A), P(133, 37, 3, 1, 0xFFE8574A), P(134, 38, 1, 1, 0xFFF4F1E8)
+    P(6, 62, 8, 2, 0xFF6E4A34), P(6, 61, 8, 1, 0xFF8A6A4A), P(13, 61, 1, 3, 0xFF5A3E2E)
+    ; ---- the villagers, the farmer, the child, the couple; the deer, the rabbits, the chickens, the butterflies ----
+    ; the trunk path runs through the square, and the fountain sits in the
+    ; middle of it - so a walker crossing the square steps up onto the upper
+    ; cobbles and round it, rather than through the water
+    loop 2 {
+        k   := A_Index
+        px0 := Mod(t*(0.0028 + 0.0006*k) + k*60, 160) - 10
+        stp := Mod(Floor(t/190) + k, 2)
+        rnd := (px0 > 56 && px0 < 82) ? Clamp(Min(px0 - 56, 82 - px0)/5.0, 0.0, 1.0) : 0.0
+        wy  := 44 - Round(6*rnd)
+        P(px0, wy, 2, 2, (k = 1) ? 0xFF3A2E24 : 0xFFE9D5A8), P(px0, wy + 2, 2, 2, (k = 1) ? 0xFF3A4C8A : 0xFFB84A3A), P(px0 - stp, wy + 4, 1, 1, 0xFF23263A), P(px0 + 1 + stp, wy + 4, 1, 1, 0xFF23263A)
+    }
+    ; the one on the spur walks down to the square's edge and back - the
+    ; spur ends where the cobbles begin
+    vy0 := Mod(t*0.0022, 34)
+    vy0 := (vy0 > 17) ? 34 - vy0 : vy0
+    stp := Mod(Floor(t/190), 2)
+    P(68, 20 + Round(vy0), 2, 2, 0xFFD9B23E), P(68, 22 + Round(vy0), 2, 2, 0xFF6A4A8A), P(68 - stp, 24 + Round(vy0), 1, 1, 0xFF23263A), P(69 + stp, 24 + Round(vy0), 1, 1, 0xFF23263A)
+    fx0 := 112 + Round(12*Sin(t*0.0005))     ; the farmer keeps to the plot's own edge, off the stream
+    P(fx0, 80, 2, 1, 0xFFD9B23E), P(fx0, 81, 2, 1, 0xFFF1C9A2), P(fx0, 82, 2, 2, 0xFF4FA85C), P(fx0 - 1, 83, 1, 2, 0xFF5A3E2E), P(fx0 - Mod(Floor(t/200), 2), 84, 1, 1, 0xFF23263A), P(fx0 + 1 + Mod(Floor(t/200), 2), 84, 1, 1, 0xFF23263A)
+    cx0 := 40 + Round(10*Sin(t*0.0012)), cy0 := 46 + Mod(Floor(t/900), 2)
+    P(cx0, cy0, 1, 1, 0xFFF1C9A2), P(cx0, cy0 + 1, 1, 1, 0xFFE8574A), P(cx0, cy0 + 2, 1, 1, 0xFF23263A)
+    ; the deer walks the meadow strip between the bottom path and the forest
+    dx0 := 4 + Round(Mod(t*0.0012, 76)), dst := Mod(Floor(t/260), 2)
+    P(dx0, 90, 5, 2, 0xFFB8865A), P(dx0 + 5, 89, 2, 2, 0xFFB8865A), P(dx0 + 6, 87, 1, 2, 0xFF8A5A3A), P(dx0 + 5, 87, 1, 1, 0xFF8A5A3A), P(dx0 + dst, 92, 1, 1, 0xFF8A5A3A), P(dx0 + 4 - dst, 92, 1, 1, 0xFF8A5A3A), P(dx0 - 1, 90, 1, 1, 0xFFF4F1E8)
+    loop 2 {
+        k := A_Index
+        hp := Mod(t*0.0011 + k*0.5, 1.0)
+        hx0 := ((k = 1) ? 8 : 100) + Round(hp*8), hy0 := ((k = 1) ? 66 : 40) - Round(Sin(hp*3.14159)*2)
+        P(hx0, hy0, 2, 1, 0xFFE9D5A8), P(hx0 + 1, hy0 - 1, 1, 1, 0xFFE9D5A8), P(hx0 - 1, hy0, 1, 1, 0xFFF4F1E8)
+    }
+    loop 3 {
+        k  := A_Index
+        pk := (Mod(t + k*300, 1100) < 550)
+        cx0 := 8 + k*4 + Round(Sin(t*0.0005 + k)*2), cy0 := 36 + Mod(k, 2)
+        P(cx0, cy0, 2, 1, 0xFFF4F1E8), P(cx0 + 2, cy0 - (pk ? 0 : 1), 1, 1, 0xFFF4F1E8), P(cx0 + 1, cy0 - 1, 1, 1, 0xFFE8574A), P(cx0 + 3, cy0 - (pk ? 0 : 1), 1, 1, 0xFFE8A64A)
+    }
+    loop 2 {
+        k := A_Index
+        bfx := 20 + k*50 + Round(20*Sin(t*0.0006 + k)), bfy := 66 + Round(6*Sin(t*0.0017 + k*2))
+        c := Mod(Floor(t/160) + k, 2) ? ((k = 1) ? 0xFFFFE08A : 0xFFB9DCF2) : ((k = 1) ? 0xFFF2A24A : 0xFF7FB7E0)
+        P(bfx - 1, bfy, 1, 1, c), P(bfx + 1, bfy, 1, 1, c)
+    }
+    ; the shadows of birds, crossing fast
+    loop 3 {
+        k := A_Index
+        P(Mod(t*0.03 + k*40, 170) - 15, 30 + k*14, 2, 1, Alpha(0xFF1E3A2A, 60)), P(Mod(t*0.03 + k*40, 170) - 14, 29 + k*14, 1, 1, Alpha(0xFF1E3A2A, 60))
+    }
+}
+
+; ---- the pixel cafe ----
+; The signature card's scene on the CREDITS page: a cafe, drawn on a 57 x 14
+; grid of 3-px cells as flat squares, so it reads as pixel art on a surface
+; that is otherwise all curves. Two contributors in it - the barista behind
+; the counter, the customer on the stool - because that is what the caption
+; under it says. Everything that moves moves on DecT(now): steam off the cup,
+; the barista's bob and blink, the sign's two bulbs, the cat's tail, a star in
+; the window, the lamp's breathing glow - so LOW PERFORMANCE MODE gets a still
+; of the whole scene, not a hole where it was.
+;
+; Accent-tinted throughout and drawn with the themed primitives, so the six
+; accents each get their own cafe and the light theme gets ink where the dark
+; one has light; the one near-white - eyes and steam - is the UI neutral the
+; classifier turns to ink on paper. About sixty fills a frame: cheaper than
+; the signature and its travelling spark it replaces.
+CafeDraw(ox, oy, acc, f, now) {
+    cs := 3.0
+    t  := DecT(now)
+    hi := AccHi(acc, 0.5)
+    ; a cell, in grid units
+    Px(x, y, w, h, b) => FillRR(ox + x*cs, oy + y*cs, w*cs, h*cs, 0, b)
+    bF := SBrush(FA(Alpha(acc, 55), f))            ; floor, frames, the dim structure
+    bC := SBrush(FA(Alpha(acc, 95), f))            ; the counter, bodies
+    bT := SBrush(FA(Alpha(acc, 170), f))           ; edges, the sign, the cup
+    bH := SBrush(FA(Alpha(hi, 235), f))            ; highlights
+    bI := SBrush(FA(Alpha(0xFFE8EAF6, 215), f))    ; ink: eyes and steam
+    ; ---- the room ----
+    loop 15                                        ; a tiled floor
+        Px((A_Index - 1)*4, 13, 2, 1, bF)
+    gl := 0.55 + 0.45*Sin(t*0.0028)                ; the lamp breathes
+    Px(8, 0, 1, 2, bT), Px(6, 2, 5, 1, bT), Px(8, 3, 1, 1, bH)
+    bG := SBrush(FA(Alpha(hi, Round(10 + 16*gl)), f))
+    Px(5, 3, 7, 5, bG), DelB(bG)
+    ; the window: a frame, a mullion, a moon and two stars that take turns
+    Px(33, 3, 7, 1, bT), Px(33, 9, 7, 1, bT), Px(33, 3, 1, 7, bT), Px(39, 3, 1, 7, bT)
+    Px(34, 4, 5, 5, bF), Px(36, 4, 1, 5, bT), Px(34, 6, 5, 1, bT)
+    Px(37, 5, 1, 1, bH)
+    tw := 0.5 + 0.5*Sin(t*0.0037)
+    bS := SBrush(FA(Alpha(hi, Round(60 + 170*tw)), f)),        Px(35, 7, 1, 1, bS), DelB(bS)
+    bS := SBrush(FA(Alpha(hi, Round(60 + 170*(1 - tw))), f)),  Px(38, 8, 1, 1, bS), DelB(bS)
+    ; the hanging sign: chains, a plate, a cup on it, two bulbs that alternate
+    Px(44, 0, 1, 2, bF), Px(48, 0, 1, 2, bF)
+    Px(42, 2, 9, 4, bC)
+    Px(42, 2, 9, 1, bT), Px(42, 5, 9, 1, bT), Px(42, 2, 1, 4, bT), Px(50, 2, 1, 4, bT)
+    Px(45, 3, 3, 2, bH), Px(48, 3, 1, 1, bH)
+    on1 := (Mod(t, 1000) < 500)
+    Px(43, 3, 1, 2, on1 ? bH : bF), Px(49, 3, 1, 2, on1 ? bF : bH)
+    ; ---- the counter, and what is on it ----
+    Px(4, 9, 28, 1, bT), Px(4, 10, 28, 3, bC), Px(4, 12, 28, 1, bF)
+    Px(22, 7, 3, 2, bT), Px(25, 7, 1, 1, bT), Px(23, 7, 1, 1, bH)    ; the cup, its handle, the coffee
+    Px(28, 8, 2, 1, bT), Px(28, 6, 1, 1, bH), Px(29, 5, 1, 2, bH), Px(30, 6, 1, 1, bH)   ; a plant
+    loop 3 {                                       ; steam: three pixels rising in turn
+        k  := A_Index
+        ph := Mod(t*0.0011 + k*0.33, 1.0)
+        sy := 6 - Round(ph*5)
+        sx := 23 + Round(Sin(ph*6.28 + k*2)*0.7)
+        bW := SBrush(FA(Alpha(0xFFE8EAF6, Round(200*(1 - ph))), f))
+        Px(sx, sy, 1, 1, bW), DelB(bW)
+    }
+    ; ---- the two of them ----
+    bob   := (Mod(t, 1400) < 700) ? 0 : 1          ; the barista, working
+    blink := (Mod(t, 3200) < 140)
+    Px(14, 6 + bob, 5, 3, bC), Px(14, 1 + bob, 5, 1, bH), Px(14, 2 + bob, 5, 3, bT)
+    if !blink
+        Px(15, 3 + bob, 1, 1, bI), Px(17, 3 + bob, 1, 1, bI)
+    Px(18, 8, 2, 1, bC)                            ; a hand on the counter
+    blk2 := (Mod(t + 1700, 3200) < 140)            ; the customer, on the stool, facing the counter
+    Px(1, 11, 3, 1, bT), Px(2, 12, 1, 1, bF)
+    Px(0, 6, 4, 3, bC), Px(1, 2, 3, 1, bH), Px(1, 3, 3, 3, bT), Px(3, 8, 1, 1, bC)
+    if !blk2
+        Px(3, 4, 1, 1, bI)
+    ; ---- the cat, by the door ----
+    tail := (Mod(t, 800) < 400)
+    Px(49, 11, 5, 2, bT), Px(53, 10, 2, 2, bT), Px(53, 9, 1, 1, bT), Px(55, 9, 1, 1, bT), Px(54, 10, 1, 1, bH)
+    if tail
+        Px(48, 10, 1, 1, bT), Px(47, 9, 1, 1, bT)
+    else
+        Px(48, 11, 1, 1, bT), Px(47, 11, 1, 1, bT)
+    DelB(bF), DelB(bC), DelB(bT), DelB(bH), DelB(bI)
+}
 Doodle(kind, dx, dy, sc, col, f, now, ph) {
     ; LOW PERFORMANCE MODE: no doodles - little drawn ornaments, nothing more
     if hubLowPerf
