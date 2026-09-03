@@ -52335,8 +52335,15 @@ PanelBackdropDark(x, y, w, h, acc, f, now, k) {
 ; screen while the boot queues (place stats, icons, every game's thumbnail
 ; reel) are still draining. The pumps ask this before each spawn or decode
 ; and wait a tick when it says so; nothing they fetch is needed mid-drag.
-DragBusy() => gateDrag || (IsObject(HL) && HL.drag) || dragOn
-           || (IsObject(PZO) && PZO.HasOwnProp("dragOn") && PZO.dragOn)
+DragBusy() {
+    global gateDrag, dragOn
+    if !IsSet(gateDrag)
+        gateDrag := 0
+    if !IsSet(dragOn)
+        dragOn := 0
+    return gateDrag || (IsObject(HL) && HL.drag) || dragOn
+        || (IsObject(PZO) && PZO.HasOwnProp("dragOn") && PZO.dragOn)
+}
 
 ; ---- a soft radial glow ----
 ; GDI+ path gradients are expensive to build every frame; n rings of the same
