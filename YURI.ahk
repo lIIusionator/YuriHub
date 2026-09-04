@@ -10,7 +10,7 @@
 ;@Ahk2Exe-SetDescription   YURI - Control Suite
 ;@Ahk2Exe-SetProductName   YURI
 ;@Ahk2Exe-SetCompanyName   YURI
-;@Ahk2Exe-SetVersion       1.0.1.0
+;@Ahk2Exe-SetVersion       1.0.2.0
 ;@Ahk2Exe-SetCopyright     YURI
 ;@Ahk2Exe-SetOrigFilename  YURI.exe
 ;;@Ahk2Exe-SetMainIcon     YURI.ico
@@ -24,8 +24,8 @@
 ; version; the compiled updater installs a downloaded YURI.exe only if that is
 ; higher than the running one. ZVER, lower down, is built from these two, so
 ; the badge the hub draws can never disagree with the number the updater uses.
-global APP_VERSION := "1.0.1"
-global APP_STAGE   := "BETA"    ; follows the number on every badge; "" once it is not a beta
+global APP_VERSION := "1.0.2"
+global APP_STAGE   := ""         ; stable release
 ; -----------------------------------------------------------------------------
 
 ; ============================================================================
@@ -3090,6 +3090,7 @@ FFM.raSkipN  := Map()      ; flag name -> current backoff length
 ; wholesale whenever raKey changes, which is exactly when it stops being valid.
 FFM.raVP     := Map()
 FFM.raSaidAt := 0          ; last drift toast, so a losing fight is not spam
+FFM.raQuiet  := 0          ; ticks in a row that found nothing to put back - see FFMReApplyIdle
 FFM.raHeld   := 0          ; flags confirmed at their wanted value last tick
 ; last known "list|mask" identity of Roblox's flag table, so FFMPoll can spot
 ; the table being rebuilt WITHOUT the pid changing (an in-place teleport to
@@ -5661,8 +5662,39 @@ FFMReApplyArm(ms) {
 }
 ; Something moved - go fast for a while.
 FFMReApplyBurst() {
-    FFM.raBurst := FFM_RA_BURSTN
+    FFM.raBurst := FFM_RA_BURSTN, FFM.raQuiet := 0
     FFMReApplyArm(FFM_RA_BURST)
+}
+; ---- the idle rate, by how quiet it has been ----
+; A tick that finds nothing to put back is evidence the next one will not
+; either. Five quiet ticks earn a three-second idle, fifteen earn five - and
+; the first drift, rebuild or burst puts it straight back to two. What makes
+; the longer idles safe is that a rebuild is no longer something only this
+; tick can notice: the poll peeks the table header every 1.2 s and calls a
+; burst the moment the identity changes, so a teleport is caught at the
+; poll's rate however long the idle has grown.
+FFMReApplyIdle() => (FFM.raQuiet < 5) ? FFM_RA_IDLE : (FFM.raQuiet < 15) ? 3000 : 5000
+
+; ---- reads by the page, not by the flag ----
+; The values RE-APPLY checks are the flags' static storage, and static storage
+; is laid out together: a hundred held flags usually sit on a handful of
+; pages. A ReadProcessMemory costs the same for four bytes as for four
+; thousand, so a tick now reads each page it touches once, into a cache that
+; lives for that tick, and takes every flag's bytes out of the buffer. A
+; value that straddles a page edge, or sits on a page that will not read as
+; a whole, is read on its own, the old way - the answer is the same either
+; way, only the count of calls changes. The read-back after a write stays a
+; direct read: it has to see what the write just did.
+FFMPageVal(pages, vp, w) {
+    pg := vp - Mod(vp, 4096)
+    if (vp + w > pg + 4096)
+        return MemIO.ReadChk(vp, w)
+    if !pages.Has(pg)
+        pages[pg] := (buf := MemIO.Read(pg, 4096)) ? buf : 0
+    buf := pages[pg]
+    if !buf
+        return MemIO.ReadChk(vp, w)
+    return (w = 1) ? NumGet(buf, vp - pg, "UChar") : NumGet(buf, vp - pg, "Int")
 }
 
 ; ---- which clients RE-APPLY is responsible for ----
@@ -5810,7 +5842,7 @@ FFMReApplyRun() {
             FFMLog("ReApply", "-", "flag table rebuilt - holding at " FFM_RA_BURST "ms")
             FFM.raBurst := FFM_RA_BURSTN
         }
-        FFM.raKey := key
+        FFM.raKey := key, FFM.raQuiet := 0
         ; counters describe the old table; they mean nothing against a new one,
         ; and the cached value pointers point into a table that no longer exists
         FFM.raDrift := Map(), FFM.raStuck := Map()
@@ -5825,6 +5857,7 @@ FFMReApplyRun() {
         ; fallback were never re-applied either.
         idx := FlagSingleton.Index(hdr)
         restored := 0, held := 0, stuck := 0, worst := "", worstN := 0
+        pages := Map()                          ; this tick's page cache - see FFMPageVal
         for fl in FFM.flags {
             if (!FFMSameProc(hp0, pid0))
                 break                           ; process swapped under us
@@ -5860,7 +5893,7 @@ FFMReApplyRun() {
             if (!vp)
                 continue
             w   := FFMWidthOf(nm)
-            cur := MemIO.ReadChk(vp, w)
+            cur := FFMPageVal(pages, vp, w)
             if (cur = "")
                 continue                        ; unreadable - do not guess at it
             if (cur = dv) {
@@ -5936,9 +5969,12 @@ FFMReApplyRun() {
         ; waves, so dropping to idle on the first quiet tick would just miss the
         ; next wave and start the whole cycle again.
         if (restored || stuck)
-            FFM.raBurst := FFM_RA_BURSTN
-        else if (FFM.raBurst > 0)
-            FFM.raBurst--
+            FFM.raBurst := FFM_RA_BURSTN, FFM.raQuiet := 0
+        else {
+            if (FFM.raBurst > 0)
+                FFM.raBurst--
+            FFM.raQuiet++
+        }
 
         ; ---- reporting ----
         ; Coalesced. The old code toasted on every tick that restored anything,
@@ -5962,7 +5998,7 @@ FFMReApplyRun() {
         }
     } finally {
         FFM.busy := 0
-        FFMReApplyArm(FFM.raBurst > 0 ? FFM_RA_BURST : FFM_RA_IDLE)
+        FFMReApplyArm(FFM.raBurst > 0 ? FFM_RA_BURST : FFMReApplyIdle())
     }
 }
 
@@ -7692,16 +7728,16 @@ FFMPoll() {
             SetTimer(() => FFMAutoInjectFire(gen2, fresh), -4000)
         }
     }
-    if (pid && FFM.flags.Length && !ffReApply && !FFM.busy
+    if (pid && FFM.flags.Length && !FFM.busy
             && MemIO.hProcess && MemIO.IsAlive()) {
         ; Same pid, nothing else changed - but Roblox can rebuild its internal
         ; flag table WITHOUT restarting the exe (an in-place teleport to
         ; another place or server keeps the process alive). That rebuild
         ; silently resets every value this module already wrote, and nothing
-        ; above would ever notice since the pid never moves. RE-APPLY already
-        ; reacts to this on its own 2s tick - Index() rebuilds against the
-        ; fresh table and rewrites whatever drifted - so this only needs to
-        ; run when RE-APPLY is off.
+        ; above would ever notice since the pid never moves. With RE-APPLY on
+        ; this used to be left to its own tick; now its idle can stretch to
+        ; five seconds while things are quiet, so the rebuild is caught HERE,
+        ; at the poll's rate, and answered with a burst - see FFMReApplyIdle.
         ; PeekHeader, NOT ReadHeader: this runs every 1.2 s, and ReadHeader
         ; falls through to a full image scan whenever the singleton is not
         ; resolved yet, which would peg a core for the whole of Roblox's
@@ -7714,6 +7750,8 @@ FFMPoll() {
                 if ffAutoInject {
                     FFMSay("FLAG TABLE REBUILT - RE-INJECTING", 0xFFFBBF24)
                     SetTimer(() => FFMAutoInjectFire(gen), -4000)
+                } else if (ffReApply && FFM.orig.Count) {
+                    FFMSay("FLAG TABLE REBUILT - RE-APPLY IS HOLDING", 0xFFFBBF24)
                 } else {
                     FFMSay("FLAG TABLE REBUILT - INJECT AGAIN IF NEEDED", 0xFFFBBF24)
                 }
@@ -15953,13 +15991,14 @@ TutBuild() {
                , "CREDITS and UPDATE LOGS are what they say. Click an entry to"
                , "switch; the page slides across."]})
     st.Push({tab: 1, mod: -1, ttl: "THE HEART", cur: 1, glyph: "brand", kick: "SIDEBAR"
-        , anchor: () => [HL.sbx + 6, HubNavY(6) + HL.nvh + 13, HL.sbw - 2, 82]
+        , anchor: () => [HL.sbx + 6, HubNavY(6) + HL.nvh + 13, HL.sbw - 2, 96]
         , body: ["The heart under the list is a seventh page. Press it and the"
                , "hub opens TOWN: three small pixel towns, picked from the chips"
                , "in the title row - a skyline on its own two-minute day, a city"
-               , "street, a village from above - each of them alive, none of"
-               , "them for anything but looking at. Press the heart again, or"
-               , "any entry above it, to come back."]})
+               , "street, a village from above. Sparks appear in them now and"
+               , "then; take one and the town grows - five levels each, kept for"
+               , "good. Press the heart again, or any entry above it, to come"
+               , "back."]})
     st.Push({tab: 1, mod: -1, ttl: "WINDOW CONTROLS", cur: 0, glyph: "grip"
         , anchor: () => [HL.brx + 60, HL.pd + 6, HL.bcx - HL.brx - 46, 32]
         , body: ["The six-dot grip is the only place the hub can be dragged from -"
@@ -16427,10 +16466,20 @@ TutPanelH() => Max(160, HL.pd + HL.ch - 34 - HL.aby)
 ; value: the light eases on its own, and easing towards a moving target makes
 ; it trail the row it is meant to be over. Each covers rows a through b, at
 ; the row's own hover plate (six in from the panel edge) plus two of air.
-TutFFRows(a, b)  => [HL.abx + 6, HL.aby + FFMSysRowY(a) - FFM.sysScrT - 2, HL.abw - 12, FFMSysRowY(b) - FFMSysRowY(a) + 40]
-TutCurRows(a, b) => [HL.abx + 6, HL.aby + 12 + (a - 1)*HL.ffrg - CSR.scrT - 2, HL.abw - 12, (b - a)*HL.ffrg + 40]
-TutRSRows(a, b)  => [HL.abx + 6, HL.aby + RSetRowY(a) - RSET.scrT - 2, HL.abw - 12, RSetRowY(b) - RSetRowY(a) + HL.rsrh + 4]
-TutSPFRows(a, b) => [HL.abx + 6, HL.aby + SPFSysRowY(a) - SPF.sysScrT - 2, HL.abw - 12, SPFSysRowY(b) - SPFSysRowY(a) + HL.spfrh + 4]
+TutFFRows(a, b)  => TutBand([HL.abx + 6, HL.aby + FFMSysRowY(a) - FFM.sysScrT - 2, HL.abw - 12, FFMSysRowY(b) - FFMSysRowY(a) + 40], HL.aby + 4, HL.aby + HL.ffh - 4)
+TutCurRows(a, b) => TutBand([HL.abx + 6, HL.aby + 12 + (a - 1)*HL.ffrg - CSR.scrT - 2, HL.abw - 12, (b - a)*HL.ffrg + 40], HL.aby + 4, HL.aby + HL.ffh - 4)
+TutRSRows(a, b)  => TutBand([HL.abx + 6, HL.aby + RSetRowY(a) - RSET.scrT - 2, HL.abw - 12, RSetRowY(b) - RSetRowY(a) + HL.rsrh + 4], HL.aby + 4, HL.aby + HL.ffh - 4)
+TutSPFRows(a, b) => TutBand([HL.abx + 6, HL.aby + SPFSysRowY(a) - SPF.sysScrT - 2, HL.abw - 12, SPFSysRowY(b) - SPFSysRowY(a) + HL.spfrh + 4], HL.aby + 8, HL.aby + 10 + SPFSysVis())
+; A row light kept inside its panel's visible band. The lists' scroll targets
+; are the tour's while it runs (the wheel is off - see HubWheel), but a light
+; that follows a scroll must still never be drawn where the panel would clip
+; the row: whatever moves the list, the light stops at the panel's edge.
+TutBand(r, top, bot) {
+    y0 := Max(r[2], top), y1 := Min(r[2] + r[4], bot)
+    if (y1 - y0 < 8)
+        return [r[1], (y0 < bot) ? y0 : bot - 8, r[3], 8]
+    return [r[1], y0, r[3], y1 - y0]
+}
 TutDOPRows(a, b) => [HL.abx + 6, HL.aby + DOPRowY(a) - 2, HL.abw - 12, DOPRowY(b) - DOPRowY(a) + DOP_RH + 4]
 ; a CLIENT SETTINGS row by its key, so a row added above one does not move
 ; the light off it
@@ -16817,11 +16866,15 @@ TutDraw(now, acc) {
     settled := !hasHole || (Abs(hx - tx) < 3 && Abs(hy - ty) < 3 && Abs(hw - tw) < 4 && Abs(hh - th) < 4)
 
     ; ---- the scrim, with the spotlight cut out of it ----
-    ; One path, two figures, alternate fill: the whole window, and the rounded
-    ; hole - so the fill covers everything but the hole in one operation.
+    ; One path, two figures, alternate fill: the window's plate, and the
+    ; rounded hole - so the fill covers everything but the hole in one
+    ; operation. The plate figure is the plate's own rounded shape (radius 20,
+    ; the one HubRender fills), not a rectangle: a rectangle painted the four
+    ; corners the plate leaves transparent, and the dimming showed as dark
+    ; squares standing off the hub's rounded edge.
     px := HL.pd, py := HL.pd, pw := HL.cw, ph := HL.ch
     DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &sp := 0)    ; FillModeAlternate
-    DllCall("gdiplus\GdipAddPathRectangle", "ptr", sp, "float", px, "float", py, "float", pw, "float", ph)
+    RRInto(sp, px, py, pw, ph, 20)
     if hasHole {
         hp := RRPath(hx, hy, hw, hh, 12)
         DllCall("gdiplus\GdipAddPathPath", "ptr", sp, "ptr", hp, "int", 0)
@@ -16832,8 +16885,7 @@ TutDraw(now, acc) {
     DllCall("gdiplus\GdipDeletePath", "ptr", sp)
 
     if hasHole {
-        ; the ring around the light: breathing, with the four corner ticks the
-        ; hub's cards wear, and a soft outer bloom
+        ; the ring around the light: breathing, with a soft outer bloom
         brth := (Sin(DecT(now)*0.0035) + 1)/2
         SoftGlow(hx + hw/2, hy + hh/2, hw/2 + 40, hh/2 + 40, acc, Round((44 + 20*brth)*f), 1.0, 5)
         pn := Pen(FA(Alpha(acc, Round(150 + 70*brth)), f), 1.6)
@@ -16853,13 +16905,6 @@ TutDraw(now, acc) {
             pn := Pen(FA(Alpha(AccHi(acc, 0.7), Round(230*fl)), f), 2.5)
             StrokeRR(hx - 1, hy - 1, hw + 2, hh + 2, 13, pn), DelP(pn)
         }
-        pn := Pen(FA(Alpha(AccHi(acc, 0.5), 230), f), 2)
-        tk := 12
-        Line(hx - 6, hy + tk, hx - 6, hy - 6, pn), Line(hx - 6, hy - 6, hx + tk, hy - 6, pn)
-        Line(hx + hw - tk, hy - 6, hx + hw + 6, hy - 6, pn), Line(hx + hw + 6, hy - 6, hx + hw + 6, hy + tk, pn)
-        Line(hx - 6, hy + hh - tk, hx - 6, hy + hh + 6, pn), Line(hx - 6, hy + hh + 6, hx + tk, hy + hh + 6, pn)
-        Line(hx + hw - tk, hy + hh + 6, hx + hw + 6, hy + hh + 6, pn), Line(hx + hw + 6, hy + hh + 6, hx + hw + 6, hy + hh - tk, pn)
-        DelP(pn)
     }
 
     ; ---- the card ----
@@ -16880,35 +16925,45 @@ TutDraw(now, acc) {
     ; the light's centre is not in - and that is the sheet - so the step
     ; lights the sheet's header and pins the card under it, leaving the
     ; header and the upper part of the sheet in view.
+    ; ---- placed against where the light is GOING, not where it is ----
+    ; The light eases from the last step's rectangle to this one's over a
+    ; dozen frames, and this block used to be evaluated against the light's
+    ; position in each of them. Half-way across the window the rules below
+    ; answer differently - room under it, then beside it, then the other
+    ; half - so the card's destination changed frame by frame and the card
+    ; set off after every one of them, wandering the window before the light
+    ; came to rest and the answer stopped changing. Against the target
+    ; rectangle the answer is the same on the step's first frame as on its
+    ; last, and the card makes one journey.
     pin := st.HasOwnProp("card") ? st.card : ""
     if (hasHole && pin = "") {
-        below := hy + hh + 16 + (96 + 6*17 + 76) <= py + ph - 12
-        above := hy - 16 - (96 + 6*17 + 76) >= py + 12
-        rightR := hx + hw + 16 + cw <= px + pw - 12
-        leftR  := hx - 16 - cw >= px + 12
-        if (!below && !above && !rightR && !leftR && hx - 16 - 300 >= px + 12)
-            cw := hx - 16 - (px + 12)
+        below := ty + th + 16 + (96 + 6*17 + 76) <= py + ph - 12
+        above := ty - 16 - (96 + 6*17 + 76) >= py + 12
+        rightR := tx + tw + 16 + cw <= px + pw - 12
+        leftR  := tx - 16 - cw >= px + 12
+        if (!below && !above && !rightR && !leftR && tx - 16 - 300 >= px + 12)
+            cw := tx - 16 - (px + 12)
     }
     TUT.cwCur := cw
     lines := TutLines(st, cw - 40)
     ch := 96 + lines.Length*17 + 76
     if hasHole {
-        cxT := Clamp(hx + hw/2 - cw/2, px + 12, px + pw - cw - 12)
+        cxT := Clamp(tx + tw/2 - cw/2, px + 12, px + pw - cw - 12)
         if (pin = "bot")
             cyT := py + ph - ch - 12
         else if (pin = "top")
             cyT := py + 12
-        else if (hy + hh + 16 + ch <= py + ph - 12)
-            cyT := hy + hh + 16
-        else if (hy - 16 - ch >= py + 12)
-            cyT := hy - 16 - ch
-        else if (hx + hw + 16 + cw <= px + pw - 12) {
-            cyT := Clamp(hy + hh/2 - ch/2, py + 12, py + ph - ch - 12), cxT := hx + hw + 16
-        } else if (hx - 16 - cw >= px + 12) {
-            cyT := Clamp(hy + hh/2 - ch/2, py + 12, py + ph - ch - 12), cxT := hx - 16 - cw
+        else if (ty + th + 16 + ch <= py + ph - 12)
+            cyT := ty + th + 16
+        else if (ty - 16 - ch >= py + 12)
+            cyT := ty - 16 - ch
+        else if (tx + tw + 16 + cw <= px + pw - 12) {
+            cyT := Clamp(ty + th/2 - ch/2, py + 12, py + ph - ch - 12), cxT := tx + tw + 16
+        } else if (tx - 16 - cw >= px + 12) {
+            cyT := Clamp(ty + th/2 - ch/2, py + 12, py + ph - ch - 12), cxT := tx - 16 - cw
         } else
             ; no room on any side even narrowed: the other half of the window
-            cyT := (hy + hh/2 < py + ph/2) ? py + ph - ch - 12 : py + 12
+            cyT := (ty + th/2 < py + ph/2) ? py + ph - ch - 12 : py + 12
     } else
         cxT := px + pw/2 - cw/2, cyT := py + ph/2 - ch/2
     if !TUT.cInit {
@@ -17079,7 +17134,7 @@ TutDraw(now, acc) {
         tt := Clamp((now - TUT.curAt)/(TUT_CUR_MS + 0.0), 0.0, 1.0)
         et := Ease3(tt)
         x0 := cx + cw - 55, y0 := by + 13
-        x1 := hx + hw/2, y1 := hy + hh/2
+        x1 := tx + tw/2, y1 := ty + th/2       ; the light's destination, like the card
         ; a quadratic arc, bulging away from the straight line
         mx := (x0 + x1)/2 + (y0 - y1)*0.25, my := (y0 + y1)/2 + (x1 - x0)*0.25
         gx := (1 - et)**2*x0 + 2*(1 - et)*et*mx + et**2*x1
@@ -18535,8 +18590,11 @@ FFMDetail(i) {
         . "code. Turn it off if injection starts failing after an update."
     b3 := "Roblox rewrites some flags back to their defaults while you play. "
         . "This checks every two seconds - faster for a few seconds after a "
-        . "teleport rebuilds the table - and rewrites any flag YOU INJECTED "
-        . "that has drifted, so those values stay where you put them. It "
+        . "teleport rebuilds the table, and easing out to five while nothing "
+        . "has moved for a while - and rewrites any flag YOU INJECTED that "
+        . "has drifted, so those values stay where you put them. A check reads "
+        . "the flags' memory a page at a time, so a hundred held flags cost a "
+        . "handful of reads, not a hundred. It "
         . "never injects on its own: a client you have not pressed INJECT on "
         . "keeps Roblox's values with this switched on, and a flag added to "
         . "the list after the last INJECT is not touched until you inject "
@@ -34625,6 +34683,30 @@ try hubLowPerf := Integer(IniRead(iniPath, "hub", "lowperf", "0"))
 ; its header and kept across launches
 global hubTown := 1
 try hubTown := Clamp(Integer(IniRead(iniPath, "hub", "town", "1")), 1, 3)
+; ---- the sparks ----
+; The towns' small game. A spark - a point of light - appears somewhere in
+; the town every so often, bobbing, and a click on it takes it: a burst, a
+; +1, and one more towards the next level. Each town keeps its own count,
+; across launches, and every level a town reaches adds something to it for
+; good: bunting, a ferris wheel, a lighthouse, a blimp, fireworks on the
+; skyline; kites, a food truck, a tram, a rooftop party, a parade on the
+; street; sheep, a windmill, a carousel, a balloon, a festival in the village.
+; Five levels a town, at the counts in TW_LV. Nothing is lost by ignoring it:
+; a town with no sparks taken is the town as it was.
+global TW := {n: [0, 0, 0], sx: 0, sy: 0, at: 0, next: 0, last: 0, kind: 1
+            , burstAt: 0, bx: 0, by: 0, plusAt: 0, plusN: 1, lvAt: 0, lvNew: 0, barE: 0.0, barK: 0}
+; ---- worth ----
+; A spark is one. Taken inside its first eight seconds it is two - a spark
+; noticed is worth more than a spark left waiting. A comet - the rarer kind,
+; one spawn in five, that crosses the scene on an arc with a tail and is gone
+; in seven seconds if nobody catches it - is three. The +N says which.
+global TW_LV  := [3, 8, 15, 25, 40]
+global TW_REW := [["bunting between the lamps", "a ferris wheel", "a lighthouse", "a blimp", "fireworks all night"]
+                , ["kites over the roofs", "a food truck", "a tram", "a rooftop party", "a parade"]
+                , ["sheep in the meadow", "a windmill", "a carousel", "a balloon", "a festival"]]
+loop 3
+    try TW.n[A_Index] := Max(0, Integer(IniRead(iniPath, "town", "n" A_Index, "0")))
+TW.next := A_TickCount + 4000
 try hubTop     := Integer(IniRead(iniPath, "hub", "ontop",   "1"))
 try hubTrueMin := Integer(IniRead(iniPath, "hub", "truemin", "0"))
 try hubAutoUpd := Integer(IniRead(iniPath, "hub", "autoupdate", "0"))
@@ -34648,7 +34730,7 @@ global profName := "USERNAME", profBio := "EMPTY BIO", profRing := 1, profFontI 
 ; index 1, which is a bundled image and not "their" picture.
 global profPicSet := 0
 global PFONTS := ["Segoe UI", "Bahnschrift", "Consolas", "Georgia", "Trebuchet MS", "Candara", "Cambria", "Impact"]
-; ---- v1.0.1 ----
+; ---- v1.0.2 ----
 ; The release list: everything the hub ships with, page by page in the
 ; order the sidebar and the module rail present them, the flag manager last
 ; so the dashboard's WHAT'S NEW - which shows the tail of this list - opens
@@ -34657,6 +34739,9 @@ global PFONTS := ["Segoe UI", "Bahnschrift", "Consolas", "Georgia", "Trebuchet M
 ; a line under ~55 characters: both the dashboard card and the UPDATE LOGS
 ; list elide past that.
 global CHANGELOG := [["+", "the hub: dashboard, sidebar, seven pages"]
+    , ["+", "fast menu for quick access to hub actions"]
+    , ["+", "easter egg mini-game in the living towns"]
+    , ["+", "credits: ZEAL main contributor, lIIusionator collaborator"]
     , ["+", "launch gate - OPEN ROBLOX, OPEN HUB, ACCOUNTS"]
     , ["+", "profile - picture, ring, name, bio, hub font"]
     , ["+", "gallery - your pictures on the gate and the logs"]
@@ -34677,6 +34762,7 @@ global CHANGELOG := [["+", "the hub: dashboard, sidebar, seven pages"]
     , ["+", "MAIN STREET - a city street, side on, in summer"]
     , ["+", "GREENVALE - a village from above, forest round it"]
     , ["+", "the towns keep the real time; fireworks on the hour"]
+    , ["+", "sparks - take them, and the towns grow, five levels each"]
     , ["+", "SCRIPT HUB - write, paste, load, CHECK, PLACE .ahk"]
     , ["+", "editor tabs, saved-script library, export .AHK / .TXT"]
     , ["+", "placed cards - portrait, ENABLE / STOP, EDIT, v1 + v2"]
@@ -37457,7 +37543,7 @@ HubOpen() {
     HL.ceVis := Max(3, Floor((HL.ceH - 16)/15))
     HL.h := Map()
     HL.hz := [1, 2, 5, 6, 7, 9, 10, 47, 50, 53, 54, 69, 60, 61, 62, 63, 64, 65, 66, 67, 205
-        , 20, 21, 22, 23, 24, 25, 31, 32, 33, 34, 35, 36, 37, 40, 41, 42, 248, 249, 2221, 2222, 2223
+        , 20, 21, 22, 23, 24, 25, 31, 32, 33, 34, 35, 36, 37, 40, 41, 42, 248, 249, 2221, 2222, 2223, 2225
         , 43, 44, 45, 46, 48, 49, 68
         ; Splitting a row into "control" and "the rest" means TWO zones per
         ; row, and a zone that is not registered here never gets a hover value
@@ -37767,6 +37853,12 @@ HubZone(sx, sy) {
     hcx0 := HL.sbx + HL.sbw/2 + 5, hcy0 := HubNavY(6) + HL.nvh + 53
     if ((ux - hcx0)**2 + ((uy - hcy0)*1.1)**2 <= 1296)
         return 37
+    ; the spark, when one is out - a generous circle, it is small and it bobs
+    if (hubTab = 7 && TW.at) {
+        TownSparkXY(&spX, &spY)
+        if ((ux - spX)**2 + (uy - spY)**2 <= 196)
+            return 2225
+    }
     ; the three town chips in TOWN's header - the rectangles TownChips draws
     if (hubTab = 7 && uy >= HL.cty - 3 && uy <= HL.cty + 21) {
         loop 3 {
@@ -38280,6 +38372,8 @@ HubClick(wParam, lParam, msg, hwnd) {
         FFM.clickAt[z] := A_TickCount
         TownPick(z - 2220)
     }
+    else if (z = 2225)
+        TownCollect()
     else if (z = 1220 || z = 1221) {
         FFM.clickAt[z] := A_TickCount
         HubCredWho(z = 1220 ? 1 : 2)
@@ -38587,10 +38681,18 @@ HubClick(wParam, lParam, msg, hwnd) {
     else if z >= 91 && z <= 96
         ScrDelete(z - 90)
     else if z >= 101 && z <= 106 {
+        ; Opened INLINE, the way the two avatar paths are (zones 7 and 131),
+        ; not through the priority -20 one-shot it used to be handed to. That
+        ; timer can only run in a gap between render frames, and on this tab
+        ; there often is none: a focused editor or a drifting hover keeps
+        ; HubRender re-arming at TICK_A, and a frame that takes about as long
+        ; as the tick leaves the -10 render thread always due - so the -20
+        ; timer waited for a gap that came seconds later, or not at all. That
+        ; was the five-to-ten-second, sometimes-never delay on this click.
         SH.msel := 0
         DllCall("ReleaseCapture")
-        HL.galReq := z - 100
-        SetTimer(HubGalOpen, -1, -20)
+        HL.galReq := 0
+        GalleryPick(z - 100)
     }
     else if z >= 111 && z <= 116 {
         SH.edAt := A_TickCount
@@ -38645,6 +38747,8 @@ HubBtnUp(wParam, lParam, msg, hwnd) {
 HubDblClick(wParam, lParam, msg, hwnd) {
     if !hubLive || hwnd != HL.gui.Hwnd
         return
+    if TUT.on
+        return 0                                ; the tour: no field is live to select in - see HubWheel
     if (DET.on || DET.t > 0.004)
         return 0
     CursorXY(&x, &y)
@@ -38676,6 +38780,8 @@ HubDblClick(wParam, lParam, msg, hwnd) {
 HubRClick(wParam, lParam, msg, hwnd) {
     if !hubLive || hwnd != HL.gui.Hwnd
         return
+    if TUT.on
+        return 0                                ; the tour: no field menu either - see HubWheel
     if (DET.on || DET.t > 0.004)
         return 0
     if FFM.ctx {
@@ -38897,6 +39003,15 @@ HubWheel(wParam, lParam, msg, hwnd) {
     ; else, so it stayed live for the first half of every collapse.
     if (!HubBodyLive() || hwnd != HL.gui.Hwnd)
         return
+    ; ---- not during the tour ----
+    ; The tour owns every click through HubZone, but the wheel never asked
+    ; HubZone - it went straight to whichever list was under the pointer. So a
+    ; wheel turn mid-tour scrolled the very list a step was lit on, and the
+    ; light, which follows the list's scroll so as to stay on its row, went
+    ; with it - off the panel and out over the chrome. The tour puts every
+    ; list where its steps need it; while it is up, the wheel does nothing.
+    if TUT.on
+        return 0
     ; The wheel is dispatched straight to whichever list is under the cursor
     ; without ever consulting HubZone, so blocking clicks did nothing for it -
     ; lists behind the sheet still scrolled.
@@ -39208,9 +39323,6 @@ HubCredWho(w) {
     credWho := w, credWhoAt := A_TickCount
     HL.cpAt := 0                     ; the copied flash belongs to the old set
     HubPoke()
-}
-HubGalOpen() {
-    GalleryPick(HL.galReq)
 }
 HubModSel(i) {
     global hubMod
@@ -40437,10 +40549,13 @@ HubRender() {
     thmp := Max(0.0, Sin(hph2*6.283))**8 + 0.55*Max(0.0, Sin(hph2*6.283 - 1.05))**8
     hs := 27*(1 + 0.11*thmp)*(1 + 0.08*hvH + 0.05*selH)
     if !hubLowPerf {
+    ; both discs on the cluster's centre: the outer one sat two below it and
+    ; the pulsing one a sixth of the heart's size below, so they rode at three
+    ; different heights and read as misaligned rings
     b := SBrush(FA(Alpha(hubCur, 8 + 10*selH), s2))
-    FillEll(hcx - 62, hcy - 60, 124, 124, b), DelB(b)
+    FillEll(hcx - 62, hcy - 62, 124, 124, b), DelB(b)
     b := SBrush(FA(Alpha(hubCur, 20 + 52*thmp + 30*hvH + 24*selH), s2))
-    FillEll(hcx - hs*1.65, hcy - hs*1.5, hs*3.3, hs*3.3, b), DelB(b)
+    FillEll(hcx - hs*1.65, hcy - hs*1.65, hs*3.3, hs*3.3, b), DelB(b)
     loop (hubLowPerf ? 0 : 5) {
         k6 := A_Index
         oang := now*0.00042*(Mod(k6, 2) ? 1 : -1) + k6*1.257
@@ -40462,28 +40577,35 @@ HubRender() {
         MiniHeart(mhx, mhy, 3.4 + k6, ElA(TH(FA(Alpha(AccHi(hubCur, 0.4), Round(140*ma)), s2))))
     }
     }                                            ; end of the ornament LOW PERFORMANCE MODE drops
-    stH := PushXform(hcx, hcy, 1.0, 3.2*Sin(DecT(now)*0.0016))
+    ; ---- the heart, on the centre everything else is drawn round ----
+    ; The path runs from the lobes at -0.62 hs to the tip at +0.85 hs, so its
+    ; visual centre sits 0.11 hs BELOW hcy - and the glow discs, the orbit,
+    ; the selected rings and the burst are all centred on hcy. That is why the
+    ; rings looked pushed up off the heart: they were centred, the heart was
+    ; not. The path is drawn 0.11 hs high, which puts its centre on theirs.
+    hcyH := hcy - hs*0.11
+    stH := PushXform(hcx, hcyH, 1.0, 3.2*Sin(DecT(now)*0.0016))
     DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &hp2 := 0)
     DllCall("gdiplus\GdipAddPathBezier", "ptr", hp2
-        , "float", hcx, "float", hcy + hs*0.85
-        , "float", hcx - hs*1.25, "float", hcy + hs*0.10
-        , "float", hcx - hs*0.80, "float", hcy - hs*0.85
-        , "float", hcx, "float", hcy - hs*0.28)
+        , "float", hcx, "float", hcyH + hs*0.85
+        , "float", hcx - hs*1.25, "float", hcyH + hs*0.10
+        , "float", hcx - hs*0.80, "float", hcyH - hs*0.85
+        , "float", hcx, "float", hcyH - hs*0.28)
     DllCall("gdiplus\GdipAddPathBezier", "ptr", hp2
-        , "float", hcx, "float", hcy - hs*0.28
-        , "float", hcx + hs*0.80, "float", hcy - hs*0.85
-        , "float", hcx + hs*1.25, "float", hcy + hs*0.10
-        , "float", hcx, "float", hcy + hs*0.85)
+        , "float", hcx, "float", hcyH - hs*0.28
+        , "float", hcx + hs*0.80, "float", hcyH - hs*0.85
+        , "float", hcx + hs*1.25, "float", hcyH + hs*0.10
+        , "float", hcx, "float", hcyH + hs*0.85)
     DllCall("gdiplus\GdipClosePathFigure", "ptr", hp2)
-    b := VBrush(hcx - hs*1.3, hcy - hs, hs*2.6, hs*2
+    b := VBrush(hcx - hs*1.3, hcyH - hs, hs*2.6, hs*2
         , FA(Alpha(AccHi(hubCur, 0.32), 230), s2), FA(Alpha(hubCur, 160 + 40*thmp), s2))
     DllCall("gdiplus\GdipFillPath", "ptr", G, "ptr", b, "ptr", hp2), DelB(b)
     pn := Pen(FA(Alpha(AccHi(hubCur, 0.5), 170 + 65*thmp), s2), 1.5)
     DllCall("gdiplus\GdipDrawPath", "ptr", G, "ptr", pn, "ptr", hp2), DelP(pn)
     b := SBrush(FA(Alpha(0xFFFFFF, 65 + 55*thmp), s2))
-    FillEll(hcx - hs*0.52, hcy - hs*0.46, hs*0.36, hs*0.32, b), DelB(b)
+    FillEll(hcx - hs*0.52, hcyH - hs*0.46, hs*0.36, hs*0.32, b), DelB(b)
     b := SBrush(FA(Alpha(0xFFFFFF, 40), s2))
-    FillEll(hcx + hs*0.22, hcy - hs*0.52, hs*0.14, hs*0.12, b), DelB(b)
+    FillEll(hcx + hs*0.22, hcyH - hs*0.52, hs*0.14, hs*0.12, b), DelB(b)
     DllCall("gdiplus\GdipDeletePath", "ptr", hp2)
     Pop(stH)
     ; ---- the burst a press throws ----
@@ -40507,7 +40629,8 @@ HubRender() {
         pn := Pen(FA(Alpha(hubCur, Round(60*selH)), s2), 1)
         DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
         Ell(hcx - hs*1.52, hcy - hs*1.42, hs*3.04, hs*2.84, pn), DelP(pn)
-        Txt("TOWN", hcx - 30, hcy + hs*1.28, 60, 12, HL.fXs, FA(Alpha(AccHi(hubCur, 0.4), Round(200*selH)), s2), fmtC)
+        ; the label sits under the outer ring, not across it
+        Txt("TOWN", hcx - 30, hcy + hs*1.5, 60, 12, HL.fXs, FA(Alpha(AccHi(hubCur, 0.4), Round(200*selH)), s2), fmtC)
     }
     if !hubLowPerf {
     if thmp > 0.03 {
@@ -43024,12 +43147,12 @@ HubRender() {
                 }
                 hvP := HL.h.Get(100 + i, 0.0)
                 pcx := x0 + 34, pcy := ry + 33
-                if bmA := SelAt(itm.av)
+                ; a script with no picture of its own gets a sigil, not the
+                ; first face in the gallery - see ScrSigil
+                if (itm.av >= 2 && (bmA := SelAt(itm.av)))
                     BlitCircle(bmA, pcx, pcy, 22, f)
-                else {
-                    b := SBrush(FA(Alpha(hubCur, 50), f))
-                    FillEll(pcx - 22, pcy - 22, 44, 44, b), DelB(b)
-                }
+                else
+                    ScrSigil(itm.name, pcx, pcy, 22, hubCur, f, now, on_)
                 if hvP > 0.01 {
                     epC := 0
                     DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &epC)
@@ -44374,7 +44497,13 @@ ScrLoadList() {
         try nm := IniRead(iniPath, "script" i, "name", "")
         try ds := IniRead(iniPath, "script" i, "desc", "")
         try fl := IniRead(iniPath, "script" i, "file", "")
-        try avi := Integer(IniRead(iniPath, "script" i, "av", "1"))
+        ; 0, not 1, when nothing is stored: 1 was the first face in the gallery,
+        ; handed to every script as a stand-in, and a chosen picture is always a
+        ; crop appended to the pool (index 2 or above) - so a stored 1 is that
+        ; stand-in too, and comes back as the sigil
+        try avi := Integer(IniRead(iniPath, "script" i, "av", "0"))
+        if (avi = 1)
+            avi := 0
         vr := "2"
         try vr := IniRead(iniPath, "script" i, "ver", "2")
         if nm = "" || fl = "" || !FileExist(fl)
@@ -44848,7 +44977,7 @@ ScrPlace() {
             ScrWarn("could not write the script file - check folder permissions")
             return
         }
-        SHList.Push({name: nm, desc: ds, file: fl, pid: 0, av: 1, ver: ver})
+        SHList.Push({name: nm, desc: ds, file: fl, pid: 0, av: 0, ver: ver})   ; no picture yet: the card wears its sigil
         ScrMarkPlaced(SHList.Length)
     }
     ScrSaveList()
@@ -48113,11 +48242,15 @@ GalleryPick(target := 0, manage := 0) {
         G := G3
         now := A_TickCount
         ThemeTick()
-        it := Min((now - glIntro)/300.0, 1.0)
+        ; 180 ms and 12 px, not 300 and 22: the card opens on a click, and a
+        ; click wants an answer inside a beat - the old entrance, with the tiles
+        ; filing in behind it, took most of a second to finish, and read as the
+        ; picker being slow to appear
+        it := Min((now - glIntro)/180.0, 1.0)
         ei := 1 - (1 - it)**3
-        winA := Round(255 * Min(it*1.8, 1.0))
-        yO := Round((1 - ei) * 22 * scaleF)
-        scl := 0.96 + 0.04*ei
+        winA := Round(255 * Min(it*2.2, 1.0))
+        yO := Round((1 - ei) * 12 * scaleF)
+        scl := 0.97 + 0.03*ei
         if glPickAt && now - glPickAt >= 200
             GalClose()
         if glCloseAt {
@@ -48129,7 +48262,7 @@ GalleryPick(target := 0, manage := 0) {
             }
         }
         lb := GetKeyState("LButton", "P")
-        if lb && !glLBP && !glDrag && !glCloseAt && now - glIntro > 200 && GalZoneCur() = 0 {
+        if lb && !glLBP && !glDrag && !glCloseAt && now - glIntro > 120 && GalZoneCur() = 0 {
             glPend := 0
             GalClose()
         }
@@ -48213,7 +48346,7 @@ GalleryPick(target := 0, manage := 0) {
 
         loop show {
             i := A_Index
-            tdel := Min(Max((now - glIntro - 60 - i*36)/260.0, 0.0), 1.0)
+            tdel := Min(Max((now - glIntro - 20 - i*16)/150.0, 0.0), 1.0)   ; the tiles follow the card in, not after it
             ta := 1 - (1 - tdel)**3
             if ta <= 0
                 continue
@@ -49732,6 +49865,40 @@ ShadowDraw(x, y, w, h, r0, rings, baseA, dynA, f, sc := 0) {
 }
 
 ; blit one pool bitmap into a circular clip at alpha f (no ring/gloss)
+; ---- a placed script's mark ----
+; What a script wears when it has no picture: a moon. A pale disc on the dark
+; well, with a shadow taken out of it by a second disc so it reads as a
+; crescent, one small point of light off its lit edge, and the hub's ring
+; round it. The shadow's side is taken from a hash of the script's name -
+; eight orientations - so each script's moon is its own phase, the same one
+; every launch, and a rename turns it. It breathes while the script runs.
+; Drawn from the name every frame, nothing stored; a picture chosen later
+; replaces it.
+ScrSigil(nm, cx, cy, r, acc, f, now, live) {
+    h := FFMFlagHash(StrLower(nm))
+    pulse := live ? 0.74 + 0.26*Sin(DecT(now)*0.0042) : 1.0
+    b := SBrush(FA(Mix(0xFF12141F, acc, 0.16), f))
+    FillEll(cx - r, cy - r, r*2, r*2, b), DelB(b)
+    mr := r*0.58
+    b := SBrush(FA(Alpha(0xFFF2EFE6, Round(232*pulse)), f))
+    FillEll(cx - mr, cy - mr, mr*2, mr*2, b), DelB(b)
+    an := Mod(h, 8)*0.7854 - 1.2
+    ep := 0
+    DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &ep)
+    DllCall("gdiplus\GdipAddPathEllipse", "ptr", ep, "float", cx - mr, "float", cy - mr, "float", mr*2, "float", mr*2)
+    sv := PushG()
+    DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", ep, "int", 1)
+    sx := cx + mr*0.62*Cos(an), sy := cy + mr*0.62*Sin(an)
+    b := SBrush(FA(Mix(0xFF12141F, acc, 0.22), f))
+    FillEll(sx - mr*0.94, sy - mr*0.94, mr*1.88, mr*1.88, b), DelB(b)
+    Pop(sv)
+    DllCall("gdiplus\GdipDeletePath", "ptr", ep)
+    dx0 := cx - mr*1.28*Cos(an), dy0 := cy - mr*1.28*Sin(an)
+    b := SBrush(FA(Alpha(AccHi(acc, 0.5), Round(230*pulse)), f))
+    FillEll(dx0 - 1.4, dy0 - 1.4, 2.8, 2.8, b), DelB(b)
+    pn := Pen(FA(Alpha(acc, Round(95 + 60*(pulse - 0.74))), f), 1)
+    Ell(cx - r + 0.5, cy - r + 0.5, r*2 - 1, r*2 - 1, pn), DelP(pn)
+}
 BlitCircle(bmp, ax, ay, r, f) {
     ep := 0
     DllCall("gdiplus\GdipCreatePath", "int", 0, "ptr*", &ep)
@@ -50058,7 +50225,48 @@ TownPick(k) {
     HL.townPrev := hubTown, HL.townAt := A_TickCount
     hubTown := k
     try IniWrite(hubTown, iniPath, "hub", "town")
+    TW.at := 0, TW.next := A_TickCount + 1500        ; a spark belongs to the town it appeared in
     HubPoke()
+}
+; ---- the level a count has reached, and the level it is at ----
+TownLevelOf(n) {
+    lv := 0
+    for i, th in TW_LV
+        if (n >= th)
+            lv := i
+    return lv
+}
+TownLevel(k) => TownLevelOf(TW.n[k])
+; where a spark may appear in each town: over sky, grass, roofs and pavement,
+; never on the fountain or the water
+TownSpots(k) {
+    if (k = 2)
+        return [[20, 12], [70, 20], [120, 14], [40, 40], [100, 44], [10, 60], [130, 62], [60, 78], [90, 78], [30, 75], [110, 75], [80, 8]]
+    if (k = 3)
+        return [[10, 40], [60, 30], [120, 44], [40, 92], [90, 40], [130, 20], [8, 70], [70, 70], [100, 10], [50, 12], [125, 92], [80, 92]]
+    return [[20, 20], [50, 12], [90, 18], [120, 30], [30, 70], [110, 72], [10, 84], [130, 84], [70, 10], [40, 40], [100, 50], [60, 68]]
+}
+; the spark's place on the hub, in the coordinates the hit test uses: the
+; scene's origin is the content column's, one cell in and the title strip down
+TownSparkXY(&x, &y) {
+    x := HL.ctx + 1 + TW.sx*4 + 2, y := HL.cty + 36 + TW.sy*4 + 2
+}
+; ---- a spark taken ----
+TownCollect() {
+    global hubTown
+    if !TW.at
+        return
+    k := hubTown
+    worth := (TW.kind = 2) ? 3 : (A_TickCount - TW.at < 8000) ? 2 : 1
+    was := TW.n[k]
+    TW.n[k] += worth
+    try IniWrite(TW.n[k], iniPath, "town", "n" k)
+    TW.burstAt := A_TickCount, TW.bx := TW.sx, TW.by := TW.sy, TW.plusAt := A_TickCount, TW.plusN := worth
+    lvNew := TownLevelOf(TW.n[k])
+    if (lvNew > TownLevelOf(was))
+        TW.lvAt := A_TickCount, TW.lvNew := lvNew
+    TW.at := 0, TW.next := A_TickCount + 6000 + Random(0, 9000)
+    HubPoke(), HubPokeLater(1400)
 }
 ; the three chips, in the title row's right half, the way the dashboard keeps
 ; its two buttons there
@@ -50084,8 +50292,152 @@ TownDraw(vx, vy, vw, vh, acc, f, now) {
     if (tw < 1 && HL.townPrev)
         TownScene(HL.townPrev, ox - 24*tw, oy, cs, acc, f*(1 - tw), now)
     TownScene(hubTown, ox + 24*(1 - tw), oy, cs, acc, f*tw, now)
+    TownGame(ox + 24*(1 - tw), oy, cs, acc, f*tw, now)
     Pop(sv)
     DllCall("gdiplus\GdipDeletePath", "ptr", pC)
+}
+; ---- the game, over the scene ----
+; The spark, its burst, the +1, the level ribbon, and the small tally in the
+; corner. Pre-themed like the towns; the colours are the sparks' own.
+TownGame(ox, oy, cs, acc, f, now) {
+    global hubTown
+    k := hubTown
+    ; ---- spawn and expiry ----
+    if (!TW.at && now >= TW.next && !HL.townAt) {
+        TW.kind := (Random(1, 5) = 1) ? 2 : 1
+        if (TW.kind = 2)
+            TW.sx := -12, TW.sy := 18, TW.at := now
+        else {
+            spots := TownSpots(k)
+            i := Random(1, spots.Length)
+            if (i = TW.last)
+                i := Mod(i, spots.Length) + 1
+            TW.last := i, TW.sx := spots[i][1], TW.sy := spots[i][2], TW.at := now
+        }
+    }
+    if (TW.at && TW.kind = 2) {
+        ; the comet crosses left to right on a shallow arc, seven seconds
+        ; end to end; where it is now is written back so the hit test can
+        ; find it where it is drawn
+        cp := (now - TW.at)/7000.0
+        TW.sx := -12 + Round(166*cp), TW.sy := 22 + Round(10*Sin(cp*3.14159*1.5)) - Round(6*cp)
+        if (cp > 1.05)
+            TW.at := 0, TW.next := now + 2500
+    } else if (TW.at && now - TW.at > 30000)
+        TW.at := 0, TW.next := now + 3000
+    P(x, y, w, h, c) => TPx(ox, oy, cs, x, y, w, h, c, f)
+    ; ---- the spark ----
+    if TW.at {
+        age := now - TW.at
+        ain := Ease3(Min(age/380.0, 1.0))                     ; grows in
+        aout := (age > 28500) ? 1 - (age - 28500)/1500.0 : 1.0 ; fades in its last second and a half
+        hv := HL.h.Get(2225, 0.0)
+        sc := ain*(1 + 0.3*hv)*aout
+        bob := 2*Sin(DecT(now)*0.004)
+        spx := ox + TW.sx*cs + 2, spy := oy + TW.sy*cs + 2 + bob
+        pulse := 0.7 + 0.3*Sin(DecT(now)*0.006)
+        cG := (TW.kind = 2) ? 0xFF9FD3F0 : 0xFFFFE08A               ; the comet is cold light, the spark warm
+        cC := (TW.kind = 2) ? 0xFFEAF6FF : 0xFFFFFBEA
+        if (TW.kind = 2) {                                          ; the tail, back along the arc
+            loop 7 {
+                q := A_Index
+                cq := Max((now - TW.at)/7000.0 - q*0.018, 0.0)
+                qx := ox + (-12 + 166*cq)*cs + 2, qy := oy + (22 + 10*Sin(cq*3.14159*1.5) - 6*cq)*cs + 2 + bob
+                b := TB(Alpha(cG, Round((150 - q*18)*aout)), f), FillEll(qx - (5 - q*0.5), qy - (5 - q*0.5), 10 - q, 10 - q, b)
+            }
+        }
+        b := TB(Alpha(cG, Round((40 + 30*pulse + 40*hv)*aout)), f), FillEll(spx - 14*sc, spy - 14*sc, 28*sc, 28*sc, b)
+        b := TB(Alpha(cG, Round((110 + 40*pulse)*aout)), f),        FillEll(spx - 7*sc, spy - 7*sc, 14*sc, 14*sc, b)
+        pn := PenP(FA(Alpha(cC, Round(200*aout)), f), 1.4)
+        ra := DecT(now)*0.0012
+        loop 4 {
+            an := ra + (A_Index - 1)*1.5708
+            Line(spx + 5*sc*Cos(an), spy + 5*sc*Sin(an), spx + (10 + 3*pulse)*sc*Cos(an), spy + (10 + 3*pulse)*sc*Sin(an), pn)
+        }
+        DelP(pn)
+        b := TB(Alpha(cC, Round(240*aout)), f), FillEll(spx - 3.2*sc, spy - 3.2*sc, 6.4*sc, 6.4*sc, b)
+        if (hv > 0.02) {
+            pn := PenP(FA(Alpha(cG, Round(160*hv*aout)), f), 1)
+            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+            Ell(spx - 18, spy - 18, 36, 36, pn), DelP(pn)
+        }
+        if (TW.kind = 1 && age < 8000)                              ; the quick window: a thin arc draining round it
+            pn := PenP(FA(Alpha(0xFFFFE08A, Round(120*aout)), f), 1.2), Arc(spx - 12, spy - 12, 24, 24, -90, 360*(1 - age/8000.0), pn), DelP(pn)
+    }
+    ; ---- the burst, and the +1 ----
+    if (TW.burstAt && now - TW.burstAt < 720) {
+        e := (now - TW.burstAt)/720.0
+        ee := 1 - (1 - e)**2
+        bx := ox + TW.bx*cs + 2, by := oy + TW.by*cs + 2
+        loop 12 {
+            an := (A_Index - 1)*0.5236 + 0.26
+            d := 6 + 30*ee
+            r := 3*(1 - e) + 0.6
+            b := TB(Alpha(Mod(A_Index, 3) ? 0xFFFFE08A : 0xFFFFFBEA, Round(230*(1 - e))), f)
+            FillEll(bx + d*Cos(an) - r, by + d*Sin(an) + 6*ee*ee - r, r*2, r*2, b)
+        }
+        pn := PenP(FA(Alpha(0xFFFFF4C8, Round(180*(1 - e))), f), 2*(1 - e) + 0.5)
+        Ell(bx - 4 - 24*ee, by - 4 - 24*ee, 8 + 48*ee, 8 + 48*ee, pn), DelP(pn)
+    } else if TW.burstAt
+        TW.burstAt := 0
+    if (TW.plusAt && now - TW.plusAt < 1000) {
+        e := (now - TW.plusAt)/1000.0
+        TxtP("+" TW.plusN, ox + TW.bx*cs - 24, oy + TW.by*cs - 16 - 22*Ease3(e), 52, 20, (TW.plusN > 1) ? HL.fV : HL.fS, FA(Alpha((TW.plusN >= 3) ? 0xFFB8E4FF : 0xFFFFF4C8, Round(240*(1 - e*e))), f), fmtC)
+    } else if TW.plusAt
+        TW.plusAt := 0
+    ; ---- the level ribbon ----
+    if (TW.lvAt && now - TW.lvAt < 3600) {
+        e := (now - TW.lvAt)/3600.0
+        inn := Ease3(Min(e*6, 1.0)), out := (e > 0.85) ? 1 - Ease3((e - 0.85)/0.15) : 1.0
+        rw := 300, rx := ox + 142*cs/2 - rw/2, ry := oy + 12 - 30*(1 - inn)
+        b := TB(Alpha(0xFF12141F, Round(200*inn*out)), f), FillRR(rx, ry, rw, 30, 8, b)
+        pn := PenP(FA(Alpha(0xFFFFE08A, Round(170*inn*out)), f), 1), StrokeRR(rx, ry, rw, 30, 8, pn), DelP(pn)
+        shx := rx + Mod(now - TW.lvAt, 1400)/1400.0*rw
+        b := TB(Alpha(0xFFFFF4C8, Round(60*inn*out)), f), FillRR(shx - 14, ry, 28, 30, 0, b)
+        TxtP("LEVEL " TW.lvNew "  ·  " TW_REW[k][TW.lvNew] " arrives", rx, ry + 7, rw, 16, HL.fS, FA(Alpha(0xFFFFF4C8, Round(245*inn*out)), f), fmtC)
+        loop 24 {                                           ; the celebration, from the middle of the ribbon
+            an := (A_Index - 1)*0.2618
+            d := 20 + 90*Ease3(Min(e*1.6, 1.0))
+            b := TB(Alpha(Mod(A_Index, 2) ? 0xFFFFE08A : 0xFFFFFBEA, Round(200*(1 - Min(e*1.6, 1.0)))), f)
+            FillEll(rx + rw/2 + d*Cos(an) - 1.5, ry + 15 + d*Sin(an)*0.6 + 30*e*e - 1.5, 3, 3, b)
+        }
+    } else if TW.lvAt
+        TW.lvAt := 0
+    ; ---- the tally, in the corner ----
+    ; two lines and a bar need 44, not 30: at 30 the second line was drawn
+    ; below the pill's edge, and a long reward name ran past its right one
+    n := TW.n[k], lv := TownLevel(k)
+    nxt := (lv < TW_LV.Length) ? TW_LV[lv + 1] : 0
+    pw2 := 196, ph2 := 44
+    hx := ox + 142*cs - pw2 - 12, hy := oy + 101*cs - ph2 - 10
+    done := !nxt
+    b := TB(Alpha(0xFF12141F, 175), f), FillRR(hx, hy, pw2, ph2, 9, b)
+    pn := PenP(FA(Alpha(done ? 0xFFFFE08A : 0xFFFFE08A, done ? 150 : 70), f), done ? 1.5 : 1), StrokeRR(hx, hy, pw2, ph2, 9, pn), DelP(pn)
+    pulse := 0.7 + 0.3*Sin(DecT(now)*0.004)
+    b := TB(Alpha(0xFFFFE08A, Round(60*pulse)), f), FillEll(hx + 7, hy + 9, 26, 26, b)
+    b := TB(0xFFFFE08A, f), FillEll(hx + 14, hy + 16, 12, 12, b)
+    b := TB(0xFFFFFBEA, f), FillEll(hx + 17, hy + 19, 6, 6, b)
+    TxtP(n "  ·  LEVEL " lv, hx + 38, hy + 6, 150, 13, HL.fS, FA(Alpha(0xFFFFF4C8, 235), f), fmtL)
+    if nxt {
+        pv := (lv ? TW_LV[lv] : 0)
+        fr := Clamp((n - pv)/(nxt - pv + 0.0), 0.0, 1.0)
+        if (TW.barK != k)
+            TW.barK := k, TW.barE := fr                             ; a switch of town does not animate from the other's bar
+        TW.barE += (fr - TW.barE)*EK(0.12)
+        b := TB(Alpha(0xFFFFE08A, 50), f), FillRR(hx + 38, hy + 22, pw2 - 50, 4, 2, b)
+        b := TB(0xFFFFE08A, f), FillRR(hx + 38, hy + 22, (pw2 - 50)*TW.barE, 4, 2, b)
+        if (TW.barE > 0.02)
+            b := TB(Alpha(0xFFFFFBEA, 200), f), FillEll(hx + 38 + (pw2 - 50)*TW.barE - 2, hy + 22, 4, 4, b)
+        TxtP(FFMElide((nxt - n) " more: " TW_REW[k][lv + 1], HL.fXs, pw2 - 50), hx + 38, hy + 29, pw2 - 50, 12, HL.fXs, FA(Alpha(0xFFFFF4C8, 150), f), fmtL)
+    } else {
+        TW.barE := 1.0
+        TxtP("the town is complete", hx + 38, hy + 22, pw2 - 50, 12, HL.fXs, FA(Alpha(0xFFFFE08A, 220), f), fmtL)
+        loop 3 {
+            q := A_Index
+            tw2 := 0.5 + 0.5*Sin(DecT(now)*0.0035 + q*2.1)
+            b := TB(Alpha(0xFFFFFBEA, Round(80 + 150*tw2)), f), FillEll(hx + pw2 - 40 + q*9, hy + 8 + Mod(q, 2)*4, 3, 3, b)
+        }
+    }
 }
 TownScene(k, ox, oy, cs, acc, f, now) {
     if (k = 2)
@@ -50533,6 +50885,70 @@ TownNight(ox, oy, cs, acc, f, now) {
         P(cx2 - 1, 93, 1, 1, Alpha(0xFFFFF3C4, Round(235*night))), P(cx2 + 8, 93, 1, 1, Alpha(0xFFFF5A5A, Round(200*night)))
         P(cx2 - 6, 92, 5, 3, Alpha(0xFFFFF3C4, Round(34*night)))
     }
+    ; ---- what the sparks have added ----
+    lv := TownLevel(1)
+    if (lv >= 1) {                                ; bunting between the lamps, waving
+        for bk, bx1 in [[20, 56], [56, 90], [90, 122]] {
+            loop 8 {
+                q := A_Index
+                fx := bx1[1] + Round((bx1[2] - bx1[1])*q/9.0)
+                fy := 76 + Round(2*Sin(q/9.0*3.14159)) + Mod(Floor(t/300) + q, 2)
+                P(fx, fy, 1, 2, Mod(q, 3) = 0 ? 0xFFE8574A : Mod(q, 3) = 1 ? 0xFFFFE08A : 0xFF9FD3F0)
+            }
+            P(bx1[1], 76, bx1[2] - bx1[1], 1, Alpha(0xFF2A2E44, 120))
+        }
+    }
+    if (lv >= 2) {                                ; a ferris wheel on the bank, turning, lit at night
+        fwx := ox + 126*cs, fwy := oy + 64*cs
+        P(124, 74, 1, 8, 0xFF3A3F5C), P(128, 74, 1, 8, 0xFF3A3F5C), P(122, 82, 9, 1, 0xFF3A3F5C)
+        pn := PenP(FA(0xFF6A6F8E, f), 1.2)
+        wa := DecT(now)*0.0004
+        loop 8 {
+            an := wa + (A_Index - 1)*0.7854
+            Line(fwx, fwy, fwx + 11*cs*Cos(an), fwy + 11*cs*Sin(an), pn)
+            gx := fwx + 11*cs*Cos(an), gy := fwy + 11*cs*Sin(an)
+            b := TB(Mod(A_Index, 2) ? 0xFFE8574A : 0xFF3F7FC9, f), FillRR(gx - 4, gy - 3, 8, 7, 2, b)
+            if (night > 0.2)
+                b := TB(Alpha(warm, Round(220*night)), f), FillEll(gx - 1.5, gy - 1.5, 3, 3, b)
+        }
+        DelP(pn)
+        pn := PenP(FA(0xFF8A8FA8, f), 1.4), Ell(fwx - 11*cs, fwy - 11*cs, 22*cs, 22*cs, pn), DelP(pn)
+        b := TB(0xFF9A9EB8, f), FillEll(fwx - 3, fwy - 3, 6, 6, b)
+    }
+    if (lv >= 3) {                                ; a lighthouse on the far hill, its beam sweeping at night
+        P(8, 40, 3, 12, 0xFFE0D8C8), P(8, 44, 3, 2, 0xFFC44A4A), P(8, 48, 3, 2, 0xFFC44A4A), P(7, 38, 5, 2, 0xFF3A3F5C), P(8, 36, 3, 2, warm)
+        if (night > 0.2) {
+            ba := DecT(now)*0.0008
+            pn := PenP(FA(Alpha(warm, Round(70*night)), f), 6)
+            Line(ox + 9.5*cs, oy + 37*cs, ox + 9.5*cs + 40*cs*Cos(ba), oy + 37*cs + 10*cs*Sin(ba), pn), DelP(pn)
+            pn := PenP(FA(Alpha(warm, Round(120*night)), f), 2)
+            Line(ox + 9.5*cs, oy + 37*cs, ox + 9.5*cs + 40*cs*Cos(ba), oy + 37*cs + 10*cs*Sin(ba), pn), DelP(pn)
+        }
+    }
+    if (lv >= 4) {                                ; a blimp, with a light banner that scrolls
+        zx := Mod(t*0.0018 + 60, 220) - 40, zy := 22 + Round(2*Sin(t*0.0007))
+        P(zx, zy, 24, 6, 0xFF8A8FA8), P(zx + 2, zy - 1, 20, 1, 0xFF9A9EB8), P(zx + 2, zy + 6, 20, 1, 0xFF6E7391), P(zx - 3, zy + 1, 4, 4, 0xFF6E7391), P(zx + 9, zy + 6, 6, 2, 0xFF3A3F5C)
+        loop 18
+            P(zx + 3 + (A_Index - 1), zy + 2, 1, 2, (Mod(Floor(t/110) + A_Index, 6) < 2) ? warm : 0xFF3A3F5C)
+    }
+    if (lv >= 5) {                                ; fireworks all night, every half minute
+        fph := Mod(t, 30000)
+        if (fph < 4200 && night > 0.2) {
+            loop 3 {
+                q := A_Index
+                fp := (fph - q*900)/2800.0
+                if (fp < 0 || fp > 1)
+                    continue
+                fcx := 34 + q*30, fcy := 16 + Mod(q, 2)*8
+                fcl := (q = 1) ? 0xFFFF6A6A : (q = 2) ? 0xFFFFE08A : 0xFF8AB8FF
+                loop 12 {
+                    an := (A_Index - 1)*0.5236
+                    rr := Round(fp*15)
+                    P(fcx + Round(rr*Cos(an)), fcy + Round(rr*Sin(an)) + Round(fp*fp*6), 1, 1, Alpha(fcl, Round(240*(1 - fp))))
+                }
+            }
+        }
+    }
     ; ---- the foreground: a fence, and a cat on it ----
     P(0, 97, 142, 1, 0xFF6E4A34), P(0, 98, 142, 1, 0xFF5A3E2E)
     loop 24
@@ -50792,6 +51208,72 @@ TownStreet(ox, oy, cs, acc, f, now) {
             P(px0 - 2, 81, 2, 3, 0xFFE0872E)
     }
     P(37, 78, 2, 2, 0xFFF1C9A2), P(37, 77, 2, 1, 0xFF3A2E24), P(37, 80, 2, 2, 0xFF8A3A4C), P(39, 78, 2, 2, 0xFFF1C9A2), P(39, 77, 2, 1, 0xFFE9D5A8), P(39, 80, 2, 2, 0xFF3A4C8A)
+    ; ---- what the sparks have added ----
+    lv := TownLevel(2)
+    if (lv >= 1) {                                ; kites over the roofs
+        loop 2 {
+            q := A_Index
+            kx := 30 + q*50 + Round(6*Sin(t*0.0009 + q)), ky := 10 + q*4 + Round(4*Sin(t*0.0013 + q*2))
+            P(kx, ky - 3, 1, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx - 1, ky - 2, 3, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx - 2, ky - 1, 5, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx - 1, ky, 3, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx, ky + 1, 1, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9)
+            loop 5
+                P(kx + Round(Sin(t*0.004 + A_Index)*1.2), ky + 1 + A_Index, 1, 1, Mod(A_Index, 2) ? 0xFFFFE08A : 0xFFF4F1E8)
+            pn := PenP(FA(Alpha(0xFF3A3F5C, 110), f), 1)
+            Line(ox + kx*cs, oy + (ky + 6)*cs, ox + (kx - 10 - q*6)*cs, oy + 84*cs, pn), DelP(pn)
+        }
+    }
+    if (lv >= 2) {                                ; a food truck, steam off its hatch, a queue
+        P(116, 76, 16, 8, 0xFFE8C95A), P(116, 75, 12, 1, 0xFFD9B23E), P(128, 77, 4, 3, 0xFF9FD3F0), P(118, 78, 8, 3, 0xFF3A2E24), P(119, 79, 6, 1, 0xFFFFE9C0)
+        P(117, 84, 2, 1, 0xFF1C1E2A), P(128, 84, 2, 1, 0xFF1C1E2A), P(117, 73, 14, 2, 0xFFE8574A), P(120, 74, 2, 1, 0xFFF4F1E8), P(124, 74, 2, 1, 0xFFF4F1E8)
+        loop 3 {
+            q := A_Index
+            sp := Mod(t*0.0011 + q*0.33, 1.0)
+            P(121 + Round(Sin(sp*6 + q)*1.2), 77 - Round(sp*6), 1, 1, Alpha(0xFFF4F1E8, Round(150*(1 - sp))))
+        }
+        TownWalker(P, 111, 84, 0xFF8A3A4C, 0xFF23263A, 0xFFF1C9A2, 0xFF3A2E24, 0, 1)
+        TownWalker(P, 106, 84, 0xFF3A4C8A, 0xFF5A3E2E, 0xFFF1C9A2, 0xFFE9D5A8, Mod(Floor(t/500), 2), 1)
+    }
+    if (lv >= 3) {                                ; a tram, on rails down the middle of the road
+        P(0, 96, 142, 1, 0xFF8A8DA5), P(0, 98, 142, 1, 0xFF8A8DA5)
+        trx := Mod(t*0.009, 240) - 60
+        P(trx, 92, 34, 5, 0xFF4FA85C), P(trx + 1, 91, 32, 1, 0xFF3E8A48), P(trx + 15, 92, 4, 5, 0xFFF4F1E8)
+        loop 7
+            P(trx + 3 + (A_Index - 1)*4, 93, 3, 2, 0xFF9FD3F0)
+        P(trx + 2, 97, 2, 1, 0xFF1C1E2A), P(trx + 30, 97, 2, 1, 0xFF1C1E2A), P(trx + 12, 97, 2, 1, 0xFF1C1E2A), P(trx + 20, 97, 2, 1, 0xFF1C1E2A)
+        P(trx + 8, 89, 1, 2, 0xFF23263A), P(trx + 4, 88, 9, 1, 0xFF23263A), P(trx + 33, 94, 1, 1, 0xFFFFE9A8)
+    }
+    if (lv >= 4) {                                ; a rooftop party on the brick house: balloons, lights, confetti
+        loop 6 {
+            q := A_Index
+            P(58 + q*5 + Round(Sin(t*0.002 + q)*1), 12 + Round(Sin(t*0.0015 + q*1.3)*1.5), 2, 2, (Mod(q, 3) = 0) ? 0xFFE8574A : (Mod(q, 3) = 1) ? 0xFFFFE08A : 0xFF3F7FC9)
+            P(59 + q*5 + Round(Sin(t*0.002 + q)*1), 14 + Round(Sin(t*0.0015 + q*1.3)*1.5), 1, 3, Alpha(0xFF3A3F5C, 120))
+        }
+        loop 14
+            P(60 + (A_Index - 1)*2, 21 + Round(Sin((A_Index - 1)/13.0*3.14159)*2), 1, 1, (Mod(Floor(t/250) + A_Index, 3) = 0) ? 0xFFFFE9A8 : 0xFFE8C05A)
+        loop 10 {
+            q := A_Index
+            cp := Mod(t*0.0004 + q*0.1, 1.0)
+            P(58 + Mod(q*7, 34) + Round(Sin(cp*10 + q)*2), 10 + Round(cp*14), 1, 1, (Mod(q, 3) = 0) ? 0xFFE8574A : (Mod(q, 3) = 1) ? 0xFFFFE08A : 0xFF9FD3F0)
+        }
+        TownWalker(P, 66, 23, 0xFF6A4A8A, 0xFF23263A, 0xFFF1C9A2, 0xFF3A2E24, Mod(Floor(t/300), 2), 1)
+        TownWalker(P, 80, 23, 0xFFE8574A, 0xFF3A4C8A, 0xFFF1C9A2, 0xFFE9D5A8, Mod(Floor(t/300) + 1, 2), -1)
+    }
+    if (lv >= 5) {                                ; a parade, crossing every forty seconds
+        pph := Mod(t, 40000)
+        if (pph < 14000) {
+            pbx := -40 + Round(pph*0.012)
+            loop 6 {
+                q := A_Index
+                TownWalker(P, pbx + q*6, 84, (Mod(q, 2) ? 0xFFE8574A : 0xFFFFE08A), 0xFF23263A, 0xFFF1C9A2, 0xFF3A2E24, Mod(Floor(t/170) + q, 2), 1, 0xFFE8574A)
+                P(pbx + q*6 - 1, 79, 1, 2, 0xFFE8C95A)
+            }
+            P(pbx - 4, 74, 8, 5, 0xFFE8574A), P(pbx - 3, 75, 6, 3, 0xFFFFE08A), P(pbx, 79, 1, 5, 0xFF5A3E2E)
+            loop 3 {
+                q := A_Index
+                np := Mod(t*0.0009 + q*0.33, 1.0)
+                P(pbx + 30 + Round(Sin(np*8 + q)*3), 76 - Round(np*12), 1, 1, Alpha(0xFF23263A, Round(200*(1 - np))))
+            }
+        }
+    }
     ; ---- the cyclist, the van, a car, and the bus ----
     ; the cyclist rides the road's near edge - a bike lane under the kerb -
     ; not the shop fronts
@@ -51065,6 +51547,68 @@ TownVillage(ox, oy, cs, acc, f, now) {
         bfx := 20 + k*50 + Round(20*Sin(t*0.0006 + k)), bfy := 66 + Round(6*Sin(t*0.0017 + k*2))
         c := Mod(Floor(t/160) + k, 2) ? ((k = 1) ? 0xFFFFE08A : 0xFFB9DCF2) : ((k = 1) ? 0xFFF2A24A : 0xFF7FB7E0)
         P(bfx - 1, bfy, 1, 1, c), P(bfx + 1, bfy, 1, 1, c)
+    }
+    ; ---- what the sparks have added ----
+    lv := TownLevel(3)
+    if (lv >= 1) {                                ; sheep in the meadow, grazing
+        loop 3 {
+            q := A_Index
+            shx := 6 + q*8 + Round(3*Sin(t*0.0003 + q*2)), shy := 12 + (q - 1)*4
+            nib := (Mod(t + q*400, 1600) < 300)
+            P(shx, shy, 4, 2, 0xFFF4F1E8), P(shx + 4, shy + (nib ? 1 : 0), 1, 1, 0xFF2A2436), P(shx, shy + 2, 1, 1, 0xFF2A2436), P(shx + 3, shy + 2, 1, 1, 0xFF2A2436)
+        }
+    }
+    if (lv >= 2) {                                ; a windmill by the plot, sails turning
+        P(134, 82, 4, 6, 0xFFE0D8C8), P(133, 81, 6, 1, 0xFF9A2A2A), P(135, 85, 2, 2, 0xFF6A3A22)
+        wa := Floor(Mod(DecT(now)*0.03, 360)/15)*15
+        pn := PenP(FA(0xFF5A3E2E, f), 2)
+        loop 4 {
+            an := (wa + (A_Index - 1)*90)*0.0174533
+            Line(ox + 136*cs, oy + 80*cs, ox + 136*cs + 7*cs*Cos(an), oy + 80*cs + 7*cs*Sin(an), pn)
+        }
+        DelP(pn)
+        b := TB(0xFFE0D8C8, f), FillEll(ox + 136*cs - 2, oy + 80*cs - 2, 4, 4, b)
+    }
+    if (lv >= 3) {                                ; a carousel on the square, turning
+        b := TB(0xFFE8574A, f), FillEll(ox + 60*cs, oy + 40*cs, 8*cs, 8*cs, b)
+        b := TB(0xFFFFE08A, f), FillEll(ox + 61*cs, oy + 41*cs, 6*cs, 6*cs, b)
+        ca := DecT(now)*0.0015
+        loop 4 {
+            an := ca + (A_Index - 1)*1.5708
+            hx0 := ox + 64*cs + 2.6*cs*Cos(an), hy0 := oy + 44*cs + 2.6*cs*Sin(an)
+            b := TB(Mod(A_Index, 2) ? 0xFFF4F1E8 : 0xFF8A6A4A, f), FillRR(hx0 - 3, hy0 - 2, 6, 4, 1.5, b)
+            b := TB(0xFF3A2E24, f), FillRR(hx0 - 1, hy0 - 1, 2, 2, 1, b)
+        }
+        b := TB(0xFFC44A4A, f), FillEll(ox + 64*cs - 2, oy + 44*cs - 2, 4, 4, b)
+    }
+    if (lv >= 4) {                                ; a balloon crossing, and its shadow on the ground
+        bx0 := Mod(t*0.0016, 200) - 30, by0 := 30 + Round(6*Sin(t*0.0006))
+        P(bx0 + 4, by0 + 30, 7, 3, Alpha(0xFF1E3A2A, 50))
+        P(bx0 - 3, by0 - 2, 11, 7, 0xFFE8574A), P(bx0 - 2, by0 - 4, 9, 2, 0xFFE8574A), P(bx0 - 2, by0 + 5, 9, 2, 0xFFB83A2E), P(bx0, by0 - 3, 2, 9, 0xFFFFE08A), P(bx0 + 4, by0 - 3, 2, 9, 0xFFFFE08A)
+        P(bx0 + 1, by0 + 8, 4, 2, 0xFF8A5A3A), P(bx0 + 1, by0 + 7, 1, 1, 0xFF5A3E2E), P(bx0 + 4, by0 + 7, 1, 1, 0xFF5A3E2E)
+    }
+    if (lv >= 5) {                                ; a festival: lanterns along the trunk path, and blooms over the square
+        loop 14 {
+            q := A_Index
+            lx := 4 + (q - 1)*10, ly := 41 + Mod(q, 2)
+            P(lx, ly, 1, 1, 0xFF5A3E2E), P(lx - 1, ly + 1, 3, 2, (Mod(Floor(t/300) + q, 4) = 0) ? 0xFFFFE9A8 : (Mod(q, 2) ? 0xFFE8574A : 0xFFFFE08A))
+        }
+        fph := Mod(t, 12000)
+        if (fph < 3600) {
+            loop 3 {
+                q := A_Index
+                fp := (fph - q*700)/2400.0
+                if (fp < 0 || fp > 1)
+                    continue
+                fcx := 60 + q*7, fcy := 44 + Mod(q, 2)*6
+                fcl := (q = 1) ? 0xFFFF6A6A : (q = 2) ? 0xFFFFE08A : 0xFF8AB8FF
+                loop 10 {
+                    an := (A_Index - 1)*0.6283
+                    rr := Round(fp*10)
+                    P(fcx + Round(rr*Cos(an)), fcy + Round(rr*Sin(an)*0.7), 1, 1, Alpha(fcl, Round(230*(1 - fp))))
+                }
+            }
+        }
     }
     ; the shadows of birds, crossing fast
     loop 3 {
@@ -52335,15 +52879,8 @@ PanelBackdropDark(x, y, w, h, acc, f, now, k) {
 ; screen while the boot queues (place stats, icons, every game's thumbnail
 ; reel) are still draining. The pumps ask this before each spawn or decode
 ; and wait a tick when it says so; nothing they fetch is needed mid-drag.
-DragBusy() {
-    global gateDrag, dragOn
-    if !IsSet(gateDrag)
-        gateDrag := 0
-    if !IsSet(dragOn)
-        dragOn := 0
-    return gateDrag || (IsObject(HL) && HL.drag) || dragOn
-        || (IsObject(PZO) && PZO.HasOwnProp("dragOn") && PZO.dragOn)
-}
+DragBusy() => gateDrag || (IsObject(HL) && HL.drag) || dragOn
+           || (IsObject(PZO) && PZO.HasOwnProp("dragOn") && PZO.dragOn)
 
 ; ---- a soft radial glow ----
 ; GDI+ path gradients are expensive to build every frame; n rings of the same
