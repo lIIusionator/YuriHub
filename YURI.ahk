@@ -10,7 +10,7 @@
 ;@Ahk2Exe-SetDescription   YURI - Control Suite
 ;@Ahk2Exe-SetProductName   YURI
 ;@Ahk2Exe-SetCompanyName   YURI
-;@Ahk2Exe-SetVersion       1.0.2.0
+;@Ahk2Exe-SetVersion       1.0.3.0
 ;@Ahk2Exe-SetCopyright     YURI
 ;@Ahk2Exe-SetOrigFilename  YURI.exe
 ;;@Ahk2Exe-SetMainIcon     YURI.ico
@@ -24,8 +24,8 @@
 ; version; the compiled updater installs a downloaded YURI.exe only if that is
 ; higher than the running one. ZVER, lower down, is built from these two, so
 ; the badge the hub draws can never disagree with the number the updater uses.
-global APP_VERSION := "1.0.2"
-global APP_STAGE   := ""         ; stable release
+global APP_VERSION := "1.0.3"
+global APP_STAGE   := ""        ; follows the number on every badge; "" once it is not a beta
 ; -----------------------------------------------------------------------------
 
 ; ============================================================================
@@ -573,17 +573,33 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
     csSEP  := Chr(1)
     csRoot := A_Args[3]
     csRepo := "lIIusionator/Community-Fflags"
+    ; The fourth argument is the parent's word for why it is asking: "force"
+    ; for a REFRESH press or a missing file, anything else for the automatic
+    ; sync at boot and on opening the panel. It decides one thing - whether
+    ; the HEAD gate below may skip the round trip.
+    csForced := (A_Args.Length >= 4 && A_Args[4] = "force") ? 1 : 0
+    ; ---- commsync helpers ----
     ; CommGet, not GetT. Definitions inside these arg blocks are hoisted
     ; GLOBALLY, so every child in the file shares one namespace: the profile
     ; child already publishes a GetT and a second one is a load-time error, not
     ; a shadow. Each child names its own fetcher.
+    ;
+    ; The body on 200 and "" otherwise - but the status and the one header the
+    ; rate-limit branch reads are left behind in csLastStatus / csLastReset,
+    ; because a 403 from the API is not "could not reach the repository", and
+    ; telling the user it was is what sent them deleting folders.
+    csLastStatus := 0, csLastReset := 0
     CommGet(url) {
+        global csLastStatus, csLastReset
+        csLastStatus := 0, csLastReset := 0
         try {
             w := ComObject("WinHttp.WinHttpRequest.5.1")
             w.SetTimeouts(6000, 6000, 8000, 20000)
             w.Open("GET", url, false)
             w.SetRequestHeader("User-Agent", "YURI")
             w.Send()
+            csLastStatus := w.Status
+            try csLastReset := Integer(w.GetResponseHeader("X-RateLimit-Reset"))
             return (w.Status = 200) ? w.ResponseText : ""
         }
         return ""
@@ -600,6 +616,46 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
         n := RTrim(n, " .")                   ; Windows silently drops these
         return (n = "") ? "_" : n
     }
+    ; ---- git's own name for a file ----
+    ; A blob is named by SHA-1 over "blob <length>\0<bytes>", which is what
+    ; the tree reports for every file. Computed here for a body that was
+    ; fetched WITHOUT the tree (the rate-limit branch), so the index still
+    ; carries the hash the next tree will report and the set is kept then
+    ; rather than fetched again. The bytes are the file's UTF-8, which is what
+    ; the repository holds; if a file ever hashed differently here it would
+    ; simply be fetched once more, never kept wrongly.
+    CommBlobSha(txt) {
+        n   := StrPut(txt, "UTF-8") - 1
+        hdr := "blob " n
+        hn  := StrPut(hdr, "UTF-8") - 1
+        buf := Buffer(hn + 1 + n + 1, 0)
+        StrPut(hdr, buf, hn + 1, "UTF-8")            ; header, then the NUL git puts after it
+        StrPut(txt, buf.Ptr + hn + 1, n + 1, "UTF-8")
+        out := "", hProv := 0, hHash := 0
+        ; PROV_RSA_AES (24) with CRYPT_VERIFYCONTEXT: no key container, no
+        ; user profile, nothing persists
+        if DllCall("advapi32\CryptAcquireContextW", "ptr*", &hProv, "ptr", 0, "ptr", 0, "uint", 24, "uint", 0xF0000000) {
+            if DllCall("advapi32\CryptCreateHash", "ptr", hProv, "uint", 0x8004, "ptr", 0, "uint", 0, "ptr*", &hHash) {  ; CALG_SHA1
+                dig := Buffer(20, 0), dl := 20
+                if (DllCall("advapi32\CryptHashData", "ptr", hHash, "ptr", buf, "uint", hn + 1 + n, "uint", 0)
+                    && DllCall("advapi32\CryptGetHashParam", "ptr", hHash, "uint", 2, "ptr", dig, "uint*", &dl, "uint", 0)) {  ; HP_HASHVAL
+                    loop 20
+                        out .= Format("{:02x}", NumGet(dig, A_Index - 1, "UChar"))
+                }
+                DllCall("advapi32\CryptDestroyHash", "ptr", hHash)
+            }
+            DllCall("advapi32\CryptReleaseContext", "ptr", hProv, "uint", 0)
+        }
+        return out
+    }
+    ; The newest commit's id, from the commit feed. That feed is a page of the
+    ; website, not the REST API: it is not metered, and it is served fresh -
+    ; the response says must-revalidate, and the feed is rendered from the
+    ; repository at the moment it is asked for. Empty when it cannot be read.
+    CommHead(feed) {
+        return RegExMatch(feed, "Grit::Commit/([0-9a-f]{40})", &m) ? m[1] : ""
+    }
+    ; ---- /commsync helpers ----
     CommReply(msg) {
         b := Buffer(StrPut(msg, "UTF-16")), StrPut(msg, b, "UTF-16")
         cd := Buffer(A_PtrSize*3)
@@ -609,77 +665,145 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
         DllCall("SendMessage", "ptr", Integer(A_Args[2]), "uint", 0x4A, "ptr", 0, "ptr", cd)
         ExitApp
     }
-    ; ---- 1. the tree ----
-    csTree := CommGet("https://api.github.com/repos/" csRepo "/git/trees/HEAD?recursive=1")
-    if (csTree = "")
-        CommReply("ERR" csSEP "could not reach the repository")
-    ; ---- 2. sort the paths into folders ----
+    ; ---- 0. what the last sync left ----
+    ; Read before anything is fetched, because two decisions below depend on
+    ; it: whether there is anything to do at all, and what can still be
+    ; refreshed when the API is closed to us. The old index carries the hash
+    ; of every set it wrote (field 7 of an S line, field 5 of a C line for the
+    ; place marker) and, from this build on, an H line naming the commit it
+    ; was written from. Indexes from before carry neither and simply re-fetch
+    ; everything once.
+    csOldS := Map(), csOldC := Map(), csOldOrder := []
+    csOldHead := "", csOldFull := 0, csOldAllHere := 1
+    csOldTxt := ""
+    try csOldTxt := FileRead(csRoot "\index.txt", "UTF-8")
+    csOldFold := "", csOldDir := ""
+    for csLn in StrSplit(csOldTxt, "`n", "`r") {
+        csFl := StrSplit(csLn, csSEP)
+        if (csFl.Length >= 2 && csFl[1] = "H") {
+            csOldHead := csFl[2]
+            csOldFull := (csFl.Length >= 3 && csFl[3] = "1") ? 1 : 0
+        } else if (csFl.Length >= 3 && csFl[1] = "C") {
+            csOldFold := csFl[2]
+            csOldDir  := (csFl.Length >= 4 && csFl[4] != "") ? csFl[4] : csFl[2]
+            csOldC[csOldFold] := {place: csFl[3], msha: (csFl.Length >= 5) ? csFl[5] : "", dir: csOldDir, files: []}
+            csOldOrder.Push(csOldFold)
+        } else if (csFl.Length >= 5 && csFl[1] = "S" && csOldFold != "") {
+            csDisk := (csFl.Length >= 6 && csFl[6] != "") ? csFl[6] : csFl[3]
+            csOldS[csOldFold "/" csFl[3]] := {who: csFl[4], cnt: csFl[5], disk: csDisk
+                , sha: (csFl.Length >= 7) ? csFl[7] : "", dir: csOldDir}
+            csOldC[csOldFold].files.Push(csFl[3])
+            if !FileExist(csRoot "\" csOldDir "\" csDisk)
+                csOldAllHere := 0
+        }
+    }
+    ; ---- 1. where HEAD is ----
+    ; Everything below is fetched BY COMMIT, never by branch name. This is
+    ; the fix for the bug that had a set stay stale until its folder was
+    ; deleted: the raw CDN keys its cache on the PATH ALONE - a query string
+    ; is ignored, which was measured, not assumed - and it may serve a
+    ; branch-name path from cache for five minutes after a push. In that
+    ; window the old fetch brought the old bytes down, wrote them over the
+    ; identical old copy, and recorded the NEW hash beside them. Every sync
+    ; after that saw hash-unchanged, kept the file, and the stale copy was
+    ; frozen in for good; REFRESH could not help because REFRESH ran the same
+    ; comparison. A commit id in the path is a path no cache has seen until
+    ; that commit exists, and what lives at it can never change - so a cache
+    ; hit there is always the right bytes.
+    csHead := CommHead(CommGet("https://github.com/" csRepo "/commits/HEAD.atom"))
+    ; The commit feed is the gate for the automatic syncs: same commit as the
+    ; index was written from, every file still on disk, last sync complete -
+    ; then there is nothing new, and this costs one unmetered request and no
+    ; API call at all. REFRESH skips the gate: it is the one place a person
+    ; is asking for the round trip, so it gets it.
+    if (!csForced && csHead != "" && csHead = csOldHead && csOldFull && csOldAllHere && csOldS.Count)
+        CommReply("OK" csSEP csOldS.Count csSEP 0 csSEP csOldS.Count)
+    ; With no feed there is still the branch name, which is what every sync
+    ; before this used; it keeps working when github.com is unreachable and
+    ; only the API and the CDN are not, at the cost of the cache lag above.
+    csRef := (csHead != "") ? csHead : "HEAD"
+    ; ---- 2. the tree ----
+    ; Named by the same commit, so it is the tree the raw files below belong
+    ; to - the two can no longer be from different moments.
+    csTree := CommGet("https://api.github.com/repos/" csRepo "/git/trees/" csRef "?recursive=1")
+    csLimited := 0, csNote := ""
+    if (csTree = "") {
+        ; ---- the API is metered; the files are not ----
+        ; Sixty requests an hour, per address, unauthenticated - and the
+        ; address is shared with everything else on the machine that talks
+        ; to GitHub's API. Before this a 403 was reported as "could not reach
+        ; the repository" and the sync gave up, which left a stale panel and
+        ; a REFRESH that did nothing for the rest of the hour. Now it is
+        ; named for what it is, and the sync carries on with what the tree
+        ; would have told it about the sets it already knows: their folders
+        ; and files from the old index, fetched at the new commit from the
+        ; raw host, which has no such meter. What this cannot do is discover
+        ; a set added since the last full sync - that waits for the limit to
+        ; reset, and the message says when.
+        if ((csLastStatus = 403 || csLastStatus = 429) && csOldOrder.Length) {
+            csLimited := 1
+            csWait := 0
+            if csLastReset
+                csWait := Ceil((csLastReset - DateDiff(A_NowUTC, "19700101000000", "Seconds"))/60.0)
+            csNote := "github api rate limit - known sets refreshed, new sets appear "
+                    . (csWait > 0 ? ("in " csWait " min") : "when it resets")
+        } else if (csLastStatus = 403 || csLastStatus = 429)
+            CommReply("ERR" csSEP "github api rate limit - try again in "
+                    . (csLastReset ? Max(1, Ceil((csLastReset - DateDiff(A_NowUTC, "19700101000000", "Seconds"))/60.0)) : 60) " min")
+        else
+            CommReply("ERR" csSEP "could not reach the repository")
+    }
+    ; ---- 3. sort the paths into folders ----
     ; One entry object at a time, then the keys out of it - so nothing here
     ; depends on the order GitHub happens to emit them in (path, mode, type,
     ; sha, size, url today), and a mirror or a proxy that reorders them is
     ; still read. An entry is one { } with no nesting, which is what the
     ; character class keys on.
     ;
-    ; ---- the sha is the whole point ----
     ; The tree names every blob by content hash. That hash changes exactly
     ; when the file's bytes change, so it answers "has this set changed since
-    ; the last sync" with no download at all - and it goes into the raw URL as
-    ; a query string, which makes a changed set a NEW url to every cache on
-    ; the way. Before this the files were fetched by branch name alone, and
-    ; the raw CDN is allowed to serve a branch-name url from cache for minutes
-    ; after a push: a sync run in that window brought the old bytes back down,
-    ; wrote them over the identical old copy, and reported success. Deleting
-    ; the folder "fixed" it only because the wait to do so outlasted the
-    ; cache. Now a set is re-fetched when, and only when, its hash moved.
-    csFolders := Map(), csOrder := [], csPos := 1
-    while (csPos := RegExMatch(csTree, '\{[^{}]*\}', &m, csPos)) {
-        csPos += m.Len
-        csObj := m[0]
-        if (!RegExMatch(csObj, '"path"\s*:\s*"([^"]*)"', &mp)
-                || !RegExMatch(csObj, '"type"\s*:\s*"(\w+)"', &mt))
-            continue
-        if (mt[1] != "blob")
-            continue
-        csSha  := RegExMatch(csObj, '"sha"\s*:\s*"([0-9a-fA-F]+)"', &ms) ? ms[1] : ""
-        csPath := mp[1]
-        csSl   := InStr(csPath, "/")
-        if (!csSl || InStr(csPath, "/", , csSl + 1))    ; top level only, one deep only
-            continue
-        csFold := SubStr(csPath, 1, csSl - 1)
-        csName := SubStr(csPath, csSl + 1)
-        if !csFolders.Has(csFold) {
-            csFolders[csFold] := {marked: 0, msha: "", files: []}
+    ; the last sync" with no download at all. A set is re-fetched when, and
+    ; only when, its hash moved - and now from a path that cannot lie about
+    ; which bytes it holds.
+    csFolders := Map(), csOrder := []
+    if !csLimited {
+        csPos := 1
+        while (csPos := RegExMatch(csTree, '\{[^{}]*\}', &m, csPos)) {
+            csPos += m.Len
+            csObj := m[0]
+            if (!RegExMatch(csObj, '"path"\s*:\s*"([^"]*)"', &mp)
+                    || !RegExMatch(csObj, '"type"\s*:\s*"(\w+)"', &mt))
+                continue
+            if (mt[1] != "blob")
+                continue
+            csSha  := RegExMatch(csObj, '"sha"\s*:\s*"([0-9a-fA-F]+)"', &ms) ? ms[1] : ""
+            csPath := mp[1]
+            csSl   := InStr(csPath, "/")
+            if (!csSl || InStr(csPath, "/", , csSl + 1))    ; top level only, one deep only
+                continue
+            csFold := SubStr(csPath, 1, csSl - 1)
+            csName := SubStr(csPath, csSl + 1)
+            if !csFolders.Has(csFold) {
+                csFolders[csFold] := {marked: 0, msha: "", files: []}
+                csOrder.Push(csFold)
+            }
+            if (csName = "place-id.ini")
+                csFolders[csFold].marked := 1, csFolders[csFold].msha := csSha
+            else if RegExMatch(csName, "i)\.json$")
+                csFolders[csFold].files.Push({name: csName, sha: csSha})
+        }
+    } else {
+        ; the old index stands in for the tree: same folders, same files, no
+        ; hashes - so every known set is fetched and hashed here
+        for csFold in csOldOrder {
+            csRec := {marked: 1, msha: "", files: []}
+            for csF in csOldC[csFold].files
+                csRec.files.Push({name: csF, sha: ""})
+            csFolders[csFold] := csRec
             csOrder.Push(csFold)
         }
-        if (csName = "place-id.ini")
-            csFolders[csFold].marked := 1, csFolders[csFold].msha := csSha
-        else if RegExMatch(csName, "i)\.json$")
-            csFolders[csFold].files.Push({name: csName, sha: csSha})
     }
-    ; ---- 2b. what the last sync left ----
-    ; The old index carries the hash of every set it wrote (field 7 of an S
-    ; line, field 5 of a C line for the place marker; indexes from before this
-    ; carry neither and simply re-fetch everything once). A set whose hash the
-    ; tree still reports, with its file still on disk, is kept as it is; the
-    ; author and the count come from the old line, so a kept set costs no
-    ; request at all.
-    csOldS := Map(), csOldC := Map()
-    csOldTxt := ""
-    try csOldTxt := FileRead(csRoot "\index.txt", "UTF-8")
-    csOldFold := "", csOldDir := ""
-    for csLn in StrSplit(csOldTxt, "`n", "`r") {
-        csFl := StrSplit(csLn, csSEP)
-        if (csFl.Length >= 3 && csFl[1] = "C") {
-            csOldFold := csFl[2]
-            csOldDir  := (csFl.Length >= 4 && csFl[4] != "") ? csFl[4] : csFl[2]
-            csOldC[csOldFold] := {place: csFl[3], msha: (csFl.Length >= 5) ? csFl[5] : ""}
-        } else if (csFl.Length >= 5 && csFl[1] = "S" && csOldFold != "") {
-            csOldS[csOldFold "/" csFl[3]] := {who: csFl[4], cnt: csFl[5]
-                , disk: (csFl.Length >= 6 && csFl[6] != "") ? csFl[6] : csFl[3]
-                , sha: (csFl.Length >= 7) ? csFl[7] : "", dir: csOldDir}
-        }
-    }
-    ; ---- 3. mirror the qualifying files ----
+    ; ---- 4. mirror the qualifying files ----
     csGen := "", csGame := "", csN := 0, csNew := 0, csSame := 0
     for csFold in csOrder {
         csRec   := csFolders[csFold]
@@ -689,13 +813,13 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
         csPlace := ""
         if !csIsGen {
             ; the marker is a file like any other: unchanged hash, known id,
-            ; no request
+            ; no request. Without a tree to say either way (rate limited) the
+            ; id on record is trusted - a place does not change its number.
             csPrevC := csOldC.Has(csFold) ? csOldC[csFold] : 0
-            if (csPrevC && csRec.msha != "" && csPrevC.msha = csRec.msha && csPrevC.place != "")
-                csPlace := csPrevC.place
+            if (csPrevC && csPrevC.place != "" && (csLimited || (csRec.msha != "" && csPrevC.msha = csRec.msha)))
+                csPlace := csPrevC.place, csRec.msha := csLimited ? csPrevC.msha : csRec.msha
             else {
-                csRaw := CommGet("https://raw.githubusercontent.com/" csRepo "/HEAD/" csFold "/place-id.ini"
-                               . (csRec.msha != "" ? "?sha=" csRec.msha : ""))
+                csRaw := CommGet("https://raw.githubusercontent.com/" csRepo "/" csRef "/" csFold "/place-id.ini")
                 if RegExMatch(csRaw, "(\d{6,})", &mi)   ; a bare id, however it is padded
                     csPlace := mi[1]
             }
@@ -721,19 +845,21 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
                 csN++, csSame++
                 continue
             }
-            csBody := CommGet("https://raw.githubusercontent.com/" csRepo "/HEAD/" csFold "/" csF
-                            . (csSha != "" ? "?sha=" csSha : ""))
+            csBody := CommGet("https://raw.githubusercontent.com/" csRepo "/" csRef "/" csFold "/" csF)
             if (csBody = "") {
                 ; A fetch that failed is a fetch that failed, not a set that
                 ; went away: the last good copy stays listed under its OLD hash,
                 ; so the next sync tries it again rather than the row vanishing
-                ; for the length of a bad connection.
-                if (csPrev && FileExist(csDir "\" csPrev.disk)) {
+                ; for the length of a bad connection. A 404 at the new commit
+                ; IS a set that went away, and it is not carried.
+                if (csLastStatus != 404 && csPrev && FileExist(csDir "\" csPrev.disk)) {
                     csKept .= "S" csSEP csFold csSEP csF csSEP csPrev.who csSEP csPrev.cnt csSEP csPrev.disk csSEP csPrev.sha "`n"
                     csN++
                 }
                 continue
             }
+            if (csSha = "")
+                csSha := CommBlobSha(csBody)
             csWho := "UNKNOWN"
             if RegExMatch(csBody, "m)^[ \t]*//[ \t]*#[ \t]*(\S.*?)[ \t]*$", &mc)
                 csWho := mc[1]
@@ -748,6 +874,11 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
             if (csCnt = 0)
                 continue
             csSafe := CommSafe(csF)
+            ; A set fetched under a hash the index already holds is one the
+            ; rate-limit branch re-read and found unchanged - that is "kept",
+            ; not "updated", however it was learned.
+            csWasSame := (csPrev && csPrev.sha != "" && csPrev.sha = csSha && csPrev.who = csWho
+                       && FileExist(csDir "\" csSafe))
             try FileDelete(csDir "\" csSafe)
             try FileAppend(csTxt, csDir "\" csSafe, "UTF-8")
             ; VERIFIED, not assumed. Both calls above are wrapped in try, so
@@ -755,7 +886,11 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
             if !FileExist(csDir "\" csSafe)
                 continue
             csKept .= "S" csSEP csFold csSEP csF csSEP csWho csSEP csCnt csSEP csSafe csSEP csSha "`n"
-            csN++, csNew++
+            csN++
+            if csWasSame
+                csSame++
+            else
+                csNew++
         }
         if (csKept = "")
             continue
@@ -766,11 +901,16 @@ if A_Args.Length >= 3 && A_Args[1] = "commsync" {
             csGame .= "C" csSEP csFold csSEP csPlace csSEP csDirN csSEP csRec.msha "`n" csKept
     }
     if (csN = 0)
-        CommReply("ERR" csSEP "the repository has no usable sets")
+        CommReply("ERR" csSEP (csLimited ? "github api rate limit - nothing cached to refresh" : "the repository has no usable sets"))
+    ; The H line: which commit this index describes, and whether it saw the
+    ; whole tree (1) or only what the old index knew (0). The parent's loader
+    ; ignores it; the next child reads it, and the gate above trusts it only
+    ; when it says 1.
     try FileDelete(csRoot "\index.txt")
-    try FileAppend(csGen csGame, csRoot "\index.txt", "UTF-8")
-    ; total, fetched fresh, kept unchanged - the parent says so after a REFRESH
-    CommReply("OK" csSEP csN csSEP csNew csSEP csSame)
+    try FileAppend("H" csSEP csRef csSEP (csLimited ? 0 : 1) "`n" csGen csGame, csRoot "\index.txt", "UTF-8")
+    ; total, fetched fresh, kept unchanged, and a note for the status line -
+    ; the parent says all of it after a REFRESH
+    CommReply("OK" csSEP csN csSEP csNew csSEP csSame csSEP csNote)
 }
 
 if A_Args.Length >= 3 && A_Args[1] = "rbxstats" {
@@ -1942,11 +2082,25 @@ global TOG_MS := 650, TICK_A := 16, TICK_S := 33, TICK_D := 33, TICK_Z := 50
 ; before, and it halves the deep rate rather than dividing it by ten: ten
 ; frames a second is the floor for something that is on screen.
 global TICK_G := 100
+; ...and the rate when nobody can see it at all: Roblox in front, the hub not
+; on top, and the hub's whole rectangle inside the game's window. A frame a
+; second keeps the clocks honest and means the hub is never more than a
+; second stale when the game is minimised or moved off it, and costs what a
+; single frame costs. This is the case a full-screen player with the hub on
+; the same monitor is in for the whole of a session - and the case where the
+; deep-idle tiers were still drawing twenty frames a second of a picture
+; nothing was displaying. See HubCovered.
+global TICK_BG := 1000
 global HUB_DEEP_MS := 4000
 ; LOW PERFORMANCE MODE's one idle rate: the frame asks for it by name when a
 ; flourish still has to land - a flash fading, a message expiring - and for
 ; nothing else. Every other idle tier is a STOP in that mode; see HubTim.
 global TICK_LP := 250
+; the frame rate a window drag runs its lift and tilt at, in the normal mode.
+; The window itself no longer waits for a frame to move - see HubMoveOnly -
+; so the drag's frames only carry its ornament, and twenty a second is plenty
+; for a 2 % lift and a three-degree lean.
+global TICK_DR := 48
 ; the hover watcher's period - a hit test, no drawing - see HubWatch
 global HUB_WATCH_MS := 50
 global C_ON := 0xFF34D399, C_OFF := 0xFFFB7185
@@ -2001,6 +2155,19 @@ global RN_probed := 0                    ; has this notice checked whether it ac
 global RN_px := 0, RN_py := 0            ; where the notice window was placed
 
 global shadowCache := Map()
+; ---- backdrop bitmap cache ----
+; The ambient texture (PanelBackdrop / MiniBackdrop / MicroBackdrop) is
+; rasterised into PARGB bitmaps and blitted, re-rasterised every BD_MS. See
+; BdBlit, next to ShadowDraw. bdBypass is raised by a renderer for a frame in
+; which its surface is changing scale under the blit.
+global bdCache := Map(), bdBytes := 0, bdBypass := 0
+global bdSpent := 0, bdMade := 0          ; this frame: bytes rasterised, bitmaps created
+global bdTrimAt := 0                      ; last placeholder sweep - see BdTrim
+global BD_MAKE := 12                      ; bitmaps one frame may create (each is an alloc + a Graphics + a raster)
+global BD_MS := 80                        ; refresh period of a cached texture
+global BD_SETTLE := 150                   ; a size must hold this long before it earns a bitmap
+global BD_BUDGET := 640*1024              ; bytes of texture one frame may rasterise before deferring; a card-sized
+                                          ; entry exceeds it alone, so the big ones refresh in a frame of their own
 global brCache := Map(), brOwn := Map()   ; solid-brush cache; see SBrushP
 ; ---- brushes a caller must free ----
 ; DelB used to free any handle it did not find in brOwn - the cached set - and
@@ -2019,6 +2186,7 @@ global brTemp := Map()
 ; instead of deleting it twice. One flush's worth is the whole race window.
 global brDead := Map()
 global penCache := Map(), penOwn := Map() ; pen cache; see PenP
+global penDirty := Map()                  ; cached pens carrying a dash - see PenDash
 ; ---- colour memos ----
 ; TH and AccHi are the two highest-frequency functions in the renderer. TH runs
 ; on EVERY colour that reaches a brush or a pen - around seventeen hundred times
@@ -2073,6 +2241,7 @@ global BW := CW + PAD*2, BH := CH + PAD*2
 ; that way - none of them reads scaleF, and none of them may start.
 global uiRes := UiResScale()
 global scaleF := (A_ScreenDPI / 96) * uiRes
+global bdScale := scaleF                  ; scale of the surface being drawn; ResetSurface keeps it current
 global PW := Round(BW*scaleF), PH := Round(BH*scaleF)
 global winPX := 0, winPY := 0
 
@@ -3091,6 +3260,7 @@ FFM.raSkipN  := Map()      ; flag name -> current backoff length
 FFM.raVP     := Map()
 FFM.raSaidAt := 0          ; last drift toast, so a losing fight is not spam
 FFM.raQuiet  := 0          ; ticks in a row that found nothing to put back - see FFMReApplyIdle
+FFM.pollMs   := 1200       ; the poll's current period - 1.2 s looking for a client, 4 s once it has one
 FFM.raHeld   := 0          ; flags confirmed at their wanted value last tick
 ; last known "list|mask" identity of Roblox's flag table, so FFMPoll can spot
 ; the table being rebuilt WITHOUT the pid changing (an in-place teleport to
@@ -5458,7 +5628,9 @@ FFMCommSync(force := 0) {
     ; A continuation line has to START with an operator - the third line here
     ; began with a string literal, which AHK reads as a new statement and
     ; rejects as having no action.
-    args := ' commsync ' ui.Hwnd ' "' YURI_COMM '"'
+    ; "force" tells the child a person asked (REFRESH, a missing file), so
+    ; it must not take the HEAD-unchanged shortcut - see the child's gate.
+    args := ' commsync ' ui.Hwnd ' "' YURI_COMM '"' (force ? ' force' : '')
     cmd := A_IsCompiled ? '"' A_ScriptFullPath '"' args
                         : '"' A_AhkPath '" "' A_ScriptFullPath '"' args
     try Run(cmd, , "Hide", &commSyncPid)
@@ -5511,8 +5683,15 @@ FFMCommSynced(payload) {
         if forced {
             tot  := (f.Length >= 2) ? f[2] : "?"
             nNew := (f.Length >= 3) ? f[3] : "?"
+            ; field 5 is the child's own caveat, when it has one - today
+            ; that is the API rate limit, which lets it refresh the sets it
+            ; knows but not discover new ones. Amber, because the answer is
+            ; true and incomplete at once.
+            note := (f.Length >= 5) ? f[5] : ""
             FFMSay("COMMUNITY REFRESHED - " tot " SET" (tot = 1 ? "" : "S")
-                 . "  ·  " (nNew = 0 ? "NOTHING CHANGED" : (nNew " UPDATED")), 0xFF34D399)
+                 . "  ·  " (nNew = 0 ? "NOTHING CHANGED" : (nNew " UPDATED"))
+                 . (note != "" ? ("  ·  " StrUpper(note)) : "")
+                 , note != "" ? AMBER : 0xFF34D399)
         }
     } else {
         ; The cache is still whatever the last good sync left, so a failure is
@@ -5612,7 +5791,7 @@ FFMBoot() {
     FFMHistLoad()
     FFMReindex()
     SetTimer(FFMFetchDb, -600)
-    SetTimer(FFMPoll, 1200)
+    SetTimer(FFMPoll, 1200), FFM.pollMs := 1200
     FFMManageReApply()
 }
 
@@ -7392,8 +7571,11 @@ HubOpenRoblox() {
 ; failed set, the counters, and the singleton's cached addresses.
 ; The staged flag set is deliberately NOT per-instance - the reason to run four
 ; clients is to give them all the same flags.
-FFMProcList() {
-    out := []
+; crash, when the caller asks for it, receives the pids of every
+; RobloxCrashHandler.exe in the same snapshot - DISABLE CRASH HANDLER reads it
+; from here rather than walking the process list a second time.
+FFMProcList(&crash := "") {
+    out := [], crash := []
     snap := DllCall("CreateToolhelp32Snapshot", "UInt", 0x02, "UInt", 0, "Ptr")
     if (snap && snap != -1) {
         sz := (A_PtrSize = 8) ? 568 : 556
@@ -7402,8 +7584,11 @@ FFMProcList() {
         nameOff := (A_PtrSize = 8) ? 44 : 36
         if DllCall("Process32FirstW", "Ptr", snap, "Ptr", pe) {
             loop {
-                if (StrGet(pe.Ptr + nameOff, "UTF-16") = "RobloxPlayerBeta.exe")
+                nm := StrGet(pe.Ptr + nameOff, "UTF-16")
+                if (nm = "RobloxPlayerBeta.exe")
                     out.Push(NumGet(pe, 8, "UInt"))
+                else if (nm = "RobloxCrashHandler.exe")
+                    crash.Push(NumGet(pe, 8, "UInt"))
                 if !DllCall("Process32NextW", "Ptr", snap, "Ptr", pe)
                     break
             }
@@ -7635,11 +7820,17 @@ FFMHasPid(lst, pid) {
 
 ; ---------------- process monitor ----------------
 FFMPoll() {
-    global ffAutoInject, ffReApply
+    global ffAutoInject, ffReApply, spfCrash
     ; Track EVERY client, not just the first one ProcessExist happens to
     ; return. FFM.inst drives the tab strip; the selected tab is the process
     ; the engine is attached to.
-    FFM.inst := FFMProcList()
+    FFM.inst := FFMProcList(&crashPids)
+    ; ---- DISABLE CRASH HANDLER rides this same snapshot ----
+    ; Before the presence branches below, because the handler is worth closing
+    ; whether or not a player client is up (Studio starts the same exe), and
+    ; the no-client branch returns early.
+    if (spfCrash && crashPids.Length)
+        SPFCrashSweep(crashPids)
     for dead in FFMDeadPids(FFM.inst) {      ; a client that went away
         FlagSingleton.Forget(dead)
         if FFM.ps.Has(dead)
@@ -7764,6 +7955,18 @@ FFMPoll() {
             FFM.lastHdrKey := key
         }
     }
+    ; ---- two speeds ----
+    ; 1.2 s is the right rate for NOTICING a client - AUTO INJECT is waiting
+    ; on it. Once a client is attached there is nothing to notice quickly: a
+    ; second instance, a close, a rebuild - all of them fine at four seconds.
+    ; So the poll slows to 4 s while attached and comes back to 1.2 s when the
+    ; client goes, which cuts its snapshot, its liveness call and its header
+    ; read to under a third of what they were for the whole of a session - on
+    ; a machine already at the top of its CPU with the game running, the one
+    ; loop the hub keeps up throughout play.
+    want := (FFM.pid && MemIO.hProcess) ? 4000 : 1200
+    if (want != FFM.pollMs)
+        FFM.pollMs := want, SetTimer(FFMPoll, want)
 }
 
 ; Delayed auto-inject, fired from a one-shot timer scheduled either by a fresh
@@ -11036,7 +11239,7 @@ FFMBtn(z, bx, by, bw, bh, label, acc, ff, kind := 0, fnt := 0) {
         b := SBrush(FA(Alpha(0xFFFFFF, 5), ff))
         FillRR(bx, by, bw, bh, 6, b), DelB(b)
         pn := Pen(FA(Alpha(0xFF9AA8C0, 46), ff), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+        PenDash(pn, 1)
         StrokeRR(bx, by, bw, bh, 6, pn), DelP(pn)
         ; both endpoints explicit - an arbitrary grey falls through THLight's
         ; heuristics and comes back as ink, which would be darker than the
@@ -11514,7 +11717,7 @@ FFMCards(x0, y0, dx, dy2, ff, now, acc) {
     ; icon: a broadcast mark - three arcs leaving a dot, the outer ones only
     ; lighting up once the features are actually on
     spfOn := (spfDiscord ? 1 : 0) + (spfRegion ? 1 : 0) + (spfMatch ? 1 : 0) + (spfOdds ? 1 : 0)
-           + (spfMulti ? 1 : 0) + (spfFps ? 1 : 0)
+           + (spfMulti ? 1 : 0) + (spfFps ? 1 : 0) + (spfCrash ? 1 : 0) + (spfMem ? 1 : 0)
     icx := mx + 24, icy := myF + mhF/2 + 4
     b := SBrush(FA(Alpha(AccHi(acc, 0.3), 200 + 55*stF), ff))
     FillEll(icx - 2.6, icy - 2.6, 5.2, 5.2, b), DelB(b)
@@ -12282,8 +12485,8 @@ FFMStatus(ax, sy, ff, now, acc) {
     }
     if FFM.loading {
         pn := Pen(FA(Alpha(acc, 200), ff), 1.6)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.06, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.06, 1000))
         Ell(ax + HL.abw - 16, sy - 1, 14, 14, pn), DelP(pn)
         Txt("loading database", ax + HL.abw - 136, sy, 112, 15, HL.fS, FA(0x60C7CBE0, ff), fmtR)
     }
@@ -15631,7 +15834,7 @@ LGISystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
     Txt("ROBLOX", ax + 44, sy + 9, 50, 12, HL.fXs, FA(Alpha(rbxUp ? C_ON : 0xFFC7CBE0, Round((rbxUp ? 220 : 130)*cg0)), ff), fmtL)
     lx0 := ax + 96, lx1 := ax + HL.abw - 96, ly := sy + 15
     pn := Pen(FA(Alpha(armed ? acc : 0xFFC7CBE0, Round((armed ? 110 : 50)*cg0)), ff), 1.2)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+    PenDash(pn, 2)
     Line(lx0, ly, lx1, ly, pn), DelP(pn)
     if (armed && rbxUp && !hubLowPerf) {
         loop 3 {
@@ -15686,7 +15889,7 @@ LGISystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
         ; ---- the empty state: an invitation, then the explanation ----
         ey := ay + LGI_TOP + 6
         pn := Pen(FA(Alpha(acc, Round(90*cg0)), ff), 1.2)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+        PenDash(pn, 1)
         StrokeRR(ax + 14, ey, HL.abw - 28, 60, 10, pn), DelP(pn)
         b := SBrush(FA(Alpha(acc, Round(14*cg0)), ff))
         FillRR(ax + 14, ey, HL.abw - 28, 60, 10, b), DelB(b)
@@ -16273,9 +16476,9 @@ TutBuild() {
                , "back to its first choice without touching the disk; OPEN FILE"
                , "opens the client settings file itself."]})
     ; ---- SPECIAL FEATURES ----
-    st.Push({tab: 2, mod: 5, ttl: "SPECIAL FEATURES: SIX SWITCHES", cur: 0, glyph: "pin"
+    st.Push({tab: 2, mod: 5, ttl: "SPECIAL FEATURES: EIGHT SWITCHES", cur: 0, glyph: "pin"
         , anchor: () => TutSPFRows(1, 3)
-        , body: ["Six switches, three at a time - the list scrolls. DISCORD"
+        , body: ["Eight switches, three at a time - the list scrolls. DISCORD"
                , "ACTIVITY shows the game you are in on your Discord profile,"
                , "with chips for your account, a join link and whether Roblox is"
                , "the focused window. SHOW SERVER REGION reads the server out of"
@@ -16283,7 +16486,9 @@ TutBuild() {
                , "FINDER rejoins - up to fifteen times - until the server is"
                , "close to you; it is the one switch that restarts Roblox on you."]})
     st.Push({tab: 2, mod: 5, ttl: "MATCHMAKING, INSTANCES, FPS", cur: 0, glyph: "pin"
-        , sps: () => SPFSysTotal()
+        ; row 4 at the top of the window, so 4..6 are the three on screen -
+        ; SPFSysTotal() now scrolls to a seventh row and would push row 4 out
+        , sps: () => SPFSysRowY(4) - SPFSysRowY(1)
         , anchor: () => TutSPFRows(4, 6)
         , body: ["BETTER MATCHMAKING, marked experimental, never rejoins anyone:"
                , "each join teaches it how far one server is, and later joins"
@@ -16292,6 +16497,16 @@ TutBuild() {
                , "launch them from the website, not the shortcut. FPS BOOST"
                , "buys frames without touching a graphics setting, and its row"
                , "reports what it managed and where the bottleneck sits."]})
+    st.Push({tab: 2, mod: 5, ttl: "CRASH HANDLER, MEMORY TRIMMER", cur: 0, glyph: "pin"
+        , sps: () => SPFSysTotal()
+        , anchor: () => TutSPFRows(7, 8)
+        , body: ["DISABLE CRASH HANDLER closes RobloxCrashHandler.exe, the"
+               , "watchdog Roblox starts beside every client; if the client then"
+               , "crashes it simply closes, with no crash box. MEMORY TRIMMER"
+               , "empties the client's working set on a schedule - its two chips"
+               , "set how often, and a size the client must reach first. The"
+               , "client faults the pages straight back, so expect a hitch at"
+               , "each trim; it is for machines that are short of RAM."]})
     st.Push({tab: 2, mod: 5, ttl: "ACCOUNTS, PLACES, AND THE LINK FIELDS", cur: 0, glyph: "folder"
         , anchor: () => [HL.abx, HL.aby + 134, HL.abw, HL.spfh - 134]
         , body: ["Under the switches, two libraries and two link fields."
@@ -16895,8 +17110,8 @@ TutDraw(now, acc) {
         ; a dashed orbit walking round the light, the way the gate's frame does
         if !hubLowPerf {
             pn := Pen(FA(Alpha(acc, 110), f), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", -Mod(DecT(now)*0.02, 1000))
+            PenDash(pn, 1)
+            PenDashOff(pn, -Mod(DecT(now)*0.02, 1000))
             StrokeRR(hx - 9, hy - 9, hw + 18, hh + 18, 18, pn), DelP(pn)
         }
         ; the click flash: the ring blinks bright when the ghost cursor lands
@@ -18639,13 +18854,16 @@ FFMDetail(i) {
 }
 SPFDetail(i) {
     ttl := ["DISCORD ACTIVITY", "SHOW SERVER REGION", "AUTO-REGION FINDER"
-          , "BETTER MATCHMAKING", "MULTI-ROBLOX INSTANCES", "FPS BOOST"]
+          , "BETTER MATCHMAKING", "MULTI-ROBLOX INSTANCES", "FPS BOOST"
+          , "DISABLE CRASH HANDLER", "MEMORY TRIMMER"]
     hnt := ["show the roblox game you are in on your discord profile"
           , "show which region your current server is hosted in"
           , "rejoin until you land on a server in your own region"
           , "picks a server this session already measured as close to you"
           , "run more than one roblox client at once, on different accounts"
-          , "more frames without changing a single graphics setting"]
+          , "more frames without changing a single graphics setting"
+          , "closes RobloxCrashHandler.exe after each launch to free its memory"
+          , "evicts the client's memory on a schedule - can cause stutter"]
     b1 := "Publishes what you are playing to Discord over its local pipe - the "
         . "game's name, its icon, how long you have been in, and a link to the "
         . "game page. The three chips on this row add your Roblox account, a "
@@ -18866,7 +19084,73 @@ SPFDetail(i) {
     ; Appended rather than written into b6, because it is the only part of this
     ; sheet that is not the same every time it is opened.
     b6 .= SPFFpsHeld()
-    bdy := [b1, b2, b3, b4, b5, b6]
+    b7 := "Roblox starts a second program beside every client: "
+        . "RobloxCrashHandler.exe. It is a watchdog. It sits idle for the whole "
+        . "session, and only does anything if the client dies - then it shows "
+        . "the crash box and sends the crash report to Roblox. While the client "
+        . "is running it contributes nothing, so with this on it is closed as "
+        . "soon as it is seen, which frees the memory it holds - a few tens of "
+        . "megabytes, and one process fewer on the list. Bloxstrap, Fishstrap "
+        . "and Bubblestrap all do the same, on by default.  "
+        . "HOW IT WORKS. The same process list the fast flag manager already "
+        . "walks to find clients now also notes the crash handler, so this row "
+        . "costs no enumeration of its own; whatever it finds is closed on the "
+        . "same tick. That poll runs every 1.2 seconds while no client is "
+        . "attached and every 4 while one is, so a handler lives at most a few "
+        . "seconds past the launch that started it. Turning the switch on also "
+        . "sweeps once immediately, so a handler already sitting beside a "
+        . "running client goes at the click. Studio starts the same executable "
+        . "and it is closed too; Studio does not need it. Nothing is written "
+        . "to any Roblox file and nothing is done to the client itself.  "
+        . "THE COST, plainly: if the client crashes while this is on, it "
+        . "simply closes. No 'Roblox has crashed' box, no crash report, and "
+        . "nothing is sent to Roblox - which is why it is off by default. If a "
+        . "crash is something you would want to read about or report, leave "
+        . "this off. Turning it off puts nothing back: a handler already "
+        . "closed stays closed, and Roblox starts a fresh one with the next "
+        . "client. The row counts what it closed this session; a count that "
+        . "never moves with clients running is the sign to run YURI as "
+        . "administrator, since a process it cannot open it cannot close."
+    b8 := "On a schedule - the first chip - this empties the working set of "
+        . "every Roblox client: the pages the client has in physical memory are "
+        . "handed back to Windows, and the number beside it in Task Manager "
+        . "drops, usually by a lot. This is the same call Bloxstrap, Fishstrap "
+        . "and Bubblestrap make for their Memory Trimmer.  "
+        . "BE CLEAR ABOUT WHAT IT DOES. The client has not stopped needing "
+        . "those pages. It faults them back in as it touches them, which is "
+        . "the stutter you feel just after each trim, and within a minute or "
+        . "so its working set is back to roughly where it was. Nothing is "
+        . "freed for good; what changes is WHEN the memory is given up. That "
+        . "is worth something on a machine with too little RAM, where the "
+        . "alternative is Windows paging out whatever it likes - your browser, "
+        . "Discord, the game itself - at a moment of its choosing. On a "
+        . "machine with enough RAM it is a hitch bought for a smaller number, "
+        . "which is exactly why FPS BOOST does not do it: that row holds the "
+        . "client's memory priority at normal so Windows will NOT trim it, and "
+        . "with both switches on they are pulling in opposite directions. Use "
+        . "one or the other.  "
+        . "THE SECOND CHIP is what makes this a tool rather than a tic. With a "
+        . "limit set, a client is left alone until its working set is over "
+        . "that size, so the trim happens only once the client has actually "
+        . "grown into a problem - and the chip goes amber while it is holding "
+        . "the trimmer back. NO LIMIT trims every client every time, which is "
+        . "Bubblestrap's default and the one setting here that is hard to "
+        . "recommend. Both chips cycle through presets; zeal.ini takes any "
+        . "number under [special] memint (seconds) and memthr (MB).  "
+        . "Each tick opens every client with the two rights the call needs and "
+        . "no others, reads the size, trims if allowed, reads it again for the "
+        . "tally, and closes the handle at once - never held between ticks, "
+        . "because the anti-cheat is known to object to a foreign handle kept "
+        . "open for long. Nothing is written to any file and no setting of the "
+        . "client's is touched. Turning it off puts nothing back, because there "
+        . "is nothing to put back: the client has already reclaimed what it "
+        . "needs. The row shows the biggest client's working set and how many "
+        . "times the trimmer has fired; a size that never appears means the "
+        . "handle was refused, and running YURI as administrator is the fix."
+    ; live, like row 6's: the reading is the only thing about this row that
+    ; is different each time the sheet is opened
+    b8 .= SPFMemHeld()
+    bdy := [b1, b2, b3, b4, b5, b6, b7, b8]
     if (i < 1 || i > bdy.Length)
         return
     DetailOpen(ttl[i], hnt[i], bdy[i], "SPECIAL")
@@ -19636,7 +19920,7 @@ CurTile(si, tx, ty, zone, fp, now, acc, cp) {
         ; nothing staged and nothing on disk to read back
         stR := PushXform(tx + CURPV/2, ty + CURPV/2, 1, Mod(DecT(now)*0.03, 360))
         pn := Pen(FA(Alpha(0xFFC7CBE0, 55), fp), 1.2)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+        PenDash(pn, 1)
         Ell(tx + CURPV/2 - 25, ty + CURPV/2 - 25, 50, 50, pn), DelP(pn)
         Pop(stR)
         pn := Pen(FA(Alpha(0xFFC7CBE0, 70), fp), 1.4)
@@ -19728,6 +20012,19 @@ global SPF := {}
 SPF.t1      := 0.0, SPF.t2 := 0.0, SPF.t3 := 0.0, SPF.t4 := 0.0   ; eased toggles
 SPF.t5      := 0.0                         ; multi-instance switch
 SPF.t6      := 0.0                         ; fps boost switch
+SPF.t7      := 0.0                         ; disable crash handler switch
+; DISABLE CRASH HANDLER: how many RobloxCrashHandler.exe processes this session
+; has closed, when the last one went, and when the row last said so - the
+; count is the row's proof, the same way the fps row carries its tally.
+SPF.crashN  := 0, SPF.crashAt := 0, SPF.crashSaidAt := 0
+SPF.t8      := 0.0                         ; memory trimmer switch
+SPF.m1      := 0.0, SPF.m2 := 0.0          ; ... and row 8's two chips
+; MEMORY TRIMMER readings. memWs is the largest client working set seen on
+; the last tick in MB (-1 before one exists), memLive how many clients that
+; tick saw, memRefused how many it could not open. memN / memFreed / memLast
+; are the tally: trims this session, MB freed in total, MB freed last time.
+SPF.memN    := 0, SPF.memFreed := 0.0, SPF.memLast := 0.0, SPF.memAt := 0
+SPF.memWs   := -1.0, SPF.memLive := 0, SPF.memRefused := 0
 ; pid -> 1 for every client this session has already trimmed, so the watcher
 ; does not re-trim a working set every fifteen seconds
 SPF.fpsSeen := Map()
@@ -20027,6 +20324,33 @@ global spfDcFocus := 0                     ; report tabbed-in / tabbed-out
 ; client file and reads nothing out of CLIENT SETTINGS. It works on the Windows
 ; side of the process instead - see SPFFpsTune.
 global spfFps     := 0                     ; feature 6 - fps boost
+; Feature 7. Roblox starts RobloxCrashHandler.exe beside every client: a
+; watchdog that sits idle until the client dies, then shows the crash box and
+; uploads the dump. It does nothing for a client that is running, so with this
+; on it is closed as soon as it is seen - the same thing Bloxstrap-family
+; bootstrappers do by default. It rides FFMPoll's snapshot (see FFMProcList),
+; so it costs no enumeration of its own. Kept OFF by default: a client that
+; crashes with this on simply closes, with no report and no dialog.
+global spfCrash   := 0                     ; feature 7 - disable crash handler
+; Feature 8. Bubblestrap's MEMORY TRIMMER, on YURI's terms. Every spfMemInt
+; seconds it empties the working set of every client - the same
+; EmptyWorkingSet call, with an optional floor: leave a client alone while it
+; is under spfMemThr MB. This is the trim FPS BOOST deliberately removed
+; (see the note above its memory-priority lever): evicting the pages makes
+; the client fault them straight back in, which is a hitch bought for a
+; smaller number in Task Manager. It exists here because on a machine that
+; is short of RAM the hitch is the cheaper of two evils, and the threshold is
+; what makes it a tool rather than a tic - it can be told to act only once
+; the client has grown past a size that is actually a problem. OFF by
+; default, and never on the same page as a promise of more frames.
+global spfMem     := 0                     ; feature 8 - memory trimmer
+global spfMemInt  := 10                    ; seconds between trims (Bubblestrap's default)
+global spfMemThr  := 0                     ; MB a client must exceed to be trimmed; 0 = always
+; The two chips cycle through these. zeal.ini may hold any number - a value
+; typed there that is not on the list is shown as-is and steps to the next
+; preset above it on the following click.
+global SPF_MEM_INTS := [5, 10, 30, 60, 300]
+global SPF_MEM_THRS := [0, 1024, 2048, 3072, 4096, 6144, 8192]
 ; These three live HERE, with the rest of the module's state, and not down
 ; beside the functions that use them. A top-level `global x := v` is two
 ; separate things: the declaration is resolved when the script loads, but the
@@ -20174,7 +20498,7 @@ global spfFpsHookCb  := 0
 ; 0 when we have not lowered ourselves; otherwise the class we were at, to be
 ; put back exactly - the same rule as everything else here.
 global spfFpsSelfWas := 0
-global SPF_SYSN := 6
+global SPF_SYSN := 8
 global SPF_SUBN := 3
 ; One source for the sub-option chip geometry - SPFSystems draws from these and
 ; SPFZone hit-tests from them, and a chip you cannot click is the exact bug
@@ -20201,13 +20525,23 @@ SPFSubY(ry)    => ry + 16                  ; measured from the row, which scroll
 ; and that was read as "registered, therefore available" when it meant the exact
 ; opposite - they were in the list BECAUSE the row switches own them.
 ;
-; 1067..1069 is free space above the row-body band (1060 + i). Named here so the
+; 1071..1073 is free space above the row-body band (1060 + i). It WAS 1066, and
+; 1067..1069 was free - until a seventh system claimed 1067 as its row body,
+; which is exactly the 984 + k mistake again, one band up. Named here so the
 ; hit test, the renderer, the hover whitelist and the click dispatch all derive
 ; from one number instead of four copies of it.
-global SPF_SUB6Z := 1066
+global SPF_SUB6Z := 1070
 global SPF_SUB6N := 3, SPF_SUB6W := 66
 SPFSub6X(ax, k) => ax + 54 + (k - 1)*70
 SPFSub6Off()    => SPF_SUB6N*70            ; how far the hint is pushed when they are up
+; MEMORY TRIMMER's two chips: the interval and the threshold. Wider than row
+; 6's because each carries a value rather than a word, and there are two of
+; them, so the hint keeps about 100px - enough for its terse reading. Their
+; band sits above FPS BOOST's (1071..1073); 1074 + k is free.
+global SPF_SUB8Z := 1074
+global SPF_SUB8N := 2, SPF_SUB8W := 84
+SPFSub8X(ax, k) => ax + 54 + (k - 1)*88
+SPFSub8Off()    => SPF_SUB8N*88
 global spfGeoPid := 0
 global spfNamePid := 0
 global spfUserPid := 0
@@ -20220,6 +20554,13 @@ try spfMatch      := Integer(IniRead(iniPath, "special", "match",   "0"))
 try spfOdds       := Integer(IniRead(iniPath, "special", "odds",    "0"))
 try spfMulti      := Integer(IniRead(iniPath, "special", "multi",   "0"))
 try spfFps        := Integer(IniRead(iniPath, "special", "fps",     "0"))
+try spfCrash      := Integer(IniRead(iniPath, "special", "crash",   "0"))
+try spfMem        := Integer(IniRead(iniPath, "special", "memtrim", "0"))
+try spfMemInt     := Integer(IniRead(iniPath, "special", "memint",  "10"))
+try spfMemThr     := Integer(IniRead(iniPath, "special", "memthr",  "0"))
+; a zero interval is a busy loop and a negative limit is a typo: neither is
+; honoured, and neither is silently rewritten in the file either
+spfMemInt := Max(1, spfMemInt), spfMemThr := Max(0, spfMemThr)
 try spfFpsGpu     := Integer(IniRead(iniPath, "special", "fpsgpu",  "0"))
 try spfFpsQuiet   := Integer(IniRead(iniPath, "special", "fpsquiet", "0"))
 try spfFpsSys     := Integer(IniRead(iniPath, "special", "fpssys",  "0"))
@@ -20256,6 +20597,10 @@ if spfFps {
     SPFFpsTimerRes(true)
     SPFFpsManage()
 }
+; The trimmer is a timer and nothing else, so arming it is the whole of
+; re-taking it. Same reasoning as the two above: a switch left on last
+; session must be live from boot, not from the first time the panel is drawn.
+SPFMemManage()
 AcctLoad()
 ; The community index was read only when the panel opened, so FFM_COMM was
 ; EMPTY when the two boot queues below and in BootWarmStart walked it: the
@@ -24481,6 +24826,185 @@ SPFRbxCount(force := false) {
     return n
 }
 
+; ---- DISABLE CRASH HANDLER: the sweep --------------------------------------
+; pids come from the snapshot FFMProcList just took, so nothing here walks the
+; process list again and a pid cannot be more than one poll old. Closes by pid
+; rather than by name for the same reason: a name lookup is a second walk, and
+; it would close whatever happened to carry the name at THAT moment. Returns
+; how many actually went, and says so on the status line unless told not to
+; - at most once every ten seconds, so a handler Roblox keeps restarting
+; cannot turn the line into a ticker.
+; ---- MEMORY TRIMMER --------------------------------------------------------
+; One timer at the chosen interval. Each tick takes one process snapshot,
+; opens each client with the two rights EmptyWorkingSet needs and not one
+; more (PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA - see the
+; handle note in SPFFpsTune for why less is safer with an anti-cheated
+; client), reads the working set, trims it if the threshold allows, reads it
+; again for the tally, and closes the handle before moving on. Never held
+; across ticks: Bloxstrap's own note is that the anti-cheat trips on a
+; foreign handle kept open for over a minute.
+SPFMemManage() {
+    if spfMem {
+        SetTimer(SPFMemTick, Max(1, spfMemInt)*1000)
+        ; a one-shot through a DIFFERENT function - a negative period on
+        ; SPFMemTick itself would replace the periodic timer just set
+        SetTimer(SPFMemKick, -60)
+    } else {
+        SetTimer(SPFMemTick, 0)
+        SetTimer(SPFMemKick, 0)
+    }
+}
+SPFMemKick() {
+    SPFMemTick()
+}
+; working set of an open process, in MB; -1 when the query is refused
+SPFMemWs(h) {
+    ; PROCESS_MEMORY_COUNTERS: cb, PageFaultCount, then eight SIZE_Ts, the
+    ; second of which is WorkingSetSize
+    sz := (A_PtrSize = 8) ? 72 : 40
+    pmc := Buffer(sz, 0)
+    NumPut("UInt", sz, pmc, 0)
+    if !DllCall("K32GetProcessMemoryInfo", "Ptr", h, "Ptr", pmc, "UInt", sz)
+        return -1.0
+    return NumGet(pmc, (A_PtrSize = 8) ? 16 : 12, "UPtr")/1048576.0
+}
+SPFMemTick() {
+    global spfMem, spfMemThr
+    if !spfMem {
+        SetTimer(SPFMemTick, 0)
+        return
+    }
+    live := FFMProcList()
+    SPF.memLive := live.Length
+    if !live.Length {
+        if (SPF.memWs != -1.0)
+            SPF.memWs := -1.0, SPF.memRefused := 0, HubPoke()
+        return
+    }
+    trimmed := 0, freed := 0.0, biggest := -1.0, refused := 0
+    for pid in live {
+        h := DllCall("OpenProcess", "UInt", 0x1000 | 0x0100, "Int", 0, "UInt", pid, "Ptr")
+        if (!h || h = -1) {
+            refused++
+            continue
+        }
+        ws := SPFMemWs(h)
+        if (ws > biggest)
+            biggest := ws
+        ; ws < 0 is a refused query, and a client whose size is unknown is
+        ; not trimmed on a guess when a threshold has been set
+        if (ws >= 0 && (spfMemThr <= 0 || ws >= spfMemThr)) {
+            if DllCall("K32EmptyWorkingSet", "Ptr", h) {
+                trimmed++
+                after := SPFMemWs(h)
+                if (after >= 0)
+                    freed += Max(0.0, ws - after)
+            }
+        }
+        DllCall("CloseHandle", "Ptr", h)
+    }
+    moved := (Abs(biggest - SPF.memWs) > 1.0) || (refused != SPF.memRefused) || trimmed
+    SPF.memWs := biggest, SPF.memRefused := refused
+    if trimmed
+        SPF.memN += trimmed, SPF.memFreed += freed, SPF.memLast := freed, SPF.memAt := A_TickCount
+    if moved
+        HubPoke()                          ; the row's reading changed; nothing else needs a frame
+}
+; ---- what the sheet appends: the reading, in words ----
+SPFMemHeld() {
+    if !spfMem
+        return "  RIGHT NOW: off."
+    s := "  RIGHT NOW: " SPFMemIntLabel() ", " SPFMemThrLabel() ". "
+    if !SPF.memLive
+        s .= "No client running."
+    else if (SPF.memWs < 0)
+        s .= SPF.memLive " client" (SPF.memLive = 1 ? "" : "s") " running, size not readable"
+            . (SPF.memRefused ? " - the handle was refused; try running as administrator." : ".")
+    else
+        s .= SPF.memLive " client" (SPF.memLive = 1 ? "" : "s") " running, the largest at "
+            . SPFMemFmt(SPF.memWs) "."
+    if SPF.memN
+        s .= " Trimmed " SPF.memN " time" (SPF.memN = 1 ? "" : "s") " this run, "
+            . SPFMemFmt(SPF.memFreed) " freed in total, " SPFMemFmt(SPF.memLast) " the last time."
+    return s
+}
+; ---- the two chips ----
+; Each click steps to the next preset above the current value, wrapping at
+; the top. A value from zeal.ini that is between presets steps to the next
+; one up, so an odd number is never stranded.
+SPFMemNext(cur, tbl) {
+    for v in tbl {
+        if (v > cur)
+            return v
+    }
+    return tbl[1]
+}
+SPFMemSubToggle(k) {
+    global spfMemInt, spfMemThr
+    if (k = 1) {
+        spfMemInt := SPFMemNext(spfMemInt, SPF_MEM_INTS)
+        SPFMemManage()                     ; re-arm at the new period
+        SPFSay("TRIM " StrUpper(SPFMemIntLabel()), C_ON)
+        SPFSave("memint", spfMemInt)
+    } else {
+        spfMemThr := SPFMemNext(spfMemThr, SPF_MEM_THRS)
+        SPFSay(spfMemThr ? ("TRIM ONLY A CLIENT OVER " SPFMemFmt(spfMemThr))
+                         : "TRIM EVERY CLIENT, WHATEVER ITS SIZE", spfMemThr ? C_ON : AMBER)
+        SPFSave("memthr", spfMemThr)
+    }
+    SPF.flashAt[30 + k] := A_TickCount
+    HubPoke()
+}
+; 1024 reads as "1 GB", 2300 as "2.2 GB": one decimal only where it carries
+; information, so the chip is not wider than its value
+SPFMemFmt(mb) {
+    if (mb < 1024)
+        return Round(mb) " MB"
+    g := Round(mb/1024.0, 1)
+    return ((g = Round(g)) ? Round(g) : g) " GB"
+}
+SPFMemIntLabel() {
+    s := spfMemInt
+    return "every " ((s >= 60 && Mod(s, 60) = 0) ? (s//60 " min") : (s " s"))
+}
+SPFMemThrLabel() => spfMemThr ? ("over " SPFMemFmt(spfMemThr)) : "no limit"
+; The chips take the left of the line, so this is what fits in what is left:
+; the biggest client's size and how many times the trimmer has fired.
+SPFMemHintShort() {
+    if !SPF.memLive
+        return "waiting"
+    if (SPF.memWs < 0)
+        return SPF.memRefused ? "no handle" : "reading..."
+    return SPFMemFmt(SPF.memWs) . (SPF.memN ? ("  ·  " SPF.memN "×") : "")
+}
+
+SPFCrashSweep(pids, say := 1) {
+    n := 0
+    for pid in pids {
+        try {
+            if ProcessClose(pid)
+                n++
+        }
+    }
+    now := A_TickCount
+    if n {
+        SPF.crashN += n, SPF.crashAt := now
+        if (say && (!SPF.crashSaidAt || now - SPF.crashSaidAt > 10000)) {
+            SPF.crashSaidAt := now
+            SPFSay("ROBLOX CRASH HANDLER CLOSED"
+                 . (SPF.crashN > n ? ("  ·  " SPF.crashN " THIS SESSION") : ""), C_ON)
+        } else
+            HubPoke()                      ; the row's count changed either way
+    } else if (say && pids.Length && (!SPF.crashSaidAt || now - SPF.crashSaidAt > 10000)) {
+        ; Found and could not close: an elevation mismatch, almost always.
+        ; Said once per ten seconds rather than every tick, and said at all
+        ; rather than leaving a lit switch over a handler that keeps running.
+        SPF.crashSaidAt := now
+        SPFSay("COULD NOT CLOSE THE ROBLOX CRASH HANDLER - TRY RUNNING AS ADMIN", C_ACC)
+    }
+    return n
+}
+
 ; ---- ACCOUNTS: storage -----------------------------------------------------
 ; A .ROBLOSECURITY cookie IS the account - anyone holding it is signed in as
 ; you, with no password and no 2FA prompt. So it never touches disk in the
@@ -26169,7 +26693,7 @@ SPFToggle(i) {
     ; function ASSIGNS to it, and an assignment to an undeclared name creates a
     ; local no matter that a super-global of that name exists - so the toggle
     ; would read an empty local and throw instead of flipping the setting.
-    global spfDiscord, spfRegion, spfMatch, spfOdds, spfMulti, spfFps
+    global spfDiscord, spfRegion, spfMatch, spfOdds, spfMulti, spfFps, spfCrash, spfMem
     if (i = 1) {
         ; Refuse rather than accept a switch that cannot do anything - turning
         ; it on here would light the toggle while the card stayed withdrawn.
@@ -26226,7 +26750,7 @@ SPFToggle(i) {
             SPFSay("MULTI-INSTANCE OFF - CLIENTS ALREADY OPEN STAY OPEN", 0xFFC7CBE0)
         }
         SPFSave("multi", spfMulti ? 1 : 0)
-    } else {
+    } else if (i = 6) {
         spfFps := !spfFps
         SPFFpsTimerRes(spfFps)
         n := SPFFpsApply(spfFps ? true : false)
@@ -26276,6 +26800,48 @@ SPFToggle(i) {
             SPFSay(msg, 0xFFC7CBE0)
         }
         SPFSave("fps", spfFps ? 1 : 0)
+    } else if (i = 7) {
+        spfCrash := !spfCrash
+        if spfCrash {
+            ; One sweep NOW, so a handler already sitting beside a running
+            ; client goes at the click rather than at the poll's next tick -
+            ; and so the message can say what happened instead of what will.
+            FFMProcList(&cp)
+            n := cp.Length ? SPFCrashSweep(cp, 0) : 0
+            SPFSay(n ? ("DISABLE CRASH HANDLER ON - " n " CLOSED NOW, AND AT EVERY LAUNCH FROM HERE")
+                     : "DISABLE CRASH HANDLER ON - CLOSES IT WITHIN SECONDS OF EACH LAUNCH", C_ON)
+        } else {
+            ; Nothing to put back: a handler that was closed stays closed, and
+            ; Roblox starts a fresh one with the next client.
+            SPFSay("DISABLE CRASH HANDLER OFF - THE NEXT LAUNCH KEEPS IT", 0xFFC7CBE0)
+        }
+        SPFSave("crash", spfCrash ? 1 : 0)
+    } else if (i = 8) {
+        spfMem := !spfMem
+        ; the tally is per run of the switch, so a fresh ON starts from zero
+        ; rather than carrying numbers from a session the user cannot see
+        if spfMem
+            SPF.memN := 0, SPF.memFreed := 0.0, SPF.memLast := 0.0, SPF.memAt := 0
+        SPFMemManage()
+        if spfMem {
+            ; Says the cost with the settings, because this is the one switch
+            ; on the panel whose effect is a hitch by design. FPS BOOST holds
+            ; memory priority precisely so the client is NOT trimmed, so with
+            ; both on the two are pulling against each other, and that is said
+            ; here rather than left for the user to work out from a stutter.
+            msg := "MEMORY TRIMMER ON - " StrUpper(SPFMemIntLabel()) ", " StrUpper(SPFMemThrLabel())
+                 . "  ·  EXPECT A HITCH AT EACH TRIM"
+            if spfFps
+                msg .= "  ·  FPS BOOST IS HOLDING THE PAGES THIS EVICTS"
+            SPFSay(msg, AMBER)
+        } else {
+            ; nothing to put back: pages the trimmer evicted have long since
+            ; been faulted in again by the client itself
+            SPFSay(SPF.memN ? ("MEMORY TRIMMER OFF - " SPF.memN " TRIM" (SPF.memN = 1 ? "" : "S")
+                              " THIS RUN, " SPFMemFmt(SPF.memFreed) " FREED IN TOTAL")
+                            : "MEMORY TRIMMER OFF", 0xFFC7CBE0)
+        }
+        SPFSave("memtrim", spfMem ? 1 : 0)
     }
     SPF.flashAt[i] := A_TickCount
     SPFSync()
@@ -26442,6 +27008,8 @@ SPFClick(z, x := 0) {
         SPFSubToggle(z - 974)
     else if (z >= SPF_SUB6Z + 1 && z <= SPF_SUB6Z + SPF_SUB6N)
         SPFFpsSubToggle(z - SPF_SUB6Z)
+    else if (z >= SPF_SUB8Z + 1 && z <= SPF_SUB8Z + SPF_SUB8N)
+        SPFMemSubToggle(z - SPF_SUB8Z)
     else if (z = 966 || z = 967) {
         f := (z = 966) ? 6 : 7
         if SH.focus != f
@@ -26600,6 +27168,21 @@ SPFZone(ux, uy) {
                 sx6 := SPFSub6X(ax, k)
                 if (ux >= sx6 && ux <= sx6 + SPF_SUB6W)
                     return SPF_SUB6Z + k
+            }
+        }
+    }
+    ; ...and row 8's two, likewise - with the top of the window checked as
+    ; well as the bottom, so a chip scrolled up out of sight is not clickable
+    ; through the header.
+    if (spfMem && HL.modT > 0.5) {
+        r8 := ay + SPFSysRowY(8) - SPF.sysScr
+        sy8 := SPFSubY(r8)
+        if (uy >= sy8 && uy <= sy8 + SPF_SUBH && uy >= ay + 10 && uy <= ay + sysVis + 6) {
+            loop SPF_SUB8N {
+                k := A_Index
+                sx8 := SPFSub8X(ax, k)
+                if (ux >= sx8 && ux <= sx8 + SPF_SUB8W)
+                    return SPF_SUB8Z + k
             }
         }
     }
@@ -26765,7 +27348,7 @@ SPFIcon(i, cx, cy, col, live, now) {
                 FillEll(ox + 2, oy + 1.1, 2.2, 2.2, bk), DelB(bk)
             }
         }
-    } else {
+    } else if (i = 6) {
         ; A frame-rate trace: five bars under a running needle. Off, the bars
         ; sit low and even. On, they climb and the needle sweeps across them,
         ; so the glyph reads as "more frames" rather than as a generic gauge -
@@ -26793,12 +27376,50 @@ SPFIcon(i, cx, cy, col, live, now) {
         }
         pn := Pen(FA(col, live ? 0.75 : 0.4), 1.2)
         Line(cx - 10, cy + 8.2, cx + 10, cy + 8.2, pn), DelP(pn)
+    } else if (i = 7) {
+        ; The crash box itself - a small dialog with an x in it - and, once the
+        ; switch is on, a bar struck through it. Static on purpose: a switch
+        ; that closes a process has nothing to animate, and this row must not
+        ; keep the renderer awake the way the fps trace does.
+        pn := Pen(col, 1.4)
+        StrokeRR(cx - 8, cy - 7, 16, 13, 2.2, pn)
+        Line(cx - 8, cy - 3.6, cx + 8, cy - 3.6, pn), DelP(pn)      ; title bar
+        pn := Pen(FA(col, live ? 0.5 : 0.9), 1.3)
+        Line(cx - 2.6, cy - 0.4, cx + 2.6, cy + 4.6, pn)             ; the x
+        Line(cx + 2.6, cy - 0.4, cx - 2.6, cy + 4.6, pn), DelP(pn)
+        if live {
+            pn := Pen(col, 1.8)
+            Line(cx - 10, cy + 9, cx + 10, cy - 9, pn), DelP(pn)
+        }
+    } else if (i = 8) {
+        ; A memory module: a slab with four chips on it and the edge contacts
+        ; below. On, the last chip is hollow - a slot emptied. Static, for the
+        ; same reason as row 7: nothing here should cost a frame.
+        pn := Pen(col, 1.4)
+        StrokeRR(cx - 10, cy - 6, 20, 11, 2, pn), DelP(pn)
+        loop 4 {
+            k  := A_Index
+            bx := cx - 8 + (k - 1)*4.4
+            if (live && k = 4) {
+                pk := Pen(FA(col, 0.6), 1)
+                StrokeRR(bx, cy - 3.6, 3, 5.6, 0.8, pk), DelP(pk)
+            } else {
+                bk := SBrush(FA(col, live ? 0.85 : 0.6))
+                FillRR(bx, cy - 3.6, 3, 5.6, 0.8, bk), DelB(bk)
+            }
+        }
+        pn := Pen(FA(col, live ? 0.75 : 0.45), 1.2)
+        loop 5 {
+            px := cx - 8 + (A_Index - 1)*4
+            Line(px, cy + 5, px, cy + 8, pn)
+        }
+        DelP(pn)
     }
 }
 
 ; ---- systems panel ---------------------------------------------------------
 SPFSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
-    global spfDiscord, spfRegion, spfMatch, spfOdds, spfMulti, spfFps, spfDcAcct, spfDcJoin, spfDcFocus
+    global spfDiscord, spfRegion, spfMatch, spfOdds, spfMulti, spfFps, spfCrash, spfMem, spfDcAcct, spfDcJoin, spfDcFocus
     mt := HL.modT
     onN := (spfDiscord ? 1 : 0) + (spfRegion ? 1 : 0) + (spfMatch ? 1 : 0) + (spfOdds ? 1 : 0)
          + (spfMulti ? 1 : 0) + (spfFps ? 1 : 0)
@@ -26833,7 +27454,7 @@ SPFSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
     DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", pClip, "int", 0)
 
     names := ["DISCORD ACTIVITY", "SHOW SERVER REGION", "AUTO-REGION FINDER", "BETTER MATCHMAKING"
-            , "MULTI-ROBLOX INSTANCES", "FPS BOOST"]
+            , "MULTI-ROBLOX INSTANCES", "FPS BOOST", "DISABLE CRASH HANDLER", "MEMORY TRIMMER"]
     hints := ["show the roblox game you are in on your discord profile"
             , "show which region your current server is hosted in"
             , "rejoin until you land on a server in your own region"
@@ -26865,8 +27486,21 @@ SPFSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
             ; nonsense. The full sentence is what the status line carries.
             , spfFps
                 ? SPFFpsHintShort()
-                : "more frames without touching a single graphics setting"]
-    ons   := [SPF.t1, SPF.t2, SPF.t3, SPF.t4, SPF.t5, SPF.t6]
+                : "more frames without touching a single graphics setting"
+            ; the count is the proof here too: the handler is invisible while
+            ; it runs, so nothing but a tally shows the switch did anything
+            , spfCrash
+                ? (SPF.crashN
+                    ? ("closed " SPF.crashN " time" (SPF.crashN = 1 ? "" : "s")
+                       " this session  ·  still watching")
+                    : "watching  ·  closes it within seconds of each launch")
+                : "closes RobloxCrashHandler.exe after each launch to free its memory"
+            ; the off-hint carries the caution, because this is the one row
+            ; whose cost is by design; on, the chips push it to its terse form
+            , spfMem
+                ? SPFMemHintShort()
+                : "evicts the client's memory on a schedule  ·  can cause stutter"]
+    ons   := [SPF.t1, SPF.t2, SPF.t3, SPF.t4, SPF.t5, SPF.t6, SPF.t7, SPF.t8]
 
     ; ---- rows ----
     ; A fourth system outgrew the window, so the rows scroll. The scroll is
@@ -26930,7 +27564,10 @@ SPFSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
         ; faded out under them. The push is eased off the same value the chips
         ; arrive on, so the two move as one thing.
         sub6 := (i = 6) ? Ease3(Clamp(SPF.t6*1.6 - 0.15, 0.0, 1.0)) : 0.0
-        hOff := Round(SPFSub6Off()*sub6)
+        ; row 8 is built like row 6: two value chips on the left, the reading
+        ; pushed right, because the size and the count are the row's proof
+        sub8 := (i = 8) ? Ease3(Clamp(SPF.t8*1.6 - 0.15, 0.0, 1.0)) : 0.0
+        hOff := Round(SPFSub6Off()*sub6 + SPFSub8Off()*sub8)
         ; row 4 keeps a permanent EXPERIMENTAL mark, so the hint gives way to it
         ; rows 4 and 5 both carry a standing caution: one is unproven, the
         ; other is something Roblox actively works against.
@@ -26944,6 +27581,8 @@ SPFSystems(ax, ay, x0, y0, dx, dy2, ff, now, acc) {
             SPFSubRow(1, axs, ry, acc, fb*subE, now, subE)
         if (sub6 > 0.001)
             SPFSubRow(6, axs, ry, acc, fb*sub6, now, sub6)
+        if (sub8 > 0.001)
+            SPFSubRow(8, axs, ry, acc, fb*sub8, now, sub8)
         if (bLbl != "")
             SPFExpBadge(axs + 54 + tw - expW + 2, ry + 16, fb, now, bLbl)
 
@@ -27077,6 +27716,12 @@ SPFSubRow(row, ax, ry, acc, f, now, e) {
         labs := [SPF.fpsGpuOn ? "GPU ON" : "GPU", q2l, q3l]
         ons  := [SPF.q1, SPF.q2, SPF.q3]
         nSub := SPF_SUB6N, wSub := SPF_SUB6W, zBase := SPF_SUB6Z, flBase := 20
+    } else if (row = 8) {
+        ; Values, not switches: the interval chip is always lit while the row
+        ; is on, and the threshold chip is lit only while a limit is set.
+        labs := [StrUpper(SPFMemIntLabel()), StrUpper(SPFMemThrLabel())]
+        ons  := [SPF.m1, SPF.m2]
+        nSub := SPF_SUB8N, wSub := SPF_SUB8W, zBase := SPF_SUB8Z, flBase := 30
     } else {
         labs := [a1, "JOINABLE", "FOCUS"]
         ons  := [SPF.u1, SPF.u2, SPF.u3]
@@ -27086,7 +27731,7 @@ SPFSubRow(row, ax, ry, acc, f, now, e) {
     loop nSub {
         k := A_Index
         on := ons[k]
-        sx := (row = 6) ? SPFSub6X(ax, k) : SPFSubX(ax, k)
+        sx := (row = 6) ? SPFSub6X(ax, k) : (row = 8) ? SPFSub8X(ax, k) : SPFSubX(ax, k)
         z  := zBase + k
         hv := Ease3(HL.h.Get(z, 0.0))
         fl := (SPF.flashAt.Has(flBase + k) && now - SPF.flashAt[flBase + k] < 420)
@@ -27115,7 +27760,14 @@ SPFSubRow(row, ax, ry, acc, f, now, e) {
         ; Roblox it is a promise rather than a fact, and green there would be a
         ; lie the user cannot see through. QUIET goes amber when it is on and
         ; has found nothing to demote.
+        ; Row 8: the interval chip goes amber while there is no client to
+        ; trim, and the threshold chip while the biggest client is still under
+        ; the limit - on, and holding the trimmer back, which is its job.
         dc := (on <= 0.02) ? 0xFF6E7590
+            : (row = 8)
+                ? ((k = 1 && !SPF.memLive) ? AMBER
+                 : (k = 2 && SPF.memWs >= 0 && SPF.memWs < spfMemThr) ? AMBER
+                 : AccHi(acc, 0.35))
             : (row = 6)
                 ? ((k = 1 && !SPF.fpsGpuOn) ? AMBER
                  : (k = 2 && !SPF.fpsQuiet.Count) ? AMBER
@@ -27584,8 +28236,8 @@ SPFAcctView(ff, now, acc, dx := 0, dy2 := 0) {
 
     ; ---- divider ----
     pn := Pen(FA(Alpha(0xFFFFFF, 16), fo), 1)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-    DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.012, 1000))
+    PenDash(pn, 1)
+    PenDashOff(pn, Mod(DecT(now)*0.012, 1000))
     Line(x + 214, ly, x + 214, by + 26, pn), DelP(pn)
 
     ; ---- detail ----
@@ -28098,8 +28750,8 @@ SPFSavedView(ff, now, acc, dx := 0, dy2 := 0) {
 
     ; ---- divider ----
     pn := Pen(FA(Alpha(0xFFFFFF, 16), fo), 1)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-    DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.012, 1000))
+    PenDash(pn, 1)
+    PenDashOff(pn, Mod(DecT(now)*0.012, 1000))
     Line(x + 214, ly, x + 214, by + 26, pn), DelP(pn)
 
     ; ---- detail ----
@@ -34682,7 +35334,7 @@ try hubLowPerf := Integer(IniRead(iniPath, "hub", "lowperf", "0"))
 ; the town the heart's page opens on - one of three, chosen from the chips in
 ; its header and kept across launches
 global hubTown := 1
-try hubTown := Clamp(Integer(IniRead(iniPath, "hub", "town", "1")), 1, 3)
+try hubTown := Clamp(Integer(IniRead(iniPath, "hub", "town", "1")), 1, 4)
 ; ---- the sparks ----
 ; The towns' small game. A spark - a point of light - appears somewhere in
 ; the town every so often, bobbing, and a click on it takes it: a burst, a
@@ -34707,6 +35359,22 @@ global TW_REW := [["bunting between the lamps", "a ferris wheel", "a lighthouse"
 loop 3
     try TW.n[A_Index] := Max(0, Integer(IniRead(iniPath, "town", "n" A_Index, "0")))
 TW.next := A_TickCount + 4000
+; ---- FLAPPY ----
+; The fourth tab: a bird, a click to flap, pipes to thread, a score, and the
+; best score kept across launches. The physics runs on the real clock, not
+; DecT, so it plays the same in LOW PERFORMANCE MODE; the picture is the
+; towns' own pixel style. See FlappyDraw, FlappyTap.
+global FB := {on: 0, dead: 0, y: 46.0, vy: 0.0, pipes: [], score: 0, best: 0, lastT: 0, deadAt: 0, spawnAt: 0, gx: 0.0, flapAt: 0, bestAt: 0
+            , coins: 0, run: 0, bird: 1, world: 1, birds: 1, worlds: 1, shop: 0, sparkAt: 0, spx: 0, spy: 0, trail: [], bonus: 0, bought: 0, boughtAt: 0}
+try FB.best   := Max(0, Integer(IniRead(iniPath, "town", "fbbest", "0")))
+try FB.coins  := Max(0, Integer(IniRead(iniPath, "flappy", "coins", "0")))
+try FB.birds  := Max(1, Integer(IniRead(iniPath, "flappy", "birds", "1")))     ; a bitmask: bit 0 is PLAIN, always owned
+try FB.worlds := Max(1, Integer(IniRead(iniPath, "flappy", "worlds", "1")))    ; bit 0 is DAY
+try FB.bird   := Clamp(Integer(IniRead(iniPath, "flappy", "bird", "1")), 1, 6)
+try FB.world  := Clamp(Integer(IniRead(iniPath, "flappy", "world", "1")), 1, 5)
+; the shop's stock: names, prices - birds then worlds; see FlappyBird, FlappyWorld
+global FB_BIRDS := [["PLAIN", 0], ["ROBIN", 15], ["JAY", 25], ["GHOST", 40], ["GOLD", 60], ["NEON", 80]]
+global FB_WORLDS := [["DAY", 0], ["DUSK", 20], ["NIGHT", 30], ["SNOW", 45], ["CAVE", 70]]
 try hubTop     := Integer(IniRead(iniPath, "hub", "ontop",   "1"))
 try hubTrueMin := Integer(IniRead(iniPath, "hub", "truemin", "0"))
 try hubAutoUpd := Integer(IniRead(iniPath, "hub", "autoupdate", "0"))
@@ -34730,72 +35398,18 @@ global profName := "USERNAME", profBio := "EMPTY BIO", profRing := 1, profFontI 
 ; index 1, which is a bundled image and not "their" picture.
 global profPicSet := 0
 global PFONTS := ["Segoe UI", "Bahnschrift", "Consolas", "Georgia", "Trebuchet MS", "Candara", "Cambria", "Impact"]
-; ---- v1.0.2 ----
-; The release list: everything the hub ships with, page by page in the
-; order the sidebar and the module rail present them, the flag manager last
-; so the dashboard's WHAT'S NEW - which shows the tail of this list - opens
-; on the module most people come for. Every line is a "+" because
-; everything is new; "*" is for a change or a fix in a later build. Keep
-; a line under ~55 characters: both the dashboard card and the UPDATE LOGS
-; list elide past that.
-global CHANGELOG := [["+", "the hub: dashboard, sidebar, seven pages"]
-    , ["+", "fast menu for quick access to hub actions"]
-    , ["+", "easter egg mini-game in the living towns"]
-    , ["+", "credits: ZEAL main contributor, lIIusionator collaborator"]
-    , ["+", "launch gate - OPEN ROBLOX, OPEN HUB, ACCOUNTS"]
-    , ["+", "profile - picture, ring, name, bio, hub font"]
-    , ["+", "gallery - your pictures on the gate and the logs"]
-    , ["+", "six accents, dark / light theme, two opacities"]
-    , ["+", "ARMED TINT recolours the hub while a system is on"]
-    , ["+", "minimise to a pill or the tray - never steals focus"]
-    , ["+", "screen-time dashboard - session, total, daily avg"]
-    , ["+", "live SYSTEMS and SCRIPTS counters"]
-    , ["+", "CHECK FOR UPDATES + AUTO UPDATE from the repo"]
-    , ["+", "PERFORMANCE mode - flat, snapped, idles at zero"]
-    , ["+", "ON TOP, one-click appearance reset"]
-    , ["+", "a detail sheet on every row - click its name"]
-    , ["+", "guided 56-step tour that opens the real panels"]
-    , ["+", "CREDITS - the makers, their links, a pixel cafe"]
-    , ["+", "UPDATE LOGS - this list, and the gallery reel"]
-    , ["+", "TOWN - the heart opens three living pixel towns"]
-    , ["+", "NIGHTFALL - a skyline on its own two-minute day"]
-    , ["+", "MAIN STREET - a city street, side on, in summer"]
-    , ["+", "GREENVALE - a village from above, forest round it"]
-    , ["+", "the towns keep the real time; fireworks on the hour"]
-    , ["+", "sparks - take them, and the towns grow, five levels each"]
-    , ["+", "SCRIPT HUB - write, paste, load, CHECK, PLACE .ahk"]
-    , ["+", "editor tabs, saved-script library, export .AHK / .TXT"]
-    , ["+", "placed cards - portrait, ENABLE / STOP, EDIT, v1 + v2"]
-    , ["+", "DEVICE OPTIMIZATIONS - five groups, snapshots, revert"]
-    , ["+", "LOGIN ITEMS - apps that open and close with Roblox"]
-    , ["+", "SPECIAL - discord activity, server region, finder"]
-    , ["+", "BETTER MATCHMAKING, multi-instance, FPS BOOST"]
-    , ["+", "LIVE strip - game, region, home, discord"]
-    , ["+", "ACCOUNTS - browser login, one client per account"]
-    , ["+", "account profiles - avatar, groups, creations, icons"]
-    , ["+", "SAVED PLACES - stats, banners, JOIN / HUNT links"]
-    , ["+", "CURSOR - arrow, shift lock, camera and text slots"]
-    , ["+", "cursor APPLY across every install and strapper mods"]
-    , ["+", "FAR CURSOR, AUTO RE-APPLY after a Roblox update"]
-    , ["+", "CLIENT SETTINGS - presets, rendering, lighting"]
-    , ["+", "textures, meshes, AA, framerate cap, shadows, post-fx"]
-    , ["+", "fonts and logos, a fast flags page, FLAG SOURCE"]
-    , ["+", "settings file - quality, MAX QUALITY, graphics mode"]
-    , ["+", "volume, sensitivity, shift lock, camera, movement"]
-    , ["+", "full screen, start maximised, reduced motion, UI"]
-    , ["+", "rows that override each other say so, and go quiet"]
-    , ["+", "REVERT clears only what the module wrote"]
-    , ["+", "FAST FLAG MANAGER - inject live into the client"]
-    , ["+", "bool flags read and written one byte wide"]
-    , ["+", "UNINJECT restores originals, RE-APPLY holds them"]
-    , ["+", "RE-APPLY never injects on its own - INJECT decides"]
-    , ["+", "AUTO INJECT, SINGLETON lookup, multi-client tabs"]
-    , ["+", "flag DATABASE, IMPORT / EXPORT, UPDATE FLAGS"]
-    , ["+", "CLEAN - export what the last injection kept"]
-    , ["+", "LOGS - injection, updates, HISTORY with restore"]
-    , ["+", "HITBOX and 30HZ HITBOX presets"]
-    , ["+", "COMMUNITY FLAGS - sets shared by other players"]
-    , ["+", "community sync by content hash, and a REFRESH"]]
+; ---- v1.0.3 ----
+; What changed in this build, in the order it is told. The dashboard's
+; WHAT'S NEW shows the tail of this list (up to seven lines) and the UPDATE
+; LOGS tab shows all of it. "+" is something new, "*" is a change or a fix
+; to something that was already here. Keep a line under ~55 characters:
+; both the dashboard card and the UPDATE LOGS list elide past that. The
+; 1.0.0 release list this replaced is in the repo's history.
+global CHANGELOG := [["*", "hub performance optimizations"]
+    , ["*", "PERFORMANCE mode - further improved tweaks"]
+    , ["+", "FLAPPY - now with a progression system"]
+    , ["+", "SPECIAL - DISABLE CRASH HANDLER switch"]
+    , ["+", "SPECIAL - MEMORY TRIMMER, with interval and limit chips"]]
 global famP := 0, fP := 0, fPs := 0
 try profName := IniRead(iniPath, "profile", "name", "USERNAME")
 try profBio := IniRead(iniPath, "profile", "bio", "EMPTY BIO")
@@ -35463,7 +36077,7 @@ HubEmptyGhost(ax, ay, pah, ff) {
     if (ef <= 0.01)
         return
     pn := Pen(FA(Alpha(0xFFFFFF, 26*ef), ff), 1)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+    PenDash(pn, 1)
     StrokeRR(ax, ay, HL.abw, pah, 12, pn), DelP(pn)
     Txt("select a module to list its systems", ax, ay + pah/2 - 8, HL.abw, 16, fHint
         , FA(Alpha(0xC7CBE0, 84*ef), ff), fmtC)
@@ -35844,7 +36458,7 @@ LoadingScreen() {
     ; that grows can only slow the bar down, never rewind it.
     ldWMax := 0.0
     ldDoneN := 0            ; and the caption's count, for the same reason
-    SetTimer(LRender, TICK_A)
+    SetTimer(LRender, ModalTick())
     while !ldDone
         Sleep 25
     return
@@ -36006,8 +36620,8 @@ LoadingScreen() {
         pn := Pen(0x16FFFFFF, 1)
         Line(cx + 18, cy + 1.5, cx + CWl - 18, cy + 1.5, pn), DelP(pn)
         pn := Pen(Alpha(curL, 20 + 10*emb2G), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.02, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.02, 1000))
         StrokeRR(cx + 6, cy + 6, CWl - 12, CHl - 12, 12, pn), DelP(pn)
         CornerFlourish(cx, cy, CWl, CHl, curL)
         Txt(Format("{:02} / {:02}", stepIdx, steps.Length), cx + CWl - 140, cy + 30, 96, 12, fBadge, Alpha(0x9AA8C0, 130), fmtR)
@@ -37508,7 +38122,7 @@ HubOpen() {
     ; -1 = no drag in progress / grip not yet sampled (see ScrGrip)
     HL.dragOff := -1
     HL.grX := 0, HL.grY := 0, HL.grBX := 0, HL.grBY := 0
-    HL.dragT := 0.0, HL.tilt := 0.0
+    HL.dragT := 0.0, HL.tilt := 0.0, HL.yO := 0        ; yO: the entrance offset the last frame used - see HubMoveOnly
     HL.abT := 0.0, HL.puzT := 0.0, HL.armT := 0.0, HL.actT := 0.0, HL.tintT := hubArmTint ? 1.0 : 0.0, HL.tintAt := 0, HL.lpT := hubLowPerf ? 1.0 : 0.0, HL.lpAt := 0, HL.topT := hubTop ? 1.0 : 0.0, HL.topAt := 0, HL.tmT := hubTrueMin ? 1.0 : 0.0, HL.tmAt := 0, HL.navY := HL.sby + 6.0, HL.modT := 0.0
     ; AUTO UPDATE's eased switch, and the update card's whole state - see the
     ; self-update block for what each phase means
@@ -37543,7 +38157,8 @@ HubOpen() {
     HL.ceVis := Max(3, Floor((HL.ceH - 16)/15))
     HL.h := Map()
     HL.hz := [1, 2, 5, 6, 7, 9, 10, 47, 50, 53, 54, 69, 60, 61, 62, 63, 64, 65, 66, 67, 205
-        , 20, 21, 22, 23, 24, 25, 31, 32, 33, 34, 35, 36, 37, 40, 41, 42, 248, 249, 2221, 2222, 2223, 2225
+        , 20, 21, 22, 23, 24, 25, 31, 32, 33, 34, 35, 36, 37, 40, 41, 42, 248, 249, 2221, 2222, 2223, 2224, 2225
+        , 2238, 2239, 2241, 2242, 2243, 2244, 2245, 2246, 2251, 2252, 2253, 2254, 2255
         , 43, 44, 45, 46, 48, 49, 68
         ; Splitting a row into "control" and "the rest" means TWO zones per
         ; row, and a zone that is not registered here never gets a hover value
@@ -37618,8 +38233,8 @@ HubOpen() {
         , 404, 966, 967, 968, 969, 970, 971
         ; SPECIAL row bodies, rebased out of the 960s so a sixth system could
         ; not collide with the GAME LINK field at 966
-        , 1061, 1062, 1063, 1064, 1065, 1066
-        , 975, 976, 977, 985, 986
+        , 1061, 1062, 1063, 1064, 1065, 1066, 1067, 1068
+        , 975, 976, 977, 985, 986, 987, 988
         ; the private-server rename sheet
         , 1012, 1013, 1014, 1015
         , 990, 991, 992, 993, 994, 995, 996, 997, 998, 999, 1000, 1002, 1003
@@ -37670,6 +38285,8 @@ HubOpen() {
     ; band cannot drift away from the hit test the way 984 + k did.
     loop SPF_SUB6N
         HL.hz.Push(SPF_SUB6Z + A_Index)
+    loop SPF_SUB8N                           ; MEMORY TRIMMER's two, same build
+        HL.hz.Push(SPF_SUB8Z + A_Index)
     HL.hz.Push(1210)                         ; the opening gate's GOT IT
     ; AUTO UPDATE tile; the dashboard's CHECK FOR UPDATES; the update card's
     ; two buttons (primary UPDATE / CLOSE, secondary CANCEL)
@@ -37861,11 +38478,37 @@ HubZone(sx, sy) {
     }
     ; the three town chips in TOWN's header - the rectangles TownChips draws
     if (hubTab = 7 && uy >= HL.cty - 3 && uy <= HL.cty + 21) {
-        loop 3 {
-            cxk := HL.ctx + HL.ctw - 40 - (4 - A_Index)*90
-            if (ux >= cxk && ux <= cxk + 84)
+        loop 4 {
+            cxk := HL.ctx + HL.ctw - 40 - (5 - A_Index)*84
+            if (ux >= cxk && ux <= cxk + 78)
                 return 2220 + A_Index
         }
+    }
+    ; FLAPPY: the shop's tiles and its BACK, the SHOP button, and otherwise the
+    ; whole scene as the flap - in cell coordinates, the way FlappyDraw lays
+    ; them out: a cell is four across from the column's origin, one in
+    if (hubTab = 7 && hubTown = 4 && ux >= HL.ctx && ux <= HL.ctx + HL.ctw && uy >= HL.cty + 36 && uy <= HL.pd + HL.ch - 34) {
+        cxc := (ux - HL.ctx - 1)/4.0, cyc := (uy - HL.cty - 36)/4.0
+        if FB.shop {
+            if (cxc >= 104 && cxc <= 132 && cyc >= 6 && cyc <= 16)
+                return 2238
+            loop 2 {
+                ty0 := (A_Index = 1) ? 26 : 63
+                nI  := (A_Index = 1) ? 6 : 5
+                x00 := (A_Index = 1) ? 8 : 18
+                if (cyc >= ty0 && cyc <= ty0 + 28) {
+                    loop nI {
+                        tx0 := x00 + (A_Index - 1)*21
+                        if (cxc >= tx0 && cxc <= tx0 + 20)
+                            return ((ty0 = 26) ? 2240 : 2250) + A_Index
+                    }
+                }
+            }
+            return 2237                          ; the rest of the shop swallows the click
+        }
+        if ((!FB.on || FB.dead) && cxc >= 54 && cxc <= 88 && cyc >= 76 && cyc <= 86)
+            return 2239
+        return 2226
     }
     if (ux - HL.avcx)**2 + (uy - HL.avcy)**2 <= 484
         return 7
@@ -38368,12 +39011,27 @@ HubClick(wParam, lParam, msg, hwnd) {
         TutClick(z)
         HubPoke()
     }
-    else if (z >= 2221 && z <= 2223) {
+    else if (z >= 2221 && z <= 2224) {
         FFM.clickAt[z] := A_TickCount
         TownPick(z - 2220)
     }
     else if (z = 2225)
         TownCollect()
+    else if (z = 2226)
+        FlappyTap()
+    else if (z = 2239) {
+        FB.shop := 1
+        HubPoke()
+    }
+    else if (z = 2238 || z = 2237) {
+        if (z = 2238)
+            FB.shop := 0
+        HubPoke()
+    }
+    else if (z >= 2241 && z <= 2246)
+        FlappyBuy(1, z - 2240)
+    else if (z >= 2251 && z <= 2255)
+        FlappyBuy(2, z - 2250)
     else if (z = 1220 || z = 1221) {
         FFM.clickAt[z] := A_TickCount
         HubCredWho(z = 1220 ? 1 : 2)
@@ -38457,6 +39115,7 @@ HubClick(wParam, lParam, msg, hwnd) {
     else if (z >= 960 && z <= 1019) || (z >= 1020 && z <= 1056)
         || (z >= 1061 && z <= 1060 + SPF_SYSN)
         || (z >= SPF_SUB6Z + 1 && z <= SPF_SUB6Z + SPF_SUB6N)
+        || (z >= SPF_SUB8Z + 1 && z <= SPF_SUB8Z + SPF_SUB8N)
         ; 960..1011 rows, switches, link fields and the two library buttons.
         ; 1020..1035 the accounts overlay and the ACCOUNTS button that opens it.
         ; This range is the ONLY thing standing between a resolved zone and its
@@ -38497,8 +39156,12 @@ HubClick(wParam, lParam, msg, hwnd) {
     ; above 474 because 472 is already the singleton switch, and the band has
     ; to reach them or they are hit-tested and hovered and then dropped.
     else if (z = 578) {
+        ; A press that lands while a sync is running was silently dropped,
+        ; which read as "REFRESH does nothing". It says so now.
         if !FFMCommSyncing()
             FFMCommSync(1)
+        else
+            FFMSay("COMMUNITY SYNC ALREADY RUNNING - ONE MOMENT", AMBER)
     }
     ; the community reels' click-to-skip: the hero, then a card's thumbnail
     else if (z = 2010)
@@ -38928,7 +39591,42 @@ HubMove(wParam, lParam, msg, hwnd) {
         return 0
     HL.bx := HL.grBX + (x - HL.grX), HL.by := HL.grBY + (y - HL.grY)
     HubClampPos()
+    HubMoveOnly()                            ; the window follows the pointer here, not on the next frame
     return 0
+}
+; ---- is the hub hidden under the game? ----
+; True when the foreground Roblox window's rectangle contains the hub's whole
+; rectangle. Asked only from deep idle with Roblox in front - one WinGetPos a
+; frame, at a rate that is already slow - and only meaningful when the hub is
+; not ON TOP, since on top it is visible over the game by definition. A hub
+; on another monitor, or peeking out from under a windowed client, is not
+; covered and keeps its visible rates.
+HubCovered() {
+    if (!hubLive || !IsObject(HL))
+        return 0
+    try WinGetPos(&rx, &ry, &rw, &rh, "ahk_exe RobloxPlayerBeta.exe")
+    catch
+        return 0
+    return (HL.px >= rx && HL.py >= ry && HL.px + HL.pw <= rx + rw && HL.py + HL.ph <= ry + rh)
+}
+; ---- moving the window without drawing it ----
+; A layered window keeps its last picture. Hand UpdateLayeredWindow a new
+; position and nothing else - no size, no surface, no blend - and it moves the
+; picture it already has: one system call, no render. That is all a drag
+; needs from a frame, and it used to get a whole frame instead: every mouse
+; move armed the fast tier, every tick drew the entire hub - the panels, the
+; text, the shadows, the pill - and presented it a few pixels along. On a
+; low-end machine that is a core pegged for as long as the window is held.
+; Now the pointer moves the window from here, on the event, exactly; the
+; frames that still run in the normal mode carry only the lift and the tilt,
+; at TICK_DR, and in LOW PERFORMANCE MODE there are none at all until the
+; button comes up.
+HubMoveOnly() {
+    if (!hubLive || !IsObject(HL) || HL.minStart)
+        return
+    HL.px := HL.bx, HL.py := HL.by + HL.yO
+    ptd := Buffer(8), NumPut("int", HL.px, "int", HL.py, ptd)
+    DllCall("user32\UpdateLayeredWindow", "ptr", HL.gui.Hwnd, "ptr", 0, "ptr", ptd, "ptr", 0, "ptr", 0, "ptr", 0, "uint", 0, "ptr", 0, "uint", 0)
 }
 ; ---- where the hub is allowed to sit ----
 ; Two handles, and which one is live follows the INTENT (HL.minTo), not the
@@ -39840,7 +40538,7 @@ HubFinish() {
 }
 HubRender() {
     Critical "On"
-    global G, hubTabAt, selCur, selNext, selFadeAt, hubCur
+    global G, hubTabAt, selCur, selNext, selFadeAt, hubCur, bdBypass
     static SCRSET := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&"
     static zfH := 0
     if (!hubLive || hubHidden)
@@ -39880,6 +40578,10 @@ HubRender() {
             fin := 1
     }
     scl *= 1 + 0.02*HL.dragT
+    ; The backdrop cache draws live while the card is changing scale - the
+    ; minimise collapse and the close shrink - so a bilinear blit of a
+    ; downscaled texture is never what is on screen. See BdBlit.
+    bdBypass := (HL.minStart || HL.closeAt) ? 1 : 0
 
     SelTick(now)
     if HL.minStart {
@@ -39895,7 +40597,10 @@ HubRender() {
         HL.minV := HL.minT
     ; hold the panel readable through most of the shrink, then fade late
     cf := Clamp(1 - Max(0.0, HL.minV - 0.40)/0.50, 0.0, 1.0)
-    dtgt := (HL.drag = 2 || (HL.drag = 1 && now - HL.dragAt > 130)) ? 1.0 : 0.0
+    ; LOW PERFORMANCE MODE draws neither the lift nor the tilt: with both at
+    ; zero the picture does not change while the window is dragged, and the
+    ; drag can run on HubMoveOnly with no frames at all
+    dtgt := (!hubLowPerf && (HL.drag = 2 || (HL.drag = 1 && now - HL.dragAt > 130))) ? 1.0 : 0.0
     HL.dragT := HL.dragT + (dtgt - HL.dragT)*EK(0.2)
     if HL.dragT < 0.004 && HL.drag != 2
         HL.dragT := 0.0
@@ -39904,7 +40609,7 @@ HubRender() {
     posFix := HubClampTick()
     velX := HL.bx - HL.prevBX
     HL.prevBX := HL.bx
-    HL.tilt := HL.tilt + ((HL.drag = 2 ? Clamp(velX*0.22, -3.0, 3.0) : 0.0) - HL.tilt)*EK(0.18)
+    HL.tilt := HL.tilt + (((HL.drag = 2 && !hubLowPerf) ? Clamp(velX*0.22, -3.0, 3.0) : 0.0) - HL.tilt)*EK(0.18)
     if !HL.drag && Abs(HL.tilt) < 0.03
         HL.tilt := 0.0
     ; Physical mouse-down edge landing outside every hub zone. Anything that
@@ -40021,6 +40726,10 @@ HubRender() {
     SPF.t3 += ((spfMatch   ? 1.0 : 0.0) - SPF.t3)*EK(0.22)
     SPF.t5 += ((spfMulti   ? 1.0 : 0.0) - SPF.t5)*EK(0.22)
     SPF.t6 += ((spfFps     ? 1.0 : 0.0) - SPF.t6)*EK(0.22)
+    SPF.t7 += ((spfCrash   ? 1.0 : 0.0) - SPF.t7)*EK(0.22)
+    SPF.t8 += ((spfMem     ? 1.0 : 0.0) - SPF.t8)*EK(0.22)
+    SPF.m1 += ((spfMem     ? 1.0 : 0.0) - SPF.m1)*EK(0.22)
+    SPF.m2 += (((spfMem && spfMemThr) ? 1.0 : 0.0) - SPF.m2)*EK(0.22)
     SPF.u1 += ((spfDcAcct  ? 1.0 : 0.0) - SPF.u1)*EK(0.22)
     SPF.u2 += ((spfDcJoin  ? 1.0 : 0.0) - SPF.u2)*EK(0.22)
     SPF.u3 += ((spfDcFocus ? 1.0 : 0.0) - SPF.u3)*EK(0.22)
@@ -40322,8 +41031,8 @@ HubRender() {
     pn := Pen(FA(0x30000000, cf), 1)
     Line(cx + 18, cy + ch - 1.5, cx + cw - 18, cy + ch - 1.5, pn), DelP(pn)
     pn := Pen(FA(Alpha(hubCur, 20 + 10*emb2G + 46*HL.dragT), cf), 1)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-    DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.02, 1000))
+    PenDash(pn, 1)
+    PenDashOff(pn, Mod(DecT(now)*0.02, 1000))
     StrokeRR(cx + 6, cy + 6, cw - 12, ch - 12, 15, pn), DelP(pn)
     loop (hubLowPerf ? 0 : 4) {
         k := A_Index - 1
@@ -40627,7 +41336,7 @@ HubRender() {
         pn := Pen(FA(Alpha(AccHi(hubCur, 0.45), Round(150*selH)), s2), 1.4)
         Ell(hcx - hs*1.32, hcy - hs*1.22, hs*2.64, hs*2.44, pn), DelP(pn)
         pn := Pen(FA(Alpha(hubCur, Round(60*selH)), s2), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+        PenDash(pn, 2)
         Ell(hcx - hs*1.52, hcy - hs*1.42, hs*3.04, hs*2.84, pn), DelP(pn)
         ; the label sits under the outer ring, not across it
         Txt("TOWN", hcx - 30, hcy + hs*1.5, 60, 12, HL.fXs, FA(Alpha(AccHi(hubCur, 0.4), Round(200*selH)), s2), fmtC)
@@ -41039,8 +41748,8 @@ HubRender() {
         b := SBrush(FA(Alpha(0x0B0C14, 122*d), cf))
         FillRR(cx, cy, cw, ch, 20, b), DelB(b)
         pn := Pen(FA(Alpha(hubCur, 205*d), cf), 1.6)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
         StrokeRR(cx + 3, cy + 3, cw - 6, ch - 6, 17, pn), DelP(pn)
         mcx := cx + cw/2, mcy := cy + ch/2 - 7
         pn := Pen(FA(Alpha(0xFFFFFF, 225*d), cf), 1.8)
@@ -41227,12 +41936,12 @@ HubRender() {
         if profRing = 2 {
             ; DASH - two dashed frames turning against each other
             pn := Pen(FA(Alpha(bcol, Round(150 + 60*mbA)), fB), 1.6)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.02, 1000))
+            PenDash(pn, 1)
+            PenDashOff(pn, Mod(DecT(now)*0.02, 1000))
             StrokeRR(bxL - 3, byT - 3, MBW + 6, MBH + 6, gr3 + 3, pn), DelP(pn)
             pn := Pen(FA(Alpha(AccHi(bcol, 0.4), Round(70 + 60*mbA)), fB), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", 1000 - Mod(DecT(now)*0.031, 1000))
+            PenDash(pn, 2)
+            PenDashOff(pn, 1000 - Mod(DecT(now)*0.031, 1000))
             StrokeRR(bxL - 7, byT - 7, MBW + 14, MBH + 14, gr3 + 7, pn), DelP(pn)
 
         } else if profRing = 3 {
@@ -41306,14 +42015,14 @@ HubRender() {
         ; hover reveals a dashed orbit instead of showing it permanently
         if (h9 > 0.01) {
             pn := Pen(FA(Alpha(bcol, Round((60 + 25*embG)*h9)), fB), 1.2)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", 1000 - Mod(DecT(now)*0.02, 1000))
+            PenDash(pn, 2)
+            PenDashOff(pn, 1000 - Mod(DecT(now)*0.02, 1000))
             StrokeRR(bxL - 8, byT - 8, MBW + 16, MBH + 16, gr3 + 8, pn), DelP(pn)
             ; a tighter orbit turning the other way - two crossing rates read as
             ; rotation, where one dashed ring alone reads as a marquee
             pn := Pen(FA(Alpha(AccHi(bcol, 0.35), Round(42*h9)), fB), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.034, 1000))
+            PenDash(pn, 1)
+            PenDashOff(pn, Mod(DecT(now)*0.034, 1000))
             StrokeRR(bxL - 4, byT - 4, MBW + 8, MBH + 8, gr3 + 4, pn), DelP(pn)
         }
         if h9 > 0.01 {
@@ -41359,8 +42068,8 @@ HubRender() {
             b := SBrush(FA(Alpha(0x0B0C14, 118*d), fB))
             FillRR(HL.mbx - MBW/2, HL.mby - MBH/2, MBW, MBH, 16, b), DelB(b)
             pn := Pen(FA(Alpha(bcol, 200*d), fB), 1.6)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+            PenDash(pn, 1)
+            PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
             StrokeRR(HL.mbx - MBW/2 - 7, HL.mby - MBH/2 - 7, MBW + 14, MBH + 14, 22, pn), DelP(pn)
         }
         Pop(stB)
@@ -41384,7 +42093,7 @@ HubRender() {
     Pop(st0)
     pt0 := Buffer(8, 0)
     sz := Buffer(8), NumPut("int", HL.pw, "int", HL.ph, sz)
-    HL.px := HL.bx, HL.py := HL.by + yO
+    HL.px := HL.bx, HL.py := HL.by + yO, HL.yO := yO
     ptd := Buffer(8), NumPut("int", HL.px, "int", HL.py, ptd)
     bf := Buffer(4), NumPut("uchar", 0, "uchar", 0, "uchar", winA, "uchar", 1, bf)
     HL.winA := winA
@@ -41476,6 +42185,10 @@ HubRender() {
             || Abs(SPF.t4 - (spfOdds ? 1.0 : 0.0)) > 0.01
             || Abs(SPF.t5 - (spfMulti ? 1.0 : 0.0)) > 0.01
             || Abs(SPF.t6 - (spfFps   ? 1.0 : 0.0)) > 0.01
+            || Abs(SPF.t7 - (spfCrash ? 1.0 : 0.0)) > 0.01
+            || Abs(SPF.t8 - (spfMem   ? 1.0 : 0.0)) > 0.01
+            || Abs(SPF.m1 - (spfMem   ? 1.0 : 0.0)) > 0.01
+            || Abs(SPF.m2 - ((spfMem && spfMemThr) ? 1.0 : 0.0)) > 0.01
             ; the fps row's bars and needle animate for as long as it is on -
             ; but LOW PERFORMANCE MODE draws no glyphs, so it must not keep the
             ; renderer awake for one there
@@ -41542,10 +42255,16 @@ HubRender() {
     ; `inFlight` is the full predicate, kept before it is narrowed: it is what
     ; decides, below, whether the mode may STOP the renderer or has to keep
     ; the settle rate for a flourish that still needs a frame to land on.
+    ; FLAPPY in play is real interaction, in both modes: the frames are the game
+    if (hubTab = 7 && hubTown = 4 && FB.on && !FB.dead)
+        busy := 1
     inFlight := busy
+    if (hubLowPerf && HL.drag = 2)
+        inFlight := 0                           ; a window drag draws nothing here: the window moves on the event
     if (hubLowPerf && busy)
-        busy := HL.drag || HL.minStart || posFix || (hubTabAt && now - hubTabAt < 320)
+        busy := (HL.drag && HL.drag != 2) || HL.minStart || posFix || (hubTabAt && now - hubTabAt < 320)
              || (HL.modAt && now - HL.modAt < 200) || FFM.edit != "" || SH.focus
+             || (hubTab = 7 && hubTown = 4 && FB.on && !FB.dead)
     ; ---- deep idle ----
     ; `busy` covers everything the interface is DOING. It does not cover the
     ; ambient decoration, which never stops and is the only reason an idle rate
@@ -41592,10 +42311,15 @@ HubRender() {
         ; rate, a flourish still landing at the settle rate, and otherwise a
         ; stop - the hover watcher wakes it (HubTim, HubWatch)
         HubTim(busy ? TICK_A : (inFlight ? TICK_LP : 0))
-    else if (deep && spfFps && WinActive("ahk_exe RobloxPlayerBeta.exe"))
-        HubTim(TICK_G)                        ; see TICK_G: from deep idle only
-    else
-        HubTim(busy ? TICK_A : (deep ? TICK_Z : TICK_S))
+    else if (deep && WinActive("ahk_exe RobloxPlayerBeta.exe")) {
+        if (!hubTop && HubCovered())
+            HubTim(TICK_BG)                   ; see TICK_BG: the game is over the whole of it
+        else if spfFps
+            HubTim(TICK_G)                    ; see TICK_G: from deep idle only
+        else
+            HubTim(TICK_Z)
+    } else
+        HubTim(busy ? ((HL.drag = 2) ? TICK_DR : TICK_A) : (deep ? TICK_Z : TICK_S))
     return
     DrawTab(tab, f, dx, dy2) {
         if f <= 0.01
@@ -42480,7 +43204,7 @@ HubRender() {
                     }
                     pn := Pen(FA(Alpha(AMBER, Round(kk = 1 ? 90 : 52)), f*qr), 1)
                     if (kk = 2)
-                        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+                        PenDash(pn, 1)
                     StrokeRR(rx, ry, rw, 46, 10, pn), DelP(pn)
                     ; the holder gets a live dot, the refused one a hollow ring -
                     ; which of the two is actually holding the key is the single
@@ -42502,7 +43226,7 @@ HubRender() {
                 if (q5 > 0.02) {
                     lx2 := rx + 17.5, ly1 := wy + 176 + 46, ly2 := wy + 176 + 54
                     pn := Pen(FA(Alpha(AMBER, Round(110*q5)), f), 1.2)
-                    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+                    PenDash(pn, 2)
                     Line(lx2, ly1, lx2, ly2, pn), DelP(pn)
                     mcy2 := (ly1 + ly2)/2
                     pn := Pen(FA(Alpha(AMBER, Round(200*q5)), f), 1.4)
@@ -43065,7 +43789,7 @@ HubRender() {
                 FillRR(x0, lsy, HL.ctw, HL.lsh, 8, b), DelB(b)
                 MicroBackdrop(x0, lsy, HL.ctw, HL.lsh, 8, hubCur, f, now, 0.8)
                 pn := Pen(FA(0x16FFFFFF, f), 1)
-                DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
+                PenDash(pn, 1)
                 StrokeRR(x0, lsy, HL.ctw, HL.lsh, 8, pn), DelP(pn)
                 Txt("nothing placed yet - write something and hit PLACE", x0, lsy, HL.ctw, HL.lsh, fHint, FA(0x4EC7CBE0, f), fmtC)
             }
@@ -43693,7 +44417,7 @@ HubRender() {
             ; the second column goes, and it stopped being true.
             colW := HL.ctw/2
             pn := Pen(FA(Alpha(hubCur, 40 + 30*emb2G), f), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+            PenDash(pn, 2)
             Line(x0 + colW, py0 + 22, x0 + colW, py0 + ph_ - 22, pn), DelP(pn)
             acy := py0 + ph_/2
             loop 2 {
@@ -43721,7 +44445,7 @@ HubRender() {
                 b := SBrush(FA(Alpha(AccHi(hubCur, 0.5), 225), f))
                 FillEll(acx + 34*Cos(oa) - 2, acy + 34*Sin(oa) - 2, 4, 4, b), DelB(b)
                 pn := Pen(FA(Alpha(hubCur, 55), f), 1)
-                DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+                PenDash(pn, 2)
                 Ell(acx - 34, acy - 34, 68, 68, pn), DelP(pn)
                 tx := acx + 42
                 Txt(nm, tx, py0 + 26, 160, 22, HL.fT, FA(Alpha(AccHi(hubCur, 0.8), 245), f), fmtL)
@@ -43909,7 +44633,7 @@ HubRender() {
             }
             occ := x0 + HL.ctw - 24, ocy2 := cbY + 21
             pn := Pen(FA(Alpha(hubCur, 45), f), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+            PenDash(pn, 2)
             Ell(occ - 11, ocy2 - 11, 22, 22, pn), DelP(pn)
             oaC := now*0.0024
             b := SBrush(FA(Alpha(AccHi(hubCur, 0.5), 210), f))
@@ -44063,7 +44787,7 @@ HubRender() {
             }
             ocx := x0 + 276, ocy := y0 + 46
             pn := Pen(FA(Alpha(hubCur, 40), f), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+            PenDash(pn, 2)
             Ell(ocx - 13, ocy - 13, 26, 26, pn), DelP(pn)
             oaL := now*0.0026
             b := SBrush(FA(Alpha(AccHi(hubCur, 0.5), 200), f))
@@ -44100,8 +44824,8 @@ HubRender() {
                 FillEll(hbx - 34, hby - 34, 68, 68, b), DelB(b)
                 MiniHeart(hbx, hby - 2, 11 + 1.4*pu7, FA(Alpha(AccHi(hubCur, 0.35), 205), f))
                 pn := Pen(FA(Alpha(hubCur, Round(40 + 26*pu7)), f), 1.1)
-                DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
-                DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.016, 1000))
+                PenDash(pn, 2)
+                PenDashOff(pn, Mod(DecT(now)*0.016, 1000))
                 Ell(hbx - 30, hby - 32, 60, 60, pn), DelP(pn)
                 Txt("made with love", hbx - 74, hby + 34, 148, 13, HL.fXs, FA(Alpha(hubCur, 105), f), fmtC)
                 DllCall("gdiplus\GdipResetClip", "ptr", G)
@@ -44171,13 +44895,13 @@ RingDraw(cxr, cyr, r, col, f, hv := 0.0) {
     if profRing = 2 {
         ; DASH - two dashed rings turning against each other
         pn := Pen(FA(Alpha(col, 170 + 60*hv), f), 1.8)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(now2*0.02, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(now2*0.02, 1000))
         Ell(cxr - r, cyr - r, r*2, r*2, pn), DelP(pn)
         ro := r + 3.6*k                          ; outside the portrait, not over it
         pn := Pen(FA(Alpha(AccHi(col, 0.4), Round(60 + 80*hv)), f), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", 1000 - Mod(now2*0.031, 1000))
+        PenDash(pn, 2)
+        PenDashOff(pn, 1000 - Mod(now2*0.031, 1000))
         Ell(cxr - ro, cyr - ro, ro*2, ro*2, pn), DelP(pn)
 
     } else if profRing = 3 {
@@ -44212,7 +44936,7 @@ RingDraw(cxr, cyr, r, col, f, hv := 0.0) {
             ok := A_Index
             rp := r + (3.5*ok)*k
             pn := Pen(FA(Alpha(col, Round((30 - ok*6) + (30 - ok*7)*hv)), f), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+            PenDash(pn, 2)
             Ell(cxr - rp, cyr - rp, rp*2, rp*2, pn), DelP(pn)
             ; odd paths run clockwise, even anticlockwise
             spd := (ok = 1) ? 0.0024 : (ok = 2) ? -0.0016 : 0.0011
@@ -45797,7 +46521,7 @@ LaunchGate() {
     OnMessage(0x84, GHT), OnMessage(0x201, GClick), OnMessage(0x202, GUp)
     OnMessage(0x200, GMove), OnMessage(0x20, GCur), OnMessage(0x100, GKeyDown)
     OnMessage(0x215, GCapLost)
-    SetTimer(GRender, TICK_A)
+    SetTimer(GRender, ModalTick())
     while !gDone
         Sleep 25
     return
@@ -46320,8 +47044,8 @@ LaunchGate() {
         Line(cx + 18, cy + CH2 - 1.5, cx + CW2 - 18, cy + CH2 - 1.5, pn), DelP(pn)
         ; slow-drifting dashed accent frame (glows while dragging)
         pn := Pen(Alpha(curG, 20 + 10*emb2G + 46*gDragT), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.02, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.02, 1000))
         StrokeRR(cx + 6, cy + 6, CW2 - 12, CH2 - 12, 12, pn), DelP(pn)
         CornerFlourish(cx, cy, CW2, CH2, curG, s1)
 
@@ -46687,7 +47411,7 @@ LaunchGate() {
         FillEll(pxD - 1.8, pyD - 1.8, 3.6, 3.6, b), DelB(b)
         oex := fx + fw - 22, oey := thY
         pn := Pen(FA(Alpha(curG, 55), s3), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+        PenDash(pn, 2)
         Ell(oex - 13, oey - 13, 26, 26, pn), DelP(pn)
         oaG := now*0.0022
         b := SBrush(FA(Alpha(AccHi(curG, 0.5), 215), s3))
@@ -46746,8 +47470,8 @@ LaunchGate() {
             b := SBrush(Alpha(0x0B0C14, 122*d))
             FillRR(cx, cy, CW2, CH2, 16, b), DelB(b)
             pn := Pen(Alpha(curG, 205*d), 1.6)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+            PenDash(pn, 1)
+            PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
             StrokeRR(cx + 3, cy + 3, CW2 - 6, CH2 - 6, 13, pn), DelP(pn)
             mcx := cx + CW2/2, mcy := cy + CH2/2 - 7
             pn := Pen(Alpha(0xFFFFFF, 225*d), 1.8)
@@ -46864,7 +47588,12 @@ MMove(wParam, lParam, msg, hwnd) {
     if hwnd != ui.Hwnd
         return
     if !dragOn {
-        RendTim(TICK_S)
+        ; Wake a stopped or idling renderer; never slow a running fast one.
+        ; This was an unconditional RendTim(TICK_S), which against a 16 ms
+        ; timer reset it to 33 on every mouse move and the frame put it back -
+        ; the 16/33 flip the puzzle card's handler describes.
+        if (rendP <= 0 || rendP > TICK_S)
+            RendTim(hubLowPerf ? TICK_A : TICK_S)
         return
     }
     ; a drag whose button is up is over - see HubMove
@@ -47164,7 +47893,7 @@ CropOpen(src, poolIdx := 0, bmpIn := 0) {
         hubP := -1
         HubTim(TICK_A)
     }
-    SetTimer(CrRender, TICK_A)
+    SetTimer(CrRender, ModalTick())
     return
 
     CrZone(sx, sy) {
@@ -47404,8 +48133,8 @@ CropOpen(src, poolIdx := 0, bmpIn := 0) {
         ; the card's, which is what the other four work out to.
         emb4 := (Sin(DecT(now)*0.004) + 1)/2
         pn := Pen(Alpha(hubCur, 20 + 10*emb4 + 46*crDragT), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.02, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.02, 1000))
         StrokeRR(cx4 + 6, cy4 + 6, CW4 - 12, CH4 - 12, 14, pn), DelP(pn)
 
         Txt("CROP PICTURE", cx4 + 24, cy4 + 18, 240, 22, fBrand, Alpha(0xFFE8EAF6, 240), fmtL)
@@ -47501,8 +48230,8 @@ CropOpen(src, poolIdx := 0, bmpIn := 0) {
             b := SBrush(Alpha(0x0B0C14, 122*d))
             FillRR(cx4, cy4, CW4, CH4, 18, b), DelB(b)
             pn := Pen(Alpha(hubCur, 205*d), 1.6)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+            PenDash(pn, 1)
+            PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
             StrokeRR(cx4 + 3, cy4 + 3, CW4 - 6, CH4 - 6, 15, pn), DelP(pn)
             mcx := cx4 + CW4/2, mcy := cy4 + CH4/2 - 7
             pn := Pen(Alpha(0xFFFFFF, 225*d), 1.8)
@@ -48065,7 +48794,7 @@ GalleryPick(target := 0, manage := 0) {
         hubP := -1
         HubTim(TICK_A)
     }
-    SetTimer(GalRender, TICK_A)
+    SetTimer(GalRender, ModalTick())
     return
 
     GalZone(sx, sy) {
@@ -48316,8 +49045,8 @@ GalleryPick(target := 0, manage := 0) {
         pn := Pen(0x28FFFFFF, 1)
         StrokeRR(cx3, cy3, CW3, CH3, 15, pn), DelP(pn)
         pn := Pen(Alpha(galAcc, 20 + 10*emb3 + 46*glDragT), 1)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.02, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.02, 1000))
         StrokeRR(cx3 + 5, cy3 + 5, CW3 - 10, CH3 - 10, 11, pn), DelP(pn)
 
         Txt("GALLERY", cx3 + 24, cy3 + 14, 200, 18, fBrand, 0xE0E8EAF6, fmtL)
@@ -48420,8 +49149,8 @@ GalleryPick(target := 0, manage := 0) {
             b := SBrush(Alpha(0x0B0C14, 122*d))
             FillRR(cx3, cy3, CW3, CH3, 15, b), DelB(b)
             pn := Pen(Alpha(galAcc, 205*d), 1.6)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+            PenDash(pn, 1)
+            PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
             StrokeRR(cx3 + 3, cy3 + 3, CW3 - 6, CH3 - 6, 12, pn), DelP(pn)
             mcx := cx3 + CW3/2, mcy := cy3 + CH3/2 - 7
             pn := Pen(Alpha(0xFFFFFF, 225*d), 1.8)
@@ -48930,6 +49659,7 @@ Render() {
     Critical "On"
     global stateT, animStart, minT, minStart, cur, pulse, emb, emb2, winPX, winPY
     global dragT, tiltS, prevBX, hovT, h1T, h2T, h3T, h4T, hgT, G
+    global rippleStart
     G := G0
     ; The overlay has its own Graphics, created before the hub's and never
     ; touched by the hub's quality switch - so LOW PERFORMANCE MODE was
@@ -49007,9 +49737,17 @@ Render() {
     h3T  := h3T  < 0.004 && hz != 3 ? 0.0 : h3T
     h4T  := h4T  < 0.004 && hz != 6 ? 0.0 : h4T
 
-    pulse := enabled ? (Sin(now * 0.00417) + 1)/2 : 0
-    emb := (Sin(now * 0.0016) + 1)/2                 ; slow ambient ember wave
-    emb2 := (Sin(now * 0.004) + 1)/2                 ; faster dormant flash wave
+    ; DecT: these three drive most of the card's ambient motion, and they were
+    ; the reason LOW PERFORMANCE MODE could never stop this window - a pulse
+    ; from the raw clock is a picture that changes every frame
+    pulse := enabled ? (Sin(DecT(now) * 0.00417) + 1)/2 : 0
+    emb := (Sin(DecT(now) * 0.0016) + 1)/2           ; slow ambient ember wave
+    emb2 := (Sin(DecT(now) * 0.004) + 1)/2           ; faster dormant flash wave
+    ; Expired here, where it is always reached. The draw path that cleared
+    ; it only runs while the card is open, so a toggle on the minimised bubble
+    ; left it set for good - and it is in the idle predicate below.
+    if (rippleStart && now - rippleStart >= RIPPLE_MS)
+        rippleStart := 0
     cur := Mix(hubAccent, C_ON, stateT)
     tg := togAt ? Min((now - togAt)/TOG_MS, 1.0) : 1.0
     togActive := togAt && tg < 1
@@ -49078,7 +49816,25 @@ Render() {
     ; ambient life everywhere: 60 fps when armed/hovered, 30 fps dormant baseline
     if it >= 1 && !animStart && !rippleStart && !minStart && !burstAt && !closing && !dragOn && dragT = 0 && tiltS = 0 && !togActive && !(scatAt && now - scatAt < 400) {
         keep := thAt || hz || hovT > 0 || h1T > 0 || h2T > 0 || h3T > 0 || h4T > 0 || rebindOn || selFadeAt || posFix || (bindFlashAt && now - bindFlashAt < 520)
-        RendTim((enabled || keep || hgT > 0.004) ? TICK_A : TICK_S)
+        ; Armed no longer means 60 fps. What `enabled` animates is a 1.5 s
+        ; pulse and a slow ring, which TICK_S carries; the fast tier is for
+        ; the pointer and for transitions. This card sits over a game, and
+        ; armed is exactly when the game is being played.
+        ; LOW PERFORMANCE MODE: a STOP, the hub's contract. Nothing ambient is
+        ; drawn there, so a frame with the pointer off the card would be the
+        ; last frame again. MMove wakes it, and every state change already
+        ; pokes RendTim(TICK_A).
+        ; ...and dormant is TICK_G, not TICK_S. Thirty frames a second for a
+        ; 1.5 s pulse and a slow ring is three times what those need, and
+        ; this card is drawn on top of a game for the whole of the time the
+        ; game is being played - it was the one renderer in the hub that
+        ; stayed at a real rate throughout play, whatever the hub's own
+        ; idle did. Ten a second carries a pulse that slow; the pointer
+        ; arriving, a state change or a transition still get the fast tier.
+        if hubLowPerf
+            RendTim((keep || hgT > 0.004) ? TICK_A : 0)
+        else
+            RendTim((keep || hgT > 0.004) ? TICK_A : TICK_G)
     }
 }
 
@@ -49242,7 +49998,7 @@ DrawCard(f, now) {
     Ell(ax - 25, ay - 25, 50, 50, pn), DelP(pn)
     RingDraw(ax, ay, 26.5, AccHi(cur, 0.5*hovT), f*s2, hovT)
     if enabled {
-        sa := Mod(now * 0.09, 360)
+        sa := Mod(DecT(now) * 0.09, 360)
         cc := AccHi(cur, 0.4)
         pn := Pen(FA(Alpha(cc, 80), f*s2), 2.5)
         Arc(ax - 26.5, ay - 26.5, 53, 53, sa, 64, pn), DelP(pn)
@@ -49305,7 +50061,7 @@ DrawCard(f, now) {
     }
     if enabled {
         loop 2 {
-            pph := Mod(now + (A_Index - 1)*450, 900)/900.0
+            pph := Mod(DecT(now) + (A_Index - 1)*450, 900)/900.0
             b := SBrush(FA(Alpha(AccHi(cur, 0.4), 235*Sin(3.14159*pph)), f*s3))
             FillEll(mx + 22 + 26*pph - 1.6, rowY - 1.6, 3.2, 3.2, b), DelB(b)
         }
@@ -49363,7 +50119,7 @@ DrawCard(f, now) {
     b := SBrush(FA(0x8CFFFFFF, f*s3))
     FillEll(dx - 2.4, dy - 2.6, 1.8, 1.8, b), DelB(b)
     if enabled {
-        oa := now*0.0042
+        oa := DecT(now)*0.0042
         b := SBrush(FA(Alpha(AccHi(cur, 0.5), 220), f*s3))
         FillEll(dx + 7.5*Cos(oa) - 1.3, dy + 7.5*Sin(oa) - 1.3, 2.6, 2.6, b), DelB(b)
     }
@@ -49429,8 +50185,8 @@ DrawCard(f, now) {
         b := SBrush(FA(Alpha(0x0B0C14, 122*d), f))
         FillRR(cx, cy, CW, CH, 16, b), DelB(b)
         pn := Pen(FA(Alpha(cur, 205*d), f), 1.6)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
         StrokeRR(cx + 3, cy + 3, CW - 6, CH - 6, 13, pn), DelP(pn)
         mcx := cx + CW/2, mcy := cy + CH/2 - 7
         pn := Pen(FA(Alpha(0xFFFFFF, 225*d), f), 1.8)
@@ -49508,7 +50264,7 @@ DrawBubble(f, now) {
             Arc(BBX - 30.75, BBY - 30.75, 61.5, 61.5, base + 76, 28, pn), DelP(pn)
         }
         ; counter-rotating faint arcs one ring inward
-        ba2 := Mod(-now*0.07, 360)
+        ba2 := Mod(-DecT(now)*0.07, 360)
         pn := Pen(FA(Alpha(cur, 70), f), 1.6)
         Arc(BBX - 33.2, BBY - 33.2, 66.4, 66.4, ba2, 58, pn)
         Arc(BBX - 33.2, BBY - 33.2, 66.4, 66.4, ba2 + 180, 58, pn), DelP(pn)
@@ -49561,10 +50317,10 @@ DrawBubble(f, now) {
     }
     ; dotted counter-march ring + outer twinkle ticks
     pn := Pen(FA(Alpha(bcol, enabled ? 70 : 55 + 20*emb), f), 1.3)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
-    DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", 1000 - Mod(DecT(now)*0.02, 1000))
+    PenDash(pn, 2)
+    PenDashOff(pn, 1000 - Mod(DecT(now)*0.02, 1000))
     Ell(BBX - 38.8, BBY - 38.8, 77.6, 77.6, pn), DelP(pn)
-    tb := -now*0.012
+    tb := -DecT(now)*0.012
     loop 12 {
         a_ := (tb + A_Index*30)*0.017453
         tw := (Sin(DecT(now)*0.002 + A_Index*0.52) + 1)/2
@@ -49578,7 +50334,7 @@ DrawBubble(f, now) {
         FillEll(BBX + 35.1*Cos(ha) - 2.2, BBY + 35.1*Sin(ha) - 2.2, 4.4, 4.4, b), DelB(b)
         loop 3 {
             k := A_Index - 1
-            twA := (k*120 + now*0.02)*0.017453
+            twA := (k*120 + DecT(now)*0.02)*0.017453
             twI := Max(0.0, Sin(DecT(now)*0.003 + k*2.1))**9
             b := SBrush(FA(Alpha(0xFFFFFF, 200*twI), f))
             FillEll(BBX + 35*Cos(twA) - 1.4, BBY + 35*Sin(twA) - 1.4, 2.8, 2.8, b), DelB(b)
@@ -49628,8 +50384,8 @@ DrawBubble(f, now) {
         b := SBrush(FA(Alpha(0x0B0C14, 118*d), f))
         FillEll(BBX - 30, BBY - 30, 60, 60, b), DelB(b)
         pn := Pen(FA(Alpha(cur, 200*d), f), 1.6)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
         Ell(BBX - 36, BBY - 36, 72, 72, pn), DelP(pn)
     }
 }
@@ -49645,11 +50401,18 @@ RendTim(p) {
     ; Keyed off the constants, NOT off a literal 8. When the base rates moved
     ; to 16/33 a `p <= 8` test stopped matching the busy rate at all, which
     ; would have dropped an actively dragged window to the idle cap.
-    if hubLowPerf
+    ; `&& p`: the cap must never turn a STOP into 40 ms. It did - AbFinishHide
+    ; asks for 0 and got a 25 fps timer against a hidden overlay, which then
+    ; drew into a window nobody could see for the rest of the session.
+    if (hubLowPerf && p)
         p := (p <= TICK_A) ? 40 : 220
     if p != rendP
         rendP := p, SetTimer(Render, p, -10)
 }
+; ---- the transient windows' one rate ----
+; The loading screen, the gate, the gallery and the cropper each run a fixed
+; timer for their lifetime; LOW PERFORMANCE MODE caps it as RendTim does.
+ModalTick() => hubLowPerf ? 40 : TICK_A
 HubTim(p) {
     global hubP
     ; Hidden means hidden. HubPoke is reached from a dozen background timers and
@@ -49712,7 +50475,7 @@ HubTim(p) {
     ; A hub left alone in this mode now costs nothing at all, deep idle or
     ; not, and wakes on the first zone change or poke.
     if (hubLowPerf && p)
-        p := (p <= TICK_A) ? 40 : (p = TICK_LP) ? 250 : 0
+        p := (p <= TICK_A) ? ((hubTab = 7 && hubTown = 4 && FB.on && !FB.dead) ? TICK_A : 40) : (p = TICK_LP) ? 250 : 0   ; a game gets the real rate even here
     if p != hubP
         hubP := p, SetTimer(HubRender, p, -10)
     if (hubLowPerf && hubLive && !hubHidden)
@@ -49784,6 +50547,213 @@ ShadowFlush() {
     for , e in shadowCache
         try DllCall("gdiplus\GdipDisposeImage", "ptr", e.bmp)
     shadowCache := Map()
+    BdFlush()                                 ; built under the same settings, dropped for the same reasons
+}
+; ============================================================================
+;  BACKDROP CACHE
+; ----------------------------------------------------------------------------
+;  The ambient texture is the largest cost left in a normal-mode frame.
+;  PanelBackdropDark on the hub card alone is ~250 antialiased dots, sixty
+;  full-height diagonal hatch lines, six blooms of radius 300-500 px, a
+;  full-card gradient wash and three vignettes - several milliseconds of
+;  software rasterisation - and MicroBackdrop repeats a smaller version of it
+;  on every button, field and bar: sixty-odd of them on a full panel. All of
+;  it was redrawn on every frame, at 30 fps idle and 60 fps busy, for motion
+;  whose slowest phases take four to nine seconds per cycle.
+;
+;  So each texture is rasterised into a PARGB bitmap and BLITTED every frame,
+;  and re-rasterised only every BD_MS. At 80 ms the hatch moves under 0.6 px
+;  per refresh and the dot wave under 2% of a cycle, which is below what the
+;  eye separates from continuous motion at these alphas. Keyed on geometry,
+;  the accent (to 5 bits a channel, so an eased tint shares a bitmap instead
+;  of minting one per frame), the theme weight and the surface scale - so
+;  same-sized controls share one bitmap and the refresh is paid once for all
+;  of them.
+;
+;  What it will not do:
+;    - anything in LOW PERFORMANCE MODE (the callers already return);
+;    - a theme crossfade, where thT moves every frame and the answer with it;
+;    - a size that has not SETTLED. A key is drawn live until it has been
+;      asked for across BD_SETTLE ms. Panel heights ease (pah := 26 +
+;      (HL.ffh - 26)*mt), so an opening panel presents a new rounded height
+;      nearly every frame and, in the tail of the ease, the same one two or
+;      three frames running - a second-sighting rule built a full-panel
+;      bitmap for each of those and threw it away a frame later, which is
+;      what made every module open stutter. Until the size holds, the caller
+;      draws live, exactly as it did before this cache existed;
+;    - more than BD_BUDGET bytes of rasterising in one frame. Every entry
+;      built in the same frame falls due in the same frame, so the refresh
+;      arrived as one spike every BD_MS; a due entry past the budget blits
+;      its last raster - a frame stale at most - and refreshes on the next,
+;      which spreads the work across frames on its own;
+;    - a hub frame flagged with bdBypass (the minimise collapse and the close
+;      shrink), where the card is changing scale under the blit.
+;
+;  The drawer runs against the bitmap's own Graphics with the shared G pointer
+;  swapped to it and hubOpacity forced to 1 - the fade `f` and the opacity are
+;  applied at blit time through IA2 exactly as ShadowDraw applies them - and
+;  under Critical, so a render timer for another window cannot land between
+;  the swap and the restore. The same primitives, caches and clip contract the
+;  live drawers use apply unchanged: a Pen or SBrush handle draws on any
+;  Graphics, and a drawer that clips itself clips inside the bitmap.
+;
+;  Bounded two ways, least-recently-used first: BD_MAXN entries, BD_MAXB
+;  bytes. Flushed with the shadows, for the same reasons.
+; ============================================================================
+BdBlit(key, x, y, w, h, f, now, fn) {
+    global bdCache, bdBytes, bdScale, bdBypass, bdSpent, bdMade, G, hubOpacity, IA2
+    static cm := 0
+    if (w < 1 || h < 1 || (thT > 0.002 && thT < 0.998))
+        return 0
+    if (bdBypass && IsObject(HL) && G = HL.g2)   ; the hub's own flag, for the hub's own surface
+        return 0
+    sc := bdScale
+    key .= "|" Round(sc*1000)
+    if !bdCache.Has(key) {
+        ; first sighting: the caller draws live, and the key is remembered
+        bdCache[key] := {bmp: 0, sg: 0, bw: 0, bh: 0, bytes: 0, at: 0, seen: now, use: now}
+        BdTrim(key, now)
+        return 0
+    }
+    e := bdCache[key]
+    e.use := now
+    if !e.bmp {
+        ; settled geometry only, and within this frame's budgets - see the note
+        ; at the top; each of these means "draw live this frame, as before".
+        ; BD_MAKE bounds the frame ~BD_SETTLE ms after a tab arrives, when
+        ; sixty controls settle at once: a dozen builds a frame, not sixty.
+        if (now - e.seen < BD_SETTLE || bdSpent > BD_BUDGET || bdMade >= BD_MAKE)
+            return 0
+        bw := Max(1, Round(w*sc)), bh := Max(1, Round(h*sc))
+        DllCall("gdiplus\GdipCreateBitmapFromScan0", "int", bw, "int", bh, "int", 0, "int", 0xE200B, "ptr", 0, "ptr*", &bmp := 0)
+        if !bmp
+            return 0
+        DllCall("gdiplus\GdipGetImageGraphicsContext", "ptr", bmp, "ptr*", &sg := 0)
+        if !sg {
+            DllCall("gdiplus\GdipDisposeImage", "ptr", bmp)
+            return 0
+        }
+        DllCall("gdiplus\GdipSetSmoothingMode",     "ptr", sg, "int", 4)
+        DllCall("gdiplus\GdipSetPixelOffsetMode",   "ptr", sg, "int", 2)
+        DllCall("gdiplus\GdipSetInterpolationMode", "ptr", sg, "int", 7)
+        DllCall("gdiplus\GdipScaleWorldTransform",  "ptr", sg, "float", bw/w, "float", bh/h, "int", 0)
+        e.bmp := bmp, e.sg := sg, e.bw := bw, e.bh := bh, e.bytes := bw*bh*4, e.at := 0
+        bdBytes += e.bytes, bdMade += 1
+        BdTrim(key, now)
+    }
+    ; a fresh bitmap is always rasterised (there is nothing to blit yet); a
+    ; refresh that is due waits a frame once this frame has spent its budget
+    if (!e.at || (now - e.at >= BD_MS && bdSpent <= BD_BUDGET)) {
+        e.at := now
+        bdSpent += e.bytes
+        prevC := A_IsCritical
+        Critical "On"
+        g0 := G, op0 := hubOpacity
+        G := e.sg, hubOpacity := 1.0
+        try {
+            DllCall("gdiplus\GdipResetClip", "ptr", G)
+            DllCall("gdiplus\GdipGraphicsClear", "ptr", G, "uint", 0)
+            fn.Call(0, 0, 1.0)
+        } finally {
+            G := g0, hubOpacity := op0
+            Critical prevC
+        }
+    }
+    a := f*hubOpacity
+    if (a <= 0.004)
+        return 1
+    if (a >= 0.996)
+        ia := 0
+    else {
+        if !cm {
+            cm := Buffer(100, 0)
+            NumPut("float", 1, cm, 0), NumPut("float", 1, cm, 24), NumPut("float", 1, cm, 48), NumPut("float", 1, cm, 96)
+        }
+        NumPut("float", a, cm, 72)
+        DllCall("gdiplus\GdipSetImageAttributesColorMatrix", "ptr", IA2, "int", 0, "int", 1, "ptr", cm, "ptr", 0, "int", 0)
+        ia := IA2
+    }
+    ; Nearest-neighbour for the blit. The bitmap is already at the surface's
+    ; scale, so the copy is 1:1 and at worst half a pixel off; bicubic (the
+    ; surface's mode, 7) resamples every pixel of an 832 x 572 card for
+    ; nothing, and even bilinear costs about twice this. Under a drag zoom or
+    ; a hover pop (1.02-1.05) a row or two of a hatch at 8/255 alpha is
+    ; doubled, which is not a thing anyone can see.
+    DllCall("gdiplus\GdipGetInterpolationMode", "ptr", G, "int*", &oim := 0)
+    DllCall("gdiplus\GdipSetInterpolationMode", "ptr", G, "int", 5)
+    DllCall("gdiplus\GdipDrawImageRectRect", "ptr", G, "ptr", e.bmp
+        , "float", x, "float", y, "float", w, "float", h
+        , "float", 0, "float", 0, "float", e.bw, "float", e.bh
+        , "int", 2, "ptr", ia, "ptr", 0, "ptr", 0)
+    DllCall("gdiplus\GdipSetInterpolationMode", "ptr", G, "int", oim)
+    return 1
+}
+; Two passes, neither of which touches the entry the caller is holding, and
+; neither walked until a cap is already exceeded.
+; First the placeholders: keys seen once and never settled. An eased size
+; mints one of these every frame it moves, so they are most of the map
+; whenever the map is full, and they are all dropped in ONE walk - throttled,
+; because a walk of the whole map on every insertion was itself a cost in the
+; tail of an ease. Then, if real bitmaps still exceed a cap, least-recently-
+; USED one at a time, the same shape as ShadowCacheTrim.
+BdTrim(keep, now) {
+    global bdCache, bdBytes, bdTrimAt
+    static MAXN := 256, MAXB := 64*1024*1024
+    if (bdCache.Count <= MAXN && bdBytes <= MAXB)
+        return
+    if (bdCache.Count > MAXN) {
+        if (now - bdTrimAt < 250 && bdBytes <= MAXB)
+            return
+        bdTrimAt := now
+        ; the stale placeholders first; still over, every placeholder. Dropping
+        ; one costs nothing - it only ever meant "draw live", and it is back
+        ; the moment its size recurs - and it keeps the walk below out of the
+        ; one-at-a-time loop, which is a full scan per eviction.
+        loop 2 {
+            stale := (A_Index = 1)
+            dead := []
+            for k, e in bdCache {
+                if (!e.bmp && k != keep && (!stale || now - e.use > 600))
+                    dead.Push(k)
+            }
+            for k in dead
+                bdCache.Delete(k)
+            if (bdCache.Count <= MAXN)
+                break
+        }
+    }
+    while (bdCache.Count > MAXN || bdBytes > MAXB) {
+        oldK := "", oldT := 0
+        for k, e in bdCache {
+            if (k = keep)
+                continue
+            if (oldK = "" || e.use < oldT)
+                oldK := k, oldT := e.use
+        }
+        if (oldK = "")
+            return
+        BdDrop(oldK)
+    }
+}
+BdDrop(k) {
+    global bdCache, bdBytes
+    e := bdCache[k]
+    if e.sg
+        try DllCall("gdiplus\GdipDeleteGraphics", "ptr", e.sg)
+    if e.bmp
+        try DllCall("gdiplus\GdipDisposeImage", "ptr", e.bmp)
+    bdBytes -= e.bytes
+    bdCache.Delete(k)
+}
+BdFlush() {
+    global bdCache, bdBytes
+    for , e in bdCache {
+        if e.sg
+            try DllCall("gdiplus\GdipDeleteGraphics", "ptr", e.sg)
+        if e.bmp
+            try DllCall("gdiplus\GdipDisposeImage", "ptr", e.bmp)
+    }
+    bdCache := Map(), bdBytes := 0
 }
 ; ---- and the cache had no ceiling ----
 ; Every other cache in the file is bounded - brCache and penCache flush at 4096
@@ -50083,6 +51053,9 @@ SetImgAlpha(f) {
 ; Clear honours the clip region and the world transform persists between
 ; frames, so one leaked Push/SetClip anywhere leaves stale pixels behind.
 ResetSurface(gr, sx, sy) {
+    global bdScale, bdSpent, bdMade
+    bdScale := sx                            ; the backdrop cache rasterises at this scale - see BdBlit
+    bdSpent := 0, bdMade := 0                ; ...and this frame's rasterising budget starts here
     DllCall("gdiplus\GdipResetClip", "ptr", gr)
     DllCall("gdiplus\GdipResetWorldTransform", "ptr", gr)
     DllCall("gdiplus\GdipScaleWorldTransform", "ptr", gr, "float", sx, "float", sy, "int", 0)
@@ -50226,7 +51199,161 @@ TownPick(k) {
     hubTown := k
     try IniWrite(hubTown, iniPath, "hub", "town")
     TW.at := 0, TW.next := A_TickCount + 1500        ; a spark belongs to the town it appeared in
+    if (k != 4)
+        FB.on := 0, FB.dead := 0, FB.shop := 0       ; leaving FLAPPY ends the game where it stands, and closes the shop
     HubPoke()
+}
+; ---- the flap ----
+; A click anywhere on the scene. The first one starts a game; one after a
+; death, once the bird has had its moment on the ground, starts the next.
+FlappyTap() {
+    now := A_TickCount
+    if FB.shop
+        return
+    if FB.dead {
+        if (now - FB.deadAt < 700)
+            return
+        FlappyReset()
+    } else if !FB.on
+        FlappyReset()
+    FB.on := 1, FB.vy := -0.072, FB.flapAt := now
+    HubPoke()
+}
+FlappyReset() {
+    FB.y := 46.0, FB.vy := 0.0, FB.pipes := [], FB.score := 0, FB.dead := 0, FB.run := 0, FB.bonus := 0
+    FB.lastT := A_TickCount, FB.spawnAt := A_TickCount + 1500, FB.gx := 0.0, FB.trail := []
+}
+; ---- a death: the best, and the coins the run earned ----
+; Coins picked up in the gaps are banked as they are taken; the run's score
+; adds a third of itself on top, so a long run pays even when the coins fell
+; the wrong side of the pipes.
+FlappyDie(now) {
+    FB.dead := 1, FB.deadAt := now
+    FB.bonus := FB.score // 3
+    FB.coins += FB.bonus
+    try IniWrite(FB.coins, iniPath, "flappy", "coins")
+    if (FB.score > FB.best) {
+        FB.best := FB.score, FB.bestAt := now
+        try IniWrite(FB.best, iniPath, "town", "fbbest")
+    }
+}
+; ---- the shop ----
+; Six birds, five worlds. Owned is a bit in a mask; PLAIN and DAY are always
+; owned. A press on an owned tile equips it; on one you can afford, buys and
+; equips it; on one you cannot, does nothing but say so. Every change is
+; written straight to the ini.
+FlappyBuy(kind, i) {
+    lst := (kind = 1) ? FB_BIRDS : FB_WORLDS
+    own := (kind = 1) ? FB.birds : FB.worlds
+    if (i < 1 || i > lst.Length)
+        return
+    bit := 1 << (i - 1)
+    if !(own & bit) {
+        if (FB.coins < lst[i][2]) {
+            FB.bought := -i*kind, FB.boughtAt := A_TickCount     ; the tile shakes its head
+            HubPoke()
+            return
+        }
+        FB.coins -= lst[i][2]
+        own |= bit
+        if (kind = 1)
+            FB.birds := own
+        else
+            FB.worlds := own
+        try IniWrite(FB.coins, iniPath, "flappy", "coins")
+        try IniWrite(own, iniPath, "flappy", (kind = 1) ? "birds" : "worlds")
+        FB.bought := i*kind, FB.boughtAt := A_TickCount
+    }
+    if (kind = 1)
+        FB.bird := i
+    else
+        FB.world := i
+    try IniWrite(i, iniPath, "flappy", (kind = 1) ? "bird" : "world")
+    HubPoke()
+}
+; ---- a pixel face: three by five ----
+; Every letter, digit and mark FLAPPY prints, as fifteen bits each, drawn at
+; any cell scale - so the score is as much a piece of the picture as the
+; pipes are, instead of a system font floating over it.
+FlappyGlyph(ch) {
+    static G := Map("0", "111101101101111", "1", "010110010010111", "2", "111001111100111", "3", "111001111001111", "4", "101101111001001"
+                  , "5", "111100111001111", "6", "111100111101111", "7", "111001001001001", "8", "111101111101111", "9", "111101111001111"
+                  , "A", "010101111101101", "B", "110101110101110", "C", "111100100100111", "D", "110101101101110", "E", "111100110100111"
+                  , "F", "111100110100100", "G", "111100101101111", "H", "101101111101101", "I", "111010010010111", "J", "001001001101111"
+                  , "K", "101101110101101", "L", "100100100100111", "M", "101111111101101", "N", "110101101101101", "O", "111101101101111"
+                  , "P", "111101111100100", "Q", "010101101110011", "R", "110101110101101", "S", "111100111001111", "T", "111010010010010"
+                  , "U", "101101101101111", "V", "101101101101010", "W", "101101111111101", "X", "101101010101101", "Y", "101101010010010"
+                  , "Z", "111001010100111", "!", "010010010000010", ".", "000000000000010", "-", "000000111000000", "+", "000010111010000"
+                  , ":", "000010000010000", "/", "001001010100100", "?", "111001011000010", "'", "010010000000000")
+    return G.Has(ch) ? G[ch] : ""
+}
+FlappyTextW(str, sc) => StrLen(str)*4*sc - sc
+FlappyText(P, x, y, str, c, sc := 1, shadow := 0) {
+    if shadow
+        FlappyText(P, x + sc, y + sc, str, shadow, sc)
+    loop parse StrUpper(str) {
+        g := FlappyGlyph(A_LoopField)
+        if (g != "") {
+            loop 15 {
+                if (SubStr(g, A_Index, 1) = "1")
+                    P(x + Mod(A_Index - 1, 3)*sc, y + ((A_Index - 1)//3)*sc, sc, sc, c)
+            }
+        }
+        x += 4*sc
+    }
+}
+; ---- the worlds ----
+; A palette each: the sky's two ends, the hills, the ground and its top, the
+; pipe in three tones, the clouds in two, and what falls or shines.
+FlappyWorld(w) {
+    if (w = 2)
+        return {sT: 0xFF6A3F8A, sB: 0xFFF2A468, hill: 0xFF5A3F7A, gnd: 0xFF8A6A4A, gT: 0xFF6E9A4E, gS: 0xFF6A4A34, pipe: 0xFF4FA85C, pL: 0xFF6FBF63, pD: 0xFF2E7A45, cT: 0xFFF6C8A8, cU: 0xFFD99A78, stars: 0, sun: 0xFFFFC46B}
+    if (w = 3)
+        return {sT: 0xFF0B1230, sB: 0xFF2A3466, hill: 0xFF1A2448, gnd: 0xFF3A3F5C, gT: 0xFF2E5A3A, gS: 0xFF2A2E44, pipe: 0xFF3E8A48, pL: 0xFF5AB366, pD: 0xFF246A38, cT: 0xFF3A4270, cU: 0xFF2A3058, stars: 1, sun: 0xFFF4F1E8}
+    if (w = 4)
+        return {sT: 0xFFB9D3E6, sB: 0xFFE8EEF4, hill: 0xFFC9D6E0, gnd: 0xFFF4F1E8, gT: 0xFFFFFFFF, gS: 0xFFD8DEE6, pipe: 0xFF8FC3E6, pL: 0xFFB9DCF2, pD: 0xFF5A8FB8, cT: 0xFFFFFFFF, cU: 0xFFD8E4EE, stars: 0, sun: 0xFFFFF4C8}
+    if (w = 5)
+        return {sT: 0xFF2A2436, sB: 0xFF3A3050, hill: 0xFF241E2E, gnd: 0xFF4A3A5A, gT: 0xFF6A4A8A, gS: 0xFF3A2E48, pipe: 0xFF6A4A8A, pL: 0xFF8A6AAA, pD: 0xFF4A3260, cT: 0xFF3A3050, cU: 0xFF2A2436, stars: 0, sun: 0}
+    return {sT: 0xFF6CB8EA, sB: 0xFFCFE9F8, hill: 0xFF9CCB8A, gnd: 0xFFC9A87A, gT: 0xFF7CBF5A, gS: 0xFFB08A5A, pipe: 0xFF4FA85C, pL: 0xFF6FBF63, pD: 0xFF2E7A45, cT: 0xFFFFFFFF, cU: 0xFFD8EAF6, stars: 0, sun: 0xFFFFE9A8}
+}
+; ---- the birds ----
+; Seven by six cells, facing right, in three wing poses: up (0), level (1),
+; down (2). Each skin is its own drawing, not a recolour - the robin has a
+; breast, the jay a crest and a mask, the ghost is hollow-eyed and half there,
+; gold has a shine, neon a glow.
+FlappyBird(P, x, y, skin, wing, f, now) {
+    if (skin = 2) {                               ; ROBIN
+        P(x + 1, y, 5, 4, 0xFF8A5A3A), P(x + 2, y - 1, 3, 1, 0xFF8A5A3A), P(x + 1, y + 2, 3, 2, 0xFFE8574A), P(x + 2, y + 4, 3, 1, 0xFF6A4A2A)
+        P(x + 4, y, 2, 1, 0xFFFFFFFF), P(x + 5, y, 1, 1, 0xFF23263A), P(x + 6, y + 2, 2, 1, 0xFFE8A64A)
+        cW := 0xFF5A3E2E
+    } else if (skin = 3) {                        ; JAY
+        P(x + 1, y, 5, 4, 0xFF3F7FC9), P(x + 2, y - 1, 3, 1, 0xFF3F7FC9), P(x + 3, y - 2, 1, 1, 0xFF3F7FC9), P(x + 4, y - 3, 1, 1, 0xFF2F5F99)
+        P(x + 1, y + 3, 5, 1, 0xFFDDEEFF), P(x + 3, y, 3, 1, 0xFF23263A), P(x + 4, y, 1, 1, 0xFFFFFFFF), P(x + 6, y + 2, 2, 1, 0xFF23263A)
+        cW := 0xFF7FB7E0
+    } else if (skin = 4) {                        ; GHOST
+        P(x + 1, y, 5, 4, Alpha(0xFFF4F1E8, 200)), P(x + 2, y - 1, 3, 1, Alpha(0xFFF4F1E8, 200)), P(x + 1, y + 4, 1, 1, Alpha(0xFFF4F1E8, 160)), P(x + 3, y + 4, 1, 1, Alpha(0xFFF4F1E8, 160)), P(x + 5, y + 4, 1, 1, Alpha(0xFFF4F1E8, 160))
+        P(x + 3, y + 1, 1, 1, 0xFF23263A), P(x + 5, y + 1, 1, 1, 0xFF23263A), P(x + 4, y + 2, 1, 1, Alpha(0xFF23263A, 120))
+        cW := Alpha(0xFFDDDAD0, 200)
+    } else if (skin = 5) {                        ; GOLD
+        P(x + 1, y, 5, 4, 0xFFFFD86B), P(x + 2, y - 1, 3, 1, 0xFFFFD86B), P(x + 2, y, 2, 1, 0xFFFFF0B8), P(x + 1, y + 3, 5, 1, 0xFFE8A64A)
+        P(x + 4, y, 2, 1, 0xFFFFFFFF), P(x + 5, y, 1, 1, 0xFF23263A), P(x + 6, y + 2, 2, 1, 0xFFE0872E)
+        P(x + 3 + Mod(Floor(now/180), 3), y - 2, 1, 1, 0xFFFFFFFF)
+        cW := 0xFFE8B84A
+    } else if (skin = 6) {                        ; NEON
+        P(x, y - 1, 7, 6, Alpha(0xFF9FD3F0, 40)), P(x + 1, y, 5, 4, 0xFFB8A6FF), P(x + 2, y - 1, 3, 1, 0xFFB8A6FF), P(x + 1, y + 3, 5, 1, 0xFF8A6AFF)
+        P(x + 4, y, 2, 1, 0xFFEAF6FF), P(x + 5, y, 1, 1, 0xFF2A2436), P(x + 6, y + 2, 2, 1, 0xFF9FD3F0)
+        cW := 0xFF9FD3F0
+    } else {                                      ; PLAIN
+        P(x + 1, y, 5, 4, 0xFFFFE08A), P(x + 2, y - 1, 3, 1, 0xFFFFE08A), P(x + 2, y + 4, 3, 1, 0xFFE8C95A)
+        P(x + 4, y, 2, 1, 0xFFFFFFFF), P(x + 5, y, 1, 1, 0xFF23263A), P(x + 6, y + 2, 2, 1, 0xFFE8A64A)
+        cW := 0xFFE8C95A
+    }
+    if (wing = 0)
+        P(x, y, 3, 1, cW), P(x + 1, y - 1, 2, 1, cW)
+    else if (wing = 2)
+        P(x, y + 3, 3, 1, cW), P(x + 1, y + 4, 2, 1, cW)
+    else
+        P(x, y + 1, 3, 2, cW)
 }
 ; ---- the level a count has reached, and the level it is at ----
 TownLevelOf(n) {
@@ -50271,10 +51398,10 @@ TownCollect() {
 ; the three chips, in the title row's right half, the way the dashboard keeps
 ; its two buttons there
 TownChips(x0, y0, acc, f) {
-    names := ["NIGHTFALL", "MAIN STREET", "GREENVALE"]
-    loop 3 {
-        cx := x0 + HL.ctw - 40 - (4 - A_Index)*90
-        FFMBtn(2220 + A_Index, cx, y0 - 3, 84, 24, names[A_Index], acc, f, (hubTown = A_Index) ? 1 : 0, HL.fS)
+    names := ["NIGHTFALL", "MAIN STREET", "GREENVALE", "FLAPPY"]
+    loop 4 {
+        cx := x0 + HL.ctw - 40 - (5 - A_Index)*84
+        FFMBtn(2220 + A_Index, cx, y0 - 3, 78, 24, names[A_Index], acc, f, (hubTown = A_Index) ? 1 : 0, HL.fS)
     }
 }
 ; The frame is a clip and nothing else - no plate, no shadow, no border: the
@@ -50292,7 +51419,8 @@ TownDraw(vx, vy, vw, vh, acc, f, now) {
     if (tw < 1 && HL.townPrev)
         TownScene(HL.townPrev, ox - 24*tw, oy, cs, acc, f*(1 - tw), now)
     TownScene(hubTown, ox + 24*(1 - tw), oy, cs, acc, f*tw, now)
-    TownGame(ox + 24*(1 - tw), oy, cs, acc, f*tw, now)
+    if (hubTown != 4)
+        TownGame(ox + 24*(1 - tw), oy, cs, acc, f*tw, now)
     Pop(sv)
     DllCall("gdiplus\GdipDeletePath", "ptr", pC)
 }
@@ -50358,7 +51486,7 @@ TownGame(ox, oy, cs, acc, f, now) {
         b := TB(Alpha(cC, Round(240*aout)), f), FillEll(spx - 3.2*sc, spy - 3.2*sc, 6.4*sc, 6.4*sc, b)
         if (hv > 0.02) {
             pn := PenP(FA(Alpha(cG, Round(160*hv*aout)), f), 1)
-            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+            PenDash(pn, 2)
             Ell(spx - 18, spy - 18, 36, 36, pn), DelP(pn)
         }
         if (TW.kind = 1 && age < 8000)                              ; the quick window: a thin arc draining round it
@@ -50440,7 +51568,9 @@ TownGame(ox, oy, cs, acc, f, now) {
     }
 }
 TownScene(k, ox, oy, cs, acc, f, now) {
-    if (k = 2)
+    if (k = 4)
+        FlappyDraw(ox, oy, cs, acc, f, now)
+    else if (k = 2)
         TownStreet(ox, oy, cs, acc, f, now)
     else if (k = 3)
         TownVillage(ox, oy, cs, acc, f, now)
@@ -50684,6 +51814,33 @@ TownNight(ox, oy, cs, acc, f, now) {
             P(lx0 - 1, 87, 3, 8, Alpha(warm, Round(26*Max(rain, night*0.7))))
     }
     P(0, 95, 142, 6, Mix(Mix(0xFF1F3325, 0xFF4F8A4F, dayc), 0xFF2E4A38, rain*0.3))
+    ; ---- the ferris wheel, once the sparks have raised it ----
+    ; On the bank BEHIND the row, so the roofs cut across its lower half the
+    ; way a skyline's wheel is seen from a street - and built from cells, in
+    ; steps: a rim of squares, eight spokes that turn fifteen degrees at a
+    ; time, a car at the end of each. The first one was a vector drawing
+    ; dropped on top of the buildings, and read as a sticker.
+    if (TownLevel(1) >= 2) {
+        wcx := 124, wcy := 60, wr := 9
+        P(wcx - 4, wcy + 6, 1, 11, 0xFF2A2E44), P(wcx + 4, wcy + 6, 1, 11, 0xFF2A2E44), P(wcx - 2, wcy + 4, 5, 1, 0xFF2A2E44)
+        P(wcx - 5, wcy + 16, 11, 1, 0xFF3A3F5C)
+        loop 24 {
+            an := (A_Index - 1)*0.2618
+            P(wcx + Round(wr*Cos(an)), wcy + Round(wr*Sin(an)), 1, 1, 0xFF8A8FA8)
+        }
+        wa := Floor(Mod(DecT(now)*0.012, 360)/15)*15*0.0174533
+        loop 8 {
+            an := wa + (A_Index - 1)*0.7854
+            loop wr - 1
+                P(wcx + Round(A_Index*Cos(an)), wcy + Round(A_Index*Sin(an)), 1, 1, 0xFF5A5E78)
+            gx := wcx + Round(wr*Cos(an)), gy := wcy + Round(wr*Sin(an))
+            P(gx - 1, gy, 3, 2, Mod(A_Index, 2) ? 0xFFE8574A : 0xFF3F7FC9)
+            P(gx - 1, gy, 3, 1, Mod(A_Index, 2) ? 0xFFFF8A7A : 0xFF7FB7E0)
+            if (night > 0.2)
+                P(gx, gy + 1, 1, 1, Alpha(warm, Round(230*night)))
+        }
+        P(wcx - 1, wcy - 1, 3, 3, 0xFF9A9EB8), P(wcx, wcy, 1, 1, 0xFF3A3F5C)
+    }
     ; ---- the buildings: x, width, height, kind (0 plain, 1 cafe, 2 shop, 3 tower, 4 billboard) ----
     bld := [[2, 14, 16, 0], [17, 11, 22, 4], [29, 13, 14, 1], [43, 12, 26, 3], [56, 7, 12, 0]
           , [78, 13, 20, 2], [92, 9, 15, 0], [102, 15, 24, 3], [118, 10, 18, 0], [129, 12, 13, 0]]
@@ -50898,31 +52055,17 @@ TownNight(ox, oy, cs, acc, f, now) {
             P(bx1[1], 76, bx1[2] - bx1[1], 1, Alpha(0xFF2A2E44, 120))
         }
     }
-    if (lv >= 2) {                                ; a ferris wheel on the bank, turning, lit at night
-        fwx := ox + 126*cs, fwy := oy + 64*cs
-        P(124, 74, 1, 8, 0xFF3A3F5C), P(128, 74, 1, 8, 0xFF3A3F5C), P(122, 82, 9, 1, 0xFF3A3F5C)
-        pn := PenP(FA(0xFF6A6F8E, f), 1.2)
-        wa := DecT(now)*0.0004
-        loop 8 {
-            an := wa + (A_Index - 1)*0.7854
-            Line(fwx, fwy, fwx + 11*cs*Cos(an), fwy + 11*cs*Sin(an), pn)
-            gx := fwx + 11*cs*Cos(an), gy := fwy + 11*cs*Sin(an)
-            b := TB(Mod(A_Index, 2) ? 0xFFE8574A : 0xFF3F7FC9, f), FillRR(gx - 4, gy - 3, 8, 7, 2, b)
-            if (night > 0.2)
-                b := TB(Alpha(warm, Round(220*night)), f), FillEll(gx - 1.5, gy - 1.5, 3, 3, b)
-        }
-        DelP(pn)
-        pn := PenP(FA(0xFF8A8FA8, f), 1.4), Ell(fwx - 11*cs, fwy - 11*cs, 22*cs, 22*cs, pn), DelP(pn)
-        b := TB(0xFF9A9EB8, f), FillEll(fwx - 3, fwy - 3, 6, 6, b)
-    }
     if (lv >= 3) {                                ; a lighthouse on the far hill, its beam sweeping at night
+        ; the beam in steps of cells, widening and fading as it goes, not a
+        ; drawn line: a line is the one thing in this picture with no pixels
         P(8, 40, 3, 12, 0xFFE0D8C8), P(8, 44, 3, 2, 0xFFC44A4A), P(8, 48, 3, 2, 0xFFC44A4A), P(7, 38, 5, 2, 0xFF3A3F5C), P(8, 36, 3, 2, warm)
         if (night > 0.2) {
-            ba := DecT(now)*0.0008
-            pn := PenP(FA(Alpha(warm, Round(70*night)), f), 6)
-            Line(ox + 9.5*cs, oy + 37*cs, ox + 9.5*cs + 40*cs*Cos(ba), oy + 37*cs + 10*cs*Sin(ba), pn), DelP(pn)
-            pn := PenP(FA(Alpha(warm, Round(120*night)), f), 2)
-            Line(ox + 9.5*cs, oy + 37*cs, ox + 9.5*cs + 40*cs*Cos(ba), oy + 37*cs + 10*cs*Sin(ba), pn), DelP(pn)
+            ba := Floor(Mod(DecT(now)*0.035, 360)/10)*10*0.0174533
+            loop 9 {
+                q := A_Index
+                bx2 := 9 + Round(q*4*Cos(ba)), by2 := 37 + Round(q*1.4*Sin(ba))
+                P(bx2, by2 - (q > 4 ? 1 : 0), 4, 1 + (q > 4 ? 2 : 1), Alpha(warm, Round((120 - q*11)*night)))
+            }
         }
     }
     if (lv >= 4) {                                ; a blimp, with a light banner that scrolls
@@ -51217,8 +52360,8 @@ TownStreet(ox, oy, cs, acc, f, now) {
             P(kx, ky - 3, 1, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx - 1, ky - 2, 3, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx - 2, ky - 1, 5, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx - 1, ky, 3, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9), P(kx, ky + 1, 1, 1, q = 1 ? 0xFFE8574A : 0xFF3F7FC9)
             loop 5
                 P(kx + Round(Sin(t*0.004 + A_Index)*1.2), ky + 1 + A_Index, 1, 1, Mod(A_Index, 2) ? 0xFFFFE08A : 0xFFF4F1E8)
-            pn := PenP(FA(Alpha(0xFF3A3F5C, 110), f), 1)
-            Line(ox + kx*cs, oy + (ky + 6)*cs, ox + (kx - 10 - q*6)*cs, oy + 84*cs, pn), DelP(pn)
+            loop 12                               ; the string, in steps
+                P(kx - Round((10 + q*6)*A_Index/12.0), ky + 6 + Round((84 - ky - 6)*A_Index/12.0), 1, 1, Alpha(0xFF3A3F5C, 110))
         }
     }
     if (lv >= 2) {                                ; a food truck, steam off its hatch, a queue
@@ -51558,28 +52701,27 @@ TownVillage(ox, oy, cs, acc, f, now) {
             P(shx, shy, 4, 2, 0xFFF4F1E8), P(shx + 4, shy + (nib ? 1 : 0), 1, 1, 0xFF2A2436), P(shx, shy + 2, 1, 1, 0xFF2A2436), P(shx + 3, shy + 2, 1, 1, 0xFF2A2436)
         }
     }
-    if (lv >= 2) {                                ; a windmill by the plot, sails turning
-        P(134, 82, 4, 6, 0xFFE0D8C8), P(133, 81, 6, 1, 0xFF9A2A2A), P(135, 85, 2, 2, 0xFF6A3A22)
-        wa := Floor(Mod(DecT(now)*0.03, 360)/15)*15
-        pn := PenP(FA(0xFF5A3E2E, f), 2)
+    if (lv >= 2) {                                ; a windmill by the plot, sails turning in steps of cells
+        P(134, 82, 4, 6, 0xFFE0D8C8), P(133, 81, 6, 1, 0xFF9A2A2A), P(135, 85, 2, 2, 0xFF6A3A22), P(135, 83, 1, 1, 0xFF9FD3F0)
+        wa := Floor(Mod(DecT(now)*0.03, 360)/15)*15*0.0174533
         loop 4 {
-            an := (wa + (A_Index - 1)*90)*0.0174533
-            Line(ox + 136*cs, oy + 80*cs, ox + 136*cs + 7*cs*Cos(an), oy + 80*cs + 7*cs*Sin(an), pn)
+            an := wa + (A_Index - 1)*1.5708
+            loop 6
+                P(136 + Round(A_Index*Cos(an)), 80 + Round(A_Index*Sin(an)), 1, 1, 0xFF5A3E2E)
+            P(136 + Round(6*Cos(an)) - (Cos(an) < 0 ? 1 : 0), 80 + Round(6*Sin(an)), 2, 1, 0xFFE9D5A8)
         }
-        DelP(pn)
-        b := TB(0xFFE0D8C8, f), FillEll(ox + 136*cs - 2, oy + 80*cs - 2, 4, 4, b)
+        P(135, 79, 2, 2, 0xFFE0D8C8)
     }
-    if (lv >= 3) {                                ; a carousel on the square, turning
-        b := TB(0xFFE8574A, f), FillEll(ox + 60*cs, oy + 40*cs, 8*cs, 8*cs, b)
-        b := TB(0xFFFFE08A, f), FillEll(ox + 61*cs, oy + 41*cs, 6*cs, 6*cs, b)
-        ca := DecT(now)*0.0015
+    if (lv >= 3) {                                ; a carousel on the square, turning: a ring of cells, four horses
+        P(61, 41, 6, 6, 0xFFE8574A), P(60, 42, 8, 4, 0xFFE8574A), P(62, 40, 4, 8, 0xFFE8574A)
+        P(62, 42, 4, 4, 0xFFFFE08A), P(61, 43, 6, 2, 0xFFFFE08A), P(63, 41, 2, 6, 0xFFFFE08A)
+        ca := Floor(Mod(DecT(now)*0.05, 360)/22.5)*22.5*0.0174533
         loop 4 {
             an := ca + (A_Index - 1)*1.5708
-            hx0 := ox + 64*cs + 2.6*cs*Cos(an), hy0 := oy + 44*cs + 2.6*cs*Sin(an)
-            b := TB(Mod(A_Index, 2) ? 0xFFF4F1E8 : 0xFF8A6A4A, f), FillRR(hx0 - 3, hy0 - 2, 6, 4, 1.5, b)
-            b := TB(0xFF3A2E24, f), FillRR(hx0 - 1, hy0 - 1, 2, 2, 1, b)
+            hx0 := 64 + Round(2.6*Cos(an)), hy0 := 44 + Round(2.6*Sin(an))
+            P(hx0 - 1, hy0, 2, 1, Mod(A_Index, 2) ? 0xFFF4F1E8 : 0xFF8A6A4A), P(hx0, hy0 - 1, 1, 1, 0xFF3A2E24)
         }
-        b := TB(0xFFC44A4A, f), FillEll(ox + 64*cs - 2, oy + 44*cs - 2, 4, 4, b)
+        P(64, 44, 1, 1, 0xFFC44A4A)
     }
     if (lv >= 4) {                                ; a balloon crossing, and its shadow on the ground
         bx0 := Mod(t*0.0016, 200) - 30, by0 := 30 + Round(6*Sin(t*0.0006))
@@ -51615,6 +52757,252 @@ TownVillage(ox, oy, cs, acc, f, now) {
         k := A_Index
         P(Mod(t*0.03 + k*40, 170) - 15, 30 + k*14, 2, 1, Alpha(0xFF1E3A2A, 60)), P(Mod(t*0.03 + k*40, 170) - 14, 29 + k*14, 1, 1, Alpha(0xFF1E3A2A, 60))
     }
+}
+
+; =============== 4  FLAPPY ===============
+; The bird sits a fifth of the way in; the world scrolls past it. Gravity, a
+; flap, pipes every 1.7 s with a gap that wanders and narrows as the score
+; climbs, coins in the gaps, the ground and the far hills moving at two
+; speeds, and a score in the picture's own pixel face. Five worlds, six
+; birds, a shop to buy them in with the coins the runs earn. All of it on the
+; grid, all of it drawn from cells. The clock is the real one, so a slow
+; frame does not slow the game - it just draws fewer of its moments.
+FlappyDraw(ox, oy, cs, acc, f, now) {
+    W(v, m) => Mod(Mod(v, m) + m, m)           ; a wrap that stays positive - Mod keeps the sign of the world's scroll, which runs negative
+    wd := FlappyWorld(FB.world)
+    ; ---- step the world ----
+    dt := FB.lastT ? Min(now - FB.lastT, 40) : 0
+    FB.lastT := now
+    live := (FB.on && !FB.dead && !FB.shop)
+    gap := 26 - Min(FB.score, 30)*0.2
+    spd := 0.028 + Min(FB.score, 40)*0.00018
+    if live {
+        FB.run += dt
+        FB.vy := Min(FB.vy + 0.00019*dt, 0.11)
+        FB.y  += FB.vy*dt
+        FB.gx += spd*dt
+        if (FB.y < 0)
+            FB.y := 0, FB.vy := 0
+        if (now >= FB.spawnAt) {
+            FB.pipes.Push({x: 150.0, gy: Random(18, Round(84 - gap - 8)), passed: 0, coin: (Random(1, 10) <= 6)})
+            FB.spawnAt := now + 1700
+        }
+        for pp in FB.pipes
+            pp.x -= spd*dt
+        while (FB.pipes.Length && FB.pipes[1].x < -12)
+            FB.pipes.RemoveAt(1)
+        bx := 30, by := Round(FB.y)
+        for pp in FB.pipes {
+            if (!pp.passed && pp.x + 10 < bx)
+                pp.passed := 1, FB.score += 1
+            gb := pp.gy + Round(gap)
+            if (bx + 6 > pp.x && bx + 1 < pp.x + 10 && (by < pp.gy || by + 4 > gb))
+                FlappyDie(now)
+            if (pp.coin && Abs(pp.x + 5 - (bx + 3)) < 4 && Abs(pp.gy + Round(gap/2) - (by + 2)) < 5) {
+                pp.coin := 0, FB.coins += 1, FB.sparkAt := now, FB.spx := Round(pp.x) + 5, FB.spy := pp.gy + Round(gap/2)
+                try IniWrite(FB.coins, iniPath, "flappy", "coins")
+            }
+        }
+        if (by + 4 >= 88)
+            FlappyDie(now)
+        ; the trail some birds leave: a cell a frame, kept for a few
+        if (FB.bird = 5 || FB.bird = 6) {
+            FB.trail.Push({x: 29, y: FB.y + 2, at: now})
+            while (FB.trail.Length && now - FB.trail[1].at > 360)
+                FB.trail.RemoveAt(1)
+        }
+    } else if FB.dead {
+        if (FB.y + 4 < 88)
+            FB.vy := Min(FB.vy + 0.00019*dt, 0.11), FB.y := Min(FB.y + FB.vy*dt, 84.0)
+    } else if !FB.on
+        FB.y := 46 + 2*Sin(now*0.004)            ; idle: the bird bobs, waiting
+    ; the shake a death throws, for a fifth of a second
+    shk := (FB.dead && now - FB.deadAt < 220) ? Round(2.5*Sin((now - FB.deadAt)*0.09)*(1 - (now - FB.deadAt)/220.0)) : 0
+    ox += shk
+    P(x, y, w, h, c) => TPx(ox, oy, cs, x, y, w, h, c, f)
+    ; ---- the sky, and what is in it ----
+    SkyBands(ox, oy, cs, 88, wd.sT, wd.sB, f, 8)
+    if wd.stars {
+        loop 30 {
+            q := A_Index
+            P(W(q*37 + 11 - Round(FB.gx*0.05), 142), Mod(q*23 + 5, 60) + 1, 1, 1, Alpha(0xFFF4F1E8, Round(90 + 130*Abs(Sin(now*0.0029 + q*1.3)))))
+        }
+    }
+    if wd.sun {
+        sx0 := (FB.world = 3) ? 110 : 112, sy0 := (FB.world = 3) ? 14 : 12
+        P(sx0 - 3, sy0 - 2, 7, 5, wd.sun), P(sx0 - 2, sy0 - 3, 5, 7, wd.sun)
+        if (FB.world = 3)
+            P(sx0 - 2, sy0 - 2, 5, 5, wd.sT)
+    }
+    if (FB.world = 5) {                           ; the cave: stalactites from the roof
+        loop 18 {
+            q := A_Index
+            sh := 4 + Mod(q*5, 9)
+            P(W((q - 1)*8 + Mod(q*3, 5) - Round(FB.gx*0.2), 150) - 4, 0, 3, sh, 0xFF241E2E), P(W((q - 1)*8 + Mod(q*3, 5) - Round(FB.gx*0.2), 150) - 3, sh, 1, 2, 0xFF241E2E)
+        }
+    } else {
+        loop 5 {
+            q := A_Index
+            TownCloud(P, W(q*37 - Round(FB.gx*0.15), 170) - 20, 6 + Mod(q*9, 22), 10 + Mod(q, 3)*4, wd.cT, wd.cU)
+        }
+    }
+    loop 36 {
+        q := A_Index
+        hh := 8 + Round(6*Sin(q*0.6) + 3*Sin(q*1.4 + 1))
+        P(W((q - 1)*4 - Round(FB.gx*0.3), 144) - 2, 88 - hh, 4, hh, wd.hill)
+    }
+    if (FB.world = 4) {                           ; snow, falling on its own slant
+        loop 40 {
+            q := A_Index
+            fp := Mod(now*0.00008 + q*0.137, 1.0)
+            P(W(q*37 + Round(fp*14) - Round(FB.gx*0.1), 142), Round(fp*88), 1, 1, Alpha(0xFFFFFFFF, 200))
+        }
+    }
+    ; ---- the pipes, and the coins in their gaps ----
+    for pp in FB.pipes {
+        px := Round(pp.x), gb := pp.gy + Round(gap)
+        P(px, 0, 10, pp.gy, wd.pipe), P(px, 0, 2, pp.gy, wd.pL), P(px + 8, 0, 2, pp.gy, wd.pD)
+        P(px - 1, pp.gy - 3, 12, 3, wd.pipe), P(px - 1, pp.gy - 3, 12, 1, wd.pL), P(px - 1, pp.gy - 1, 12, 1, wd.pD)
+        P(px, gb, 10, 88 - gb, wd.pipe), P(px, gb, 2, 88 - gb, wd.pL), P(px + 8, gb, 2, 88 - gb, wd.pD)
+        P(px - 1, gb, 12, 3, wd.pipe), P(px - 1, gb, 12, 1, wd.pL), P(px - 1, gb + 2, 12, 1, wd.pD)
+        if (FB.world = 3)
+            P(px + 3, pp.gy - 2, 4, 1, 0xFFFFD98A), P(px + 3, gb + 1, 4, 1, 0xFFFFD98A)
+        if pp.coin {
+            cy0 := pp.gy + Round(gap/2)
+            cw := [3, 2, 1, 2][Mod(Floor(now/110), 4) + 1]
+            P(px + 5 - cw//2 - (cw = 2 ? 0 : 0), cy0 - 1, cw, 3, 0xFFFFD86B), P(px + 5 - cw//2, cy0 - 2, cw, 1, 0xFFE8A64A), P(px + 5 - cw//2, cy0 + 2, cw, 1, 0xFFE8A64A)
+            if (cw = 3)
+                P(px + 5, cy0, 1, 1, 0xFFFFF0B8)
+        }
+    }
+    ; ---- the ground, scrolling ----
+    P(0, 88, 142, 13, wd.gnd), P(0, 88, 142, 1, wd.gT), P(0, 89, 142, 1, Mix(wd.gT, 0xFF000000, 0.2))
+    loop 20
+        P(W((A_Index - 1)*8 - Round(FB.gx), 152) - 8, 92, 4, 1, wd.gS)
+    loop 20
+        P(W((A_Index - 1)*8 + 4 - Round(FB.gx), 152) - 8, 96, 4, 1, wd.gS)
+    if (FB.world = 5) {
+        loop 6
+            P(W((A_Index - 1)*24 + 6 - Round(FB.gx), 152) - 8, 86, 1, 2, AccHi(acc, 0.4)), P(W((A_Index - 1)*24 + 5 - Round(FB.gx), 152) - 8, 87, 3, 1, acc)
+    }
+    ; ---- the bird, its trail, the coin sparkle ----
+    for tr in FB.trail {
+        ta := 1 - (now - tr.at)/360.0
+        P(Round(tr.x - (now - tr.at)*spd), Round(tr.y), 1, 1, Alpha((FB.bird = 5) ? 0xFFFFE08A : 0xFF9FD3F0, Round(200*ta)))
+    }
+    by := Round(FB.y)
+    wing := (now - FB.flapAt < 160) ? 0 : (FB.vy < 0 ? 1 : 2)
+    FlappyBird(P, 29, by, FB.bird, wing, f, now)
+    if (FB.dead && FB.y + 4 >= 84)
+        P(31, by - 3, 1, 1, 0xFFFFFFFF), P(33, by - 4, 1, 1, 0xFFFFFFFF), P(35, by - 3, 1, 1, 0xFFFFFFFF)
+    if (FB.sparkAt && now - FB.sparkAt < 380) {
+        e := (now - FB.sparkAt)/380.0
+        loop 6 {
+            an := (A_Index - 1)*1.047
+            P(FB.spx + Round((2 + 5*e)*Cos(an)) - Round(spd*(now - FB.sparkAt)), FB.spy + Round((2 + 5*e)*Sin(an)), 1, 1, Alpha(0xFFFFE08A, Round(230*(1 - e))))
+        }
+    } else if FB.sparkAt
+        FB.sparkAt := 0
+    ; ---- the words, in the pixel face ----
+    inkS := 0xFF23263A
+    if (FB.on && !FB.shop) {
+        sc := String(FB.score)
+        FlappyText(P, 71 - FlappyTextW(sc, 3)//2, 6, sc, 0xFFFFFFFF, 3, Alpha(inkS, 140))
+    }
+    ; coins, top right - the shop shows its own, so not under the shop
+    if !FB.shop {
+        P(126, 5, 3, 3, 0xFFFFD86B), P(127, 6, 1, 1, 0xFFFFF0B8), P(126, 4, 3, 1, 0xFFE8A64A), P(126, 8, 3, 1, 0xFFE8A64A)
+        FlappyText(P, 131, 4, String(FB.coins), 0xFFFFF4C8, 1, Alpha(inkS, 140))
+    }
+    if (!FB.on && !FB.shop) {
+        P(26, 22, 90, 26, Alpha(0xFF12141F, 170)), P(26, 22, 90, 1, Alpha(0xFFFFE08A, 120)), P(26, 47, 90, 1, Alpha(0xFFFFE08A, 120)), P(26, 22, 1, 26, Alpha(0xFFFFE08A, 120)), P(115, 22, 1, 26, Alpha(0xFFFFE08A, 120))
+        FlappyText(P, 71 - FlappyTextW("TAP TO FLY", 2)//2, 26 + Mod(Floor(now/500), 2), "TAP TO FLY", 0xFFFFFFFF, 2, Alpha(inkS, 140))
+        FlappyText(P, 71 - FlappyTextW("BEST " FB.best, 1)//2, 40, "BEST " FB.best, 0xFFFFE08A, 1)
+    }
+    if (FB.dead && !FB.shop) {
+        e := Ease3(Min((now - FB.deadAt)/420.0, 1.0))
+        ; The card on the same ladder as the shop: the title with two cells
+        ; of air under it, the medal beside the three lines and below the
+        ; title rather than on it, and TAP TO RETRY on the card's own last
+        ; row - it was drawn at row 40 of a card 38 tall, i.e. outside it.
+        py0 := 22 - Round(6*(1 - e))
+        P(31, py0, 80, 50, Alpha(0xFF12141F, Round(190*e))), P(31, py0, 80, 1, Alpha(0xFFFFE08A, Round(150*e))), P(31, py0 + 49, 80, 1, Alpha(0xFFFFE08A, Round(150*e))), P(31, py0, 1, 50, Alpha(0xFFFFE08A, Round(150*e))), P(110, py0, 1, 50, Alpha(0xFFFFE08A, Round(150*e)))
+        FlappyText(P, 71 - FlappyTextW("GAME OVER", 2)//2, py0 + 4, "GAME OVER", Alpha(0xFFFFFFFF, Round(240*e)), 2, Alpha(inkS, Round(140*e)))
+        nb := (FB.bestAt && FB.bestAt = FB.deadAt)
+        ; the medal, by the score: bronze at ten, silver at twenty-five, gold at fifty
+        mc := (FB.score >= 50) ? 0xFFFFD86B : (FB.score >= 25) ? 0xFFD8DEE6 : (FB.score >= 10) ? 0xFFC98A5A : 0
+        if mc
+            P(38, py0 + 17, 12, 2, 0xFFE8574A), P(40, py0 + 20, 8, 8, mc), P(41, py0 + 19, 6, 10, mc), P(39, py0 + 21, 10, 6, mc), P(42, py0 + 22, 2, 2, 0xFFFFFFFF)
+        FlappyText(P, 53, py0 + 18, "SCORE " FB.score, Alpha(0xFFFFF4C8, Round(230*e)), 1)
+        FlappyText(P, 53, py0 + 25, (nb ? "NEW BEST!" : "BEST " FB.best), Alpha(nb ? 0xFFFFE08A : 0xFFFFF4C8, Round(230*e)), 1)
+        FlappyText(P, 53, py0 + 32, "+" FB.bonus " COINS", Alpha(0xFFFFD86B, Round(230*e)), 1)
+        if (Mod(Floor(now/450), 2))
+            FlappyText(P, 71 - FlappyTextW("TAP TO RETRY", 1)//2, py0 + 41, "TAP TO RETRY", Alpha(0xFFFFF4C8, Round(200*e)), 1)
+    }
+    ; the SHOP button, whenever a run is not live - under the card, above
+    ; the ground, its coin clear of its word
+    if (!live && !FB.shop) {
+        hvS := HL.h.Get(2239, 0.0)
+        P(54, 76, 34, 10, Alpha(0xFF12141F, Round(170 + 60*hvS))), P(54, 76, 34, 1, Alpha(0xFFFFE08A, Round(140 + 100*hvS))), P(54, 85, 34, 1, Alpha(0xFFFFE08A, Round(140 + 100*hvS))), P(54, 76, 1, 10, Alpha(0xFFFFE08A, Round(140 + 100*hvS))), P(87, 76, 1, 10, Alpha(0xFFFFE08A, Round(140 + 100*hvS)))
+        FlappyText(P, 60, 78, "SHOP", 0xFFFFFFFF, 1)
+        P(80, 79, 3, 3, 0xFFFFD86B), P(81, 80, 1, 1, 0xFFFFF0B8), P(80, 78, 3, 1, 0xFFE8A64A), P(80, 82, 3, 1, 0xFFE8A64A)
+    }
+    ; ---- the shop ----
+    ; Laid out on a strict ladder so nothing lands on anything: the title row
+    ; holds the name, the purse and BACK; each shelf is a label, then a row
+    ; of tiles 28 cells tall with the preview in the top half, the name on
+    ; the third line and the price or state on the fourth, inside the tile.
+    ; Six tiles across at a twenty-one-cell pitch leaves a cell of air round
+    ; a five-letter name at the pixel face's width of nineteen.
+    if FB.shop {
+        P(6, 4, 130, 96, Alpha(0xFF12141F, 228)), P(6, 4, 130, 1, 0xFFFFE08A), P(6, 99, 130, 1, 0xFFFFE08A), P(6, 4, 1, 96, 0xFFFFE08A), P(135, 4, 1, 96, 0xFFFFE08A)
+        FlappyText(P, 11, 7, "SHOP", 0xFFFFFFFF, 2, Alpha(inkS, 140))
+        P(64, 9, 3, 3, 0xFFFFD86B), P(65, 10, 1, 1, 0xFFFFF0B8), P(64, 8, 3, 1, 0xFFE8A64A), P(64, 12, 3, 1, 0xFFE8A64A)
+        FlappyText(P, 69, 8, String(FB.coins), 0xFFFFE08A, 1)
+        hvB := HL.h.Get(2238, 0.0)
+        P(104, 6, 28, 10, Alpha(0xFF1E2238, Round(200 + 40*hvB))), P(104, 6, 28, 1, 0xFFFFE08A), P(104, 15, 28, 1, 0xFFFFE08A), P(104, 6, 1, 10, 0xFFFFE08A), P(131, 6, 1, 10, 0xFFFFE08A)
+        FlappyText(P, 118 - FlappyTextW("BACK", 1)//2, 9, "BACK", 0xFFFFFFFF, 1)
+        FlappyText(P, 11, 20, "BIRDS", 0xFFFFE08A, 1)
+        FlappyText(P, 11, 57, "WORLDS", 0xFFFFE08A, 1)
+        loop 2 {
+            kind := A_Index
+            lst := (kind = 1) ? FB_BIRDS : FB_WORLDS
+            own := (kind = 1) ? FB.birds : FB.worlds
+            eq  := (kind = 1) ? FB.bird : FB.world
+            ty0 := (kind = 1) ? 26 : 63
+            x00 := (kind = 1) ? 8 : 18
+            for i, it in lst {
+                tx0 := x00 + (i - 1)*21
+                z := (kind = 1 ? 2240 : 2250) + i
+                hv := HL.h.Get(z, 0.0)
+                has := (own & (1 << (i - 1)))
+                sh2 := (FB.bought = -i*kind && now - FB.boughtAt < 400) ? Round(1.5*Sin((now - FB.boughtAt)*0.06)) : 0
+                jb := (FB.bought = i*kind && now - FB.boughtAt < 500) ? Round(2*Sin((now - FB.boughtAt)/500.0*3.14159)) : 0
+                cB := (eq = i) ? 0xFFFFE08A : has ? 0xFF8A8FA8 : 0xFF3A3F5C
+                tx := tx0 + sh2, ty := ty0 - jb
+                P(tx, ty, 20, 28, Alpha(0xFF1E2238, Round(200 + 40*hv))), P(tx, ty, 20, 1, cB), P(tx, ty + 27, 20, 1, cB), P(tx, ty, 1, 28, cB), P(tx + 19, ty, 1, 28, cB)
+                if (kind = 1)
+                    FlappyBird(P, tx + 6, ty + 6 + Round(Sin(now*0.004 + i)*0.6), i, Mod(Floor(now/220) + i, 3), f, now)
+                else {
+                    w2 := FlappyWorld(i)
+                    P(tx + 2, ty + 2, 16, 6, w2.sT), P(tx + 2, ty + 6, 16, 4, w2.sB), P(tx + 2, ty + 9, 16, 2, w2.hill), P(tx + 2, ty + 11, 16, 2, w2.gnd), P(tx + 2, ty + 11, 16, 1, w2.gT)
+                    P(tx + 9, ty + 2, 2, 5, w2.pipe), P(tx + 9, ty + 10, 2, 1, w2.pipe)
+                }
+                FlappyText(P, tx + 10 - FlappyTextW(it[1], 1)//2, ty + 15, it[1], has ? 0xFFFFFFFF : 0xFF8A8FA8, 1)
+                if (eq = i)
+                    FlappyText(P, tx + 10 - FlappyTextW("ON", 1)//2, ty + 22, "ON", 0xFFFFE08A, 1)
+                else if has
+                    FlappyText(P, tx + 10 - FlappyTextW("USE", 1)//2, ty + 22, "USE", 0xFFB9DCF2, 1)
+                else {
+                    pr := String(it[2])
+                    P(tx + 10 - FlappyTextW(pr, 1)//2 - 4, ty + 22, 3, 3, (FB.coins >= it[2]) ? 0xFFFFD86B : 0xFF6A6F8E)
+                    FlappyText(P, tx + 10 - FlappyTextW(pr, 1)//2, ty + 22, pr, (FB.coins >= it[2]) ? 0xFFFFD86B : 0xFF6A6F8E, 1)
+                }
+            }
+        }
+    }
+    if (FB.bought && now - FB.boughtAt > 520)
+        FB.bought := 0
 }
 
 ; ---- the pixel cafe ----
@@ -51736,7 +53124,7 @@ Doodle(kind, dx, dy, sc, col, f, now, ph) {
         Line(dx + sc*0.4, dy - sc*0.5, dx + sc*0.1, dy - sc*0.1, pn)
         Line(dx + sc*0.4, dy - sc*0.5, dx, dy - sc*0.62, pn)
     } else {
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
+        PenDash(pn, 2)
         Ell(dx - sc, dy - sc*0.62, sc*2, sc*1.24, pn)
         DelP(pn)
         oa := now*0.0022 + ph
@@ -52557,10 +53945,18 @@ PanelBackdropLight(x, y, w, h, acc, f, now, k) {
 PanelBackdrop(x, y, w, h, acc, f, now, k := 1.0) {
     if hubLowPerf
         return                               ; LOW PERFORMANCE MODE: flat surfaces
-    if ((dk := k*(1 - thT)) > 0.004)
-        PanelBackdropDark(x, y, w, h, acc, f, now, dk)
-    if ((lt := k*thT) > 0.004)
-        PanelBackdropLight(x, y, w, h, acc, f, now, lt)
+    dk := k*(1 - thT), lt := k*thT
+    ; cached and blitted - see BdBlit. `draw` is the same body at full alpha.
+    if (f > 0.004 && BdBlit("P|" Round(w) "|" Round(h) "|" (acc & 0xF8F8F8) "|" Round(k*100) "|" (lt > 0.004 ? 1 : 0)
+                          , x, y, w, h, f, now, draw))
+        return
+    draw(x, y, f)
+    draw(x0, y0, f0) {
+        if (dk > 0.004)
+            PanelBackdropDark(x0, y0, w, h, acc, f0, now, dk)
+        if (lt > 0.004)
+            PanelBackdropLight(x0, y0, w, h, acc, f0, now, lt)
+    }
 }
 MiniBackdropLight(x, y, w, h, r, acc, f, now, k) {
     pM := RRPath(x, y, w, h, r)
@@ -52613,10 +54009,19 @@ MiniBackdrop(x, y, w, h, r, acc, f, now, k := 1.0) {
         return                               ; LOW PERFORMANCE MODE: flat surfaces
     if (w < 24 || h < 16)
         return
-    if ((dk := k*(1 - thT)) > 0.004)
-        MiniBackdropDark(x, y, w, h, r, acc, f, now, dk)
-    if ((lt := k*thT) > 0.004)
-        MiniBackdropLight(x, y, w, h, r, acc, f, now, lt)
+    dk := k*(1 - thT), lt := k*thT
+    ; cached and blitted - see BdBlit. The drawers clip to their own rounded
+    ; rect, so the shape is baked into the bitmap's transparent corners.
+    if (f > 0.004 && BdBlit("M|" Round(w) "|" Round(h) "|" Round(r*2) "|" (acc & 0xF8F8F8) "|" Round(k*100) "|" (lt > 0.004 ? 1 : 0)
+                          , x, y, w, h, f, now, draw))
+        return
+    draw(x, y, f)
+    draw(x0, y0, f0) {
+        if (dk > 0.004)
+            MiniBackdropDark(x0, y0, w, h, r, acc, f0, now, dk)
+        if (lt > 0.004)
+            MiniBackdropLight(x0, y0, w, h, r, acc, f0, now, lt)
+    }
 }
 MiniBackdropDark(x, y, w, h, r, acc, f, now, k) {
     pM := RRPath(x, y, w, h, r)
@@ -52692,6 +54097,13 @@ MicroBackdrop(x, y, w, h, r, acc, f, now, k := 1.0) {
         return                               ; LOW PERFORMANCE MODE: flat surfaces
     if (w < 20 || h < 8 || f <= 0.02)
         return
+    ; cached and blitted - see BdBlit; MicroBackdropRaw below is the texture
+    if BdBlit("U|" Round(w) "|" Round(h) "|" Round(r*2) "|" (acc & 0xF8F8F8) "|" Round(k*100), x, y, w, h, f, now, draw)
+        return
+    MicroBackdropRaw(x, y, w, h, r, acc, f, now, k)
+    draw(x0, y0, f0) => MicroBackdropRaw(x0, y0, w, h, r, acc, f0, now, k)
+}
+MicroBackdropRaw(x, y, w, h, r, acc, f, now, k) {
     p := RRPath(x, y, w, h, r)
     sv := PushG()
     DllCall("gdiplus\GdipSetClipPath", "ptr", G, "ptr", p, "int", 1)
@@ -52948,7 +54360,7 @@ HBrushP(x, y, w, h, c1, c2) {
     return b
 }
 PenP(c, w) {
-    global penCache, penOwn
+    global penCache, penOwn, penDirty
     k := ElA(c)
     ; Nothing invisible reaches the rasteriser. A pen at zero alpha still walks
     ; its geometry and still costs the whole call - and during a fade EVERY
@@ -52962,8 +54374,14 @@ PenP(c, w) {
     ky := k*4096 + Round(w*64)
     if penCache.Has(ky) {
         p := penCache[ky]
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", p, "int", 0)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", p, "float", 0)
+        ; Only a pen that was handed a dash (PenDash / PenDashOff) is reset.
+        ; This was two DllCalls on EVERY fetch - a thousand a frame - to clear
+        ; a state that fewer than fifty sites ever set.
+        if penDirty.Has(p) {
+            penDirty.Delete(p)
+            DllCall("gdiplus\GdipSetPenDashStyle", "ptr", p, "int", 0)
+            DllCall("gdiplus\GdipSetPenDashOffset", "ptr", p, "float", 0)
+        }
         return p
     }
     DllCall("gdiplus\GdipCreatePen1", "uint", k, "float", w, "int", 2, "ptr*", &p := 0)
@@ -53030,12 +54448,31 @@ DelP(p) {
 ; Same bound as the brushes, and for the same reason: alpha ramps and theme
 ; crossfades mint new colours every frame. Called only where BrushCacheTick is.
 PenCacheTick() {
-    global penCache, penOwn
+    global penCache, penOwn, penDirty
     if penCache.Count < 2048
         return
     for k, p in penCache
         DllCall("gdiplus\GdipDeletePen", "ptr", p)
-    penCache := Map(), penOwn := Map()
+    penCache := Map(), penOwn := Map(), penDirty := Map()
+}
+; ---- the two pen mutations, with a mark ----
+; Every dash a site sets goes through here so PenP knows which handles to
+; clean on their next fetch. Nothing in the file mutates a pen any other way
+; (caps, joins, width and alignment are never touched - see the note above
+; SBrush), so this mark is the whole of the state a cached pen can carry.
+PenDash(p, style) {
+    global penDirty
+    if !p
+        return
+    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", p, "int", style)
+    penDirty[p] := 1
+}
+PenDashOff(p, off) {
+    global penDirty
+    if !p
+        return
+    DllCall("gdiplus\GdipSetPenDashOffset", "ptr", p, "float", off)
+    penDirty[p] := 1
 }
 ; ---- LOW PERFORMANCE MODE: a frozen clock for decoration ----
 ; Every ambient movement in this file is a phase built from the frame clock -
@@ -54017,7 +55454,7 @@ PuzOvToggleBind(*) {
 
 ; ---- timer wrapper, same contract as RendTim ----
 PuzRendTim(p) {
-    if hubLowPerf
+    if (hubLowPerf && p)                     ; a stop stays a stop - see RendTim
         p := (p <= TICK_A) ? 40 : 220
     if (p != PZO.rendP)
         PZO.rendP := p, SetTimer(PuzRender, p, -10)
@@ -54159,7 +55596,12 @@ PuzOvMMove(wParam, lParam, msg, hwnd) {
     ; flips 16/33/16/33 on every mouse move, and SetTimer RESTARTS the
     ; countdown each time it changes - so the card renders at neither rate and
     ; the pointer stutters. One writer for the period, and this is not it.
+    ; ...except from a STOP: LOW PERFORMANCE MODE halts the renderer when the
+    ; pointer is off the card, and the frame that lands the hover has to be
+    ; booked by something. Waking a stopped timer cannot fight anything.
     PZO.pokeAt := A_TickCount
+    if (PZO.rendP <= 0)
+        PuzRendTim(TICK_A)
     if PZO.sld {
         CursorXY(&sx2, &sy2)
         PuzOvSlideSet(sx2)
@@ -54332,9 +55774,9 @@ PuzRender() {
     if (PZO.burstAt && now - PZO.burstAt >= 450)
         PZO.burstAt := 0
 
-    PZO.pulse := PZO.enabled ? (Sin(now * 0.00417) + 1)/2 : 0
-    PZO.emb   := (Sin(now * 0.0016) + 1)/2
-    PZO.emb2  := (Sin(now * 0.004) + 1)/2
+    PZO.pulse := PZO.enabled ? (Sin(DecT(now) * 0.00417) + 1)/2 : 0   ; frozen in the mode - see Render
+    PZO.emb   := (Sin(DecT(now) * 0.0016) + 1)/2
+    PZO.emb2  := (Sin(DecT(now) * 0.004) + 1)/2
     PZO.cur   := Mix(hubAccent, C_ON, PZO.stateT)
     tg := PZO.togAt ? Min((now - PZO.togAt)/TOG_MS, 1.0) : 1.0
     togActive := PZO.togAt && tg < 1
@@ -54430,7 +55872,14 @@ PuzRender() {
               || (mkFlashAt && now - mkFlashAt < 520))
         deep := (!keep && !PZO.enabled && PZO.minStart = 0
               && PZO.pokeAt && now - PZO.pokeAt > HUB_DEEP_MS)
-        PuzRendTim((PZO.enabled || keep) ? TICK_A : (deep ? TICK_Z : TICK_S))
+        ; Armed idles at TICK_S, not TICK_A - the same reasoning as the block
+        ; overlay's cadence; `deep` already excludes an armed card, so it
+        ; never drops below that. LOW PERFORMANCE MODE stops; PuzOvMove and
+        ; the PuzRendTim(TICK_A) pokes wake it.
+        if hubLowPerf
+            PuzRendTim(keep ? TICK_A : 0)
+        else
+            PuzRendTim(keep ? TICK_A : (deep ? TICK_Z : TICK_S))
     }
 }
 
@@ -54590,7 +56039,7 @@ PuzOvDrawCard(f, now) {
     Ell(ax - 25, ay - 25, 50, 50, pn), DelP(pn)
     RingDraw(ax, ay, 26.5, AccHi(cur, 0.5*PZO.hovT), f*s2, PZO.hovT)
     if PZO.enabled {
-        sa := Mod(now * 0.09, 360)
+        sa := Mod(DecT(now) * 0.09, 360)
         cc := AccHi(cur, 0.4)
         pn := Pen(FA(Alpha(cc, 80), f*s2), 2.5)
         Arc(ax - 26.5, ay - 26.5, 53, 53, sa, 64, pn), DelP(pn)
@@ -54657,7 +56106,7 @@ PuzOvDrawCard(f, now) {
     b := SBrush(FA(0x8CFFFFFF, f*s3))
     FillEll(dx - 2.4, dy - 2.6, 1.8, 1.8, b), DelB(b)
     if PZ_solving {
-        oa := now*0.0042
+        oa := DecT(now)*0.0042
         b := SBrush(FA(Alpha(AccHi(cur, 0.5), 220), f*s3))
         FillEll(dx + 7.5*Cos(oa) - 1.3, dy + 7.5*Sin(oa) - 1.3, 2.6, 2.6, b), DelB(b)
     }
@@ -54774,8 +56223,8 @@ PuzOvDrawCard(f, now) {
         b := SBrush(FA(Alpha(0x0B0C14, 122*d), f))
         FillRR(cx, cy, CW, CH, 16, b), DelB(b)
         pn := Pen(FA(Alpha(cur, 205*d), f), 1.6)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
         StrokeRR(cx + 3, cy + 3, CW - 6, CH - 6, 13, pn), DelP(pn)
         mcx := cx + CW/2, mcy := cy + CH/2 - 7
         pn := Pen(FA(Alpha(0xFFFFFF, 225*d), f), 1.8)
@@ -54853,7 +56302,7 @@ PuzOvDrawBubble(f, now) {
             Arc(BBX - 30.75, BBY - 30.75, 61.5, 61.5, base + 76, 28, pn), DelP(pn)
         }
         ; counter-rotating faint arcs one ring inward
-        ba2 := Mod(-now*0.07, 360)
+        ba2 := Mod(-DecT(now)*0.07, 360)
         pn := Pen(FA(Alpha(cur, 70), f), 1.6)
         Arc(BBX - 33.2, BBY - 33.2, 66.4, 66.4, ba2, 58, pn)
         Arc(BBX - 33.2, BBY - 33.2, 66.4, 66.4, ba2 + 180, 58, pn), DelP(pn)
@@ -54906,10 +56355,10 @@ PuzOvDrawBubble(f, now) {
     }
     ; dotted counter-march ring + outer twinkle ticks
     pn := Pen(FA(Alpha(bcol, PZO.enabled ? 70 : 55 + 20*emb), f), 1.3)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 2)
-    DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", 1000 - Mod(DecT(now)*0.02, 1000))
+    PenDash(pn, 2)
+    PenDashOff(pn, 1000 - Mod(DecT(now)*0.02, 1000))
     Ell(BBX - 38.8, BBY - 38.8, 77.6, 77.6, pn), DelP(pn)
-    tb := -now*0.012
+    tb := -DecT(now)*0.012
     loop 12 {
         a_ := (tb + A_Index*30)*0.017453
         tw := (Sin(DecT(now)*0.002 + A_Index*0.52) + 1)/2
@@ -54923,7 +56372,7 @@ PuzOvDrawBubble(f, now) {
         FillEll(BBX + 35.1*Cos(ha) - 2.2, BBY + 35.1*Sin(ha) - 2.2, 4.4, 4.4, b), DelB(b)
         loop 3 {
             k := A_Index - 1
-            twA := (k*120 + now*0.02)*0.017453
+            twA := (k*120 + DecT(now)*0.02)*0.017453
             twI := Max(0.0, Sin(DecT(now)*0.003 + k*2.1))**9
             b := SBrush(FA(Alpha(0xFFFFFF, 200*twI), f))
             FillEll(BBX + 35*Cos(twA) - 1.4, BBY + 35*Sin(twA) - 1.4, 2.8, 2.8, b), DelB(b)
@@ -54978,8 +56427,8 @@ PuzOvDrawBubble(f, now) {
         b := SBrush(FA(Alpha(0x0B0C14, 118*d), f))
         FillEll(BBX - 30, BBY - 30, 60, 60, b), DelB(b)
         pn := Pen(FA(Alpha(cur, 200*d), f), 1.6)
-        DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-        DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.03, 1000))
+        PenDash(pn, 1)
+        PenDashOff(pn, Mod(DecT(now)*0.03, 1000))
         Ell(BBX - 36, BBY - 36, 72, 72, pn), DelP(pn)
     }
 }
@@ -55938,8 +57387,8 @@ PuzCalReticle(cx, cy, r, acc, f, now, step, kick) {
     r2 := r*1.24
     bx := cx - r2/2, by := cy - r2/2
     pn := Pen(FA(Alpha(acc, 60), f), 1.1)
-    DllCall("gdiplus\GdipSetPenDashStyle", "ptr", pn, "int", 1)
-    DllCall("gdiplus\GdipSetPenDashOffset", "ptr", pn, "float", Mod(DecT(now)*0.02, 1000))
+    PenDash(pn, 1)
+    PenDashOff(pn, Mod(DecT(now)*0.02, 1000))
     StrokeRR(bx, by, r2, r2, 3, pn), DelP(pn)
     ; the corner being asked for, and the arms running INTO the box from it
     ax  := (step = 1) ? bx : bx + r2
