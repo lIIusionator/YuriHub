@@ -1,0 +1,15 @@
+# .NET build output
+bin/
+obj/
+*.user
+.vs/
+.idea/
+
+# Local YURI2 build/package output
+YURI2/publish/
+YURI2/bundle/
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Yuri.App">
+  <!-- The hub draws every pixel itself; the theme only gives Window a template. -->
+  <Application.Styles>
+    <SimpleTheme />
+  </Application.Styles>
+</Application>

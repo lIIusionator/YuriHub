@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>12</LangVersion>
+    <AssemblyName>YURI</AssemblyName>
+    <RootNamespace>Yuri</RootNamespace>
+    <Version>2.0.0</Version>
+    <FileVersion>2.0.0.0</FileVersion>
+    <Product>YURI</Product>
+    <Company>YURI</Company>
+    <Copyright>YURI</Copyright>
+    <Description>YURI - Control Suite</Description>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Ahk2Exe-SetMainIcon: the executable's own icon, and what Explorer and the taskbar show. -->
+    <ApplicationIcon>YURI.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <AvaloniaResource Include="Assets\**" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.3.20" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.20" />
+    <PackageReference Include="Avalonia.Themes.Simple" Version="11.3.20" />
+  </ItemGroup>
+</Project>
