@@ -2,7 +2,7 @@
 
 > A custom hub made for Roblox.
 
-[![Version](https://img.shields.io/badge/version-1.0.3-2ea44f)](https://github.com/lIIusionator/YuriHub/releases/tag/v1.0.3)
+[![Version](https://img.shields.io/badge/version-2.0.1-2ea44f)](https://github.com/lIIusionator/YuriHub/releases/tag/v2.0.1)
 [![Release branch](https://img.shields.io/badge/release-main-24292f)](https://github.com/lIIusionator/YuriHub/tree/main)
 
 YuriHub brings everyday Roblox tools and performance tweaks together in one place.
@@ -21,16 +21,14 @@ YuriHub brings everyday Roblox tools and performance tweaks together in one plac
 
 ## Current Release
 
-**v1.0.3** is the current stable release and is published from the `main` branch.
+**v2.0.1** is the current stable release and is published from the `main` branch.
 
-### What's New in v1.0.3
-- Hub Performance Optimizations
-- Performance Mode Tweaks
-- Flappy Bird
-- Disable Crash Handler
-- Memory Trimmer
+### What's New in v2.0.1
+- No more AutoHotkey
+- Latest stable build published from the main branch
+- Release metadata updated to v2.0.1
 
-[View the v1.0.3 release](https://github.com/lIIusionator/YuriHub/releases/tag/v1.0.3)
+[View the v2.0.1 release](https://github.com/lIIusionator/YuriHub/releases/tag/v2.0.1)
 
 ## Credits
 
