@@ -22,7 +22,7 @@
 ;  by hand.
 ; =============================================================================
 
-;@Ahk2Exe-SetVersion 2.1.0.0
+;@Ahk2Exe-SetVersion 2.1.1.0
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 Persistent false
@@ -115,9 +115,10 @@ LatestVersion() {
         req.Send()
         url := ""
         try url := req.Option[1]                    ; WinHttpRequestOption_URL: the address after the redirect
-        if RegExMatch(url, "i)/tag/v?(\d+(?:\.\d+)*)", &m)
+        ; the first run of digits and dots after /tag/ - so a tag typed "v.2.1.1" reads as 2.1.1 too
+        if RegExMatch(url, "i)/tag/[^/\d]*(\d+(?:\.\d+)*)", &m)
             return m[1]
-        if RegExMatch(req.ResponseText, "i)/releases/tag/v?(\d+(?:\.\d+)*)", &m)   ; the page itself, if the address could not be read
+        if RegExMatch(req.ResponseText, "i)/releases/tag/[^/\d]*(\d+(?:\.\d+)*)", &m)   ; the page itself, if the address could not be read
             return m[1]
     }
     return ""
