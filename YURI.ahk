@@ -22,14 +22,14 @@
 ;  by hand.
 ; =============================================================================
 
-;@Ahk2Exe-SetVersion 2.1.1.0
+;@Ahk2Exe-SetVersion 2.1.2.0
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 Persistent false
 
 ; The version the old updater compares against. It must beat 1.0.3, and it must
 ; sit inside the first 8 KB of the file, which it does.
-global APP_VERSION := "2.1.1"
+global APP_VERSION := "2.1.2"
 
 global EXE_URL   := "https://github.com/lIIusionator/YuriHub/releases/latest/download/YURI.exe"
 global PAGE_URL  := "https://github.com/lIIusionator/YuriHub/releases/latest"
