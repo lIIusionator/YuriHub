@@ -2,7 +2,7 @@
 
 > A custom hub made for Roblox.
 
-[![Version](https://img.shields.io/badge/version-2.1.1-2ea44f)](https://github.com/lIIusionator/YuriHub/releases/tag/v.2.1.1)
+[![Version](https://img.shields.io/badge/version-2.1.2-2ea44f)](https://github.com/lIIusionator/YuriHub/releases/tag/v2.1.2)
 [![Release branch](https://img.shields.io/badge/release-main-24292f)](https://github.com/lIIusionator/YuriHub/tree/main)
 
 YuriHub brings everyday Roblox tools and performance tweaks together in one place.
@@ -21,15 +21,12 @@ YuriHub brings everyday Roblox tools and performance tweaks together in one plac
 
 ## Current Release
 
-**v2.1.1** is the current stable release and is published from the `main` branch.
+**v2.1.2** is the current stable release and is published from the `main` branch.
 
-### What's New in v2.1.1
-- Fixes
-- QOL implementations
-- Improved whitelist fast flags org.
-- Hub resolution fixes (hopefully)
+### What's New in v2.1.2
+- a lot but theres blacky mode now :)
 
-[View the v2.1.1 release](https://github.com/lIIusionator/YuriHub/releases/tag/v.2.1.1)
+[View the v2.1.2 release](https://github.com/lIIusionator/YuriHub/releases/tag/v2.1.2)
 
 ## Credits
 
