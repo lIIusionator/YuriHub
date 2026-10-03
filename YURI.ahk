@@ -11,10 +11,11 @@
 ;  runs it. So an old copy updates to this, and this puts YURI.exe down and
 ;  starts it.
 ;
-;  It always fetches the NEWEST release (releases/latest), so it does not need
-;  editing for each new version. APP_VERSION is only the number the old hub's
-;  "NEWER VERSION FOUND" card shows; bump it with each release if you want
-;  that card to show the current one.
+;  It always fetches the NEWEST release (releases/latest), so it never needs
+;  editing for a new version. APP_VERSION is fixed at "2" - YURI 2 - on
+;  purpose: it only has to beat the old hub's own 1.0.3 (it always will), and
+;  the old hub's card then reads "v2 is available - you are on v1.0.3", which
+;  stays true whatever the newest release is. Leave it alone.
 ;
 ;  Nothing here is clever, on purpose. It has one job and it must not fail in a
 ;  way that leaves somebody stranded on the old build: every step is wrapped,
@@ -22,14 +23,16 @@
 ;  by hand.
 ; =============================================================================
 
-;@Ahk2Exe-SetVersion 2.1.2.0
+;@Ahk2Exe-SetVersion 2.0.0.0
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 Persistent false
 
 ; The version the old updater compares against. It must beat 1.0.3, and it must
-; sit inside the first 8 KB of the file, which it does.
-global APP_VERSION := "2.1.2"
+; sit inside the first 8 KB of the file, which it does. Fixed at "2" (YURI 2):
+; AutoHotkey's VerCompare reads it as 2.0.0, newer than any 1.x, so it never
+; needs bumping - see the header.
+global APP_VERSION := "2"
 
 global EXE_URL   := "https://github.com/lIIusionator/YuriHub/releases/latest/download/YURI.exe"
 global PAGE_URL  := "https://github.com/lIIusionator/YuriHub/releases/latest"
